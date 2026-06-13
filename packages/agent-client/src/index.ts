@@ -7,8 +7,9 @@
 // @tinycloud/eliza-plugin-memory.
 //
 // T2 surface: config + errors + logger + the Transport seam + the real node-sdk
-// transport. T3 adds the serialized worker (queue/breaker/timeouts). Session +
-// SQL helpers land in T4.
+// transport. T3 adds the serialized worker (queue/breaker/timeouts). T4 adds the
+// session lifecycle, the SQL surface, memoized ensureSchema, and createAgentClient
+// — the public composition root the host plugins consume.
 
 export const AGENT_CLIENT_VERSION = "0.1.0";
 
@@ -59,3 +60,15 @@ export type {
   Job,
   WorkerOptions,
 } from "./worker";
+
+export { Session, STOP_FLUSH_MS } from "./session";
+export type { SessionOptions } from "./session";
+
+export { createSql, withRowObjects } from "./sql";
+export type { SqlApi } from "./sql";
+
+export { createEnsureSchema } from "./schema";
+export type { EnsureSchema } from "./schema";
+
+export { createAgentClient } from "./client";
+export type { AgentClient, AgentClientDeps } from "./client";
