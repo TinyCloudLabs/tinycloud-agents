@@ -78,10 +78,13 @@ test("defaultActivate calls signIn() BEFORE useDelegation() (node-sdk 2.3.0 wall
   const config = resolveDelegationConfig({
     mode: "delegation",
     serializedDelegation: "fake-serialized-delegation",
-    agentKey: AGENT_KEY, // inline key → no readFileSync, no file access
+    agentKey: AGENT_KEY,
   });
 
-  const access = await defaultActivate(config, fakeDelegation());
+  // defaultActivate reuses the identity signIn() already resolved (review #8) — the
+  // key comes from identity.normalizedKey, not a re-read of config.
+  const identity = { did: "did:pkh:eip155:1:0xfakeagent", normalizedKey: AGENT_KEY };
+  const access = await defaultActivate(config, fakeDelegation(), identity);
 
   // Ordering: signIn must precede useDelegation, each called exactly once.
   expect(calls).toEqual(["signIn", "useDelegation"]);

@@ -85,6 +85,15 @@ export class TinyCloudMemoryStorageService
 {
   static serviceType = "memoryStorage" as const;
 
+  /**
+   * Stable identity brand for the slot guard. Compared as a STRING (not via
+   * `instanceof`) so two copies of this module — version skew, hoisted vs nested,
+   * dist vs src — that carry distinct class identities are still recognized as
+   * "ours" (review #3). Subclasses inherit this static, so a test subclass also
+   * brands as ours.
+   */
+  static readonly providerId = "@tinycloud/eliza-plugin-memory";
+
   capabilityDescription =
     "Stores Eliza long-term memories and session summaries in a user-owned " +
     "TinyCloud space (system of record for advanced memory).";
@@ -142,28 +151,89 @@ export class TinyCloudMemoryStorageService
     return service;
   }
 
-  /**
-   * Throws (loud, actionable) if a NON-TinyCloud service already holds the
-   * "memoryStorage" slot — the signature of plugin-sql being listed first.
-   * Order-independent: when we are first, no foreign incumbent exists and this
-   * is a no-op; when plugin-sql is first, its AdvancedMemoryStorageService is
-   * already registered by the time our start() runs, so we detect and reject it.
-   * Degrades gracefully (no-op) on runtimes without getServicesByType.
-   */
-  private static assertSlotNotTaken(runtime: IAgentRuntime): void {
-    const byType = (runtime as { getServicesByType?: (t: string) => unknown[] }).getServicesByType;
-    if (typeof byType !== "function") return;
-    const incumbents = byType.call(runtime, TinyCloudMemoryStorageService.serviceType) ?? [];
-    const foreign = (incumbents as object[]).find(
-      (s) => !(s instanceof TinyCloudMemoryStorageService),
+  /** True if a STARTED service instance is one of ours (brand survives module dup, #3). */
+  private static isOurInstance(s: unknown): boolean {
+    return (
+      (s as { constructor?: { providerId?: unknown } } | null | undefined)?.constructor
+        ?.providerId === TinyCloudMemoryStorageService.providerId
     );
-    if (foreign) {
-      const name = (foreign as { constructor?: { name?: string } }).constructor?.name ?? "another service";
-      throw new Error(
-        `@tinycloud/eliza-plugin-memory: the "memoryStorage" slot is already held by ` +
-          `${name}. List "@tinycloud/eliza-plugin-memory" BEFORE "@elizaos/plugin-sql" in ` +
-          `character.plugins so it wins the slot (first-registered wins, plan §2.2).`,
-      );
+  }
+
+  /** True if a REGISTERED service class is one of ours (the class object carries the static brand). */
+  private static isOurClass(c: unknown): boolean {
+    return (
+      (c as { providerId?: unknown } | null | undefined)?.providerId ===
+      TinyCloudMemoryStorageService.providerId
+    );
+  }
+
+  /** Human label for the foreign incumbent (class or instance) — names only, never secrets. */
+  private static describeIncumbent(x: unknown): string {
+    // A class object: use its own .name; an instance: its constructor's .name.
+    const asClass = (x as { name?: unknown } | null | undefined)?.name;
+    if (typeof asClass === "string" && asClass) return asClass;
+    const ctorName = (x as { constructor?: { name?: unknown } } | null | undefined)?.constructor?.name;
+    return typeof ctorName === "string" && ctorName ? ctorName : "another service";
+  }
+
+  private static slotTakenError(incumbent: string): Error {
+    return new Error(
+      `@tinycloud/eliza-plugin-memory: the "memoryStorage" slot is already held by ` +
+        `${incumbent}. List "@tinycloud/eliza-plugin-memory" BEFORE "@elizaos/plugin-sql" in ` +
+        `character.plugins so it wins the slot (first-registered wins, plan §2.2).`,
+    );
+  }
+
+  /**
+   * Throws (loud, actionable) if a NON-TinyCloud service holds — or is about to
+   * win — the "memoryStorage" slot. The slot winner is the FIRST-REGISTERED class
+   * (Eliza starts a type's registered classes in registration order, first started
+   * wins). Two complementary checks:
+   *
+   *   (A) Started-instance check (public API): scan getServicesByType for a foreign
+   *       STARTED incumbent. Catches the case where a misordered plugin-sql has
+   *       already been started before our start() runs.
+   *
+   *   (B) Winner-class check (review #2): inspect the registered class list
+   *       (runtime.serviceTypes[type]) — populated SYNCHRONOUSLY at registration,
+   *       BEFORE any start(). serviceTypes[type][0] is the slot winner regardless of
+   *       start scheduling / lazy resolution, so this closes the false-negative where
+   *       a foreign incumbent is registered-but-not-yet-started (getServicesByType
+   *       still returns []). Best-effort + feature-detected: a runtime shape change
+   *       degrades to (A), never throws spuriously.
+   *
+   * Identity is by stable brand (providerId), not instanceof, so duplicate module
+   * copies of THIS package are not misflagged as foreign (review #3). Degrades to a
+   * no-op on runtimes exposing neither signal.
+   *
+   * `protected` (not private) so the slot-precedence tests can drive the guard in
+   * isolation, without the network bring-up that the public start() would trigger.
+   */
+  protected static assertSlotNotTaken(runtime: IAgentRuntime): void {
+    const TYPE = TinyCloudMemoryStorageService.serviceType;
+
+    // (A) Started-instance check — a foreign incumbent already in the slot.
+    const byType = (runtime as { getServicesByType?: (t: string) => unknown[] }).getServicesByType;
+    if (typeof byType === "function") {
+      const incumbents = (byType.call(runtime, TYPE) as unknown[]) ?? [];
+      const foreign = incumbents.find((s) => !TinyCloudMemoryStorageService.isOurInstance(s));
+      if (foreign) {
+        throw TinyCloudMemoryStorageService.slotTakenError(
+          TinyCloudMemoryStorageService.describeIncumbent(foreign),
+        );
+      }
+    }
+
+    // (B) Winner-class check — the first-registered class wins, even if not yet started.
+    const registered = (runtime as { serviceTypes?: Map<string, unknown[]> }).serviceTypes;
+    const classes = registered instanceof Map ? registered.get(TYPE) : undefined;
+    if (Array.isArray(classes) && classes.length > 0) {
+      const winner = classes[0];
+      if (!TinyCloudMemoryStorageService.isOurClass(winner)) {
+        throw TinyCloudMemoryStorageService.slotTakenError(
+          TinyCloudMemoryStorageService.describeIncumbent(winner),
+        );
+      }
     }
   }
 

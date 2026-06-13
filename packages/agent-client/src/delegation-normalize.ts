@@ -23,9 +23,10 @@
 // HARD CONTRACT: never place the Authorization header, the JWT, agentKey, or the
 // serialized blob in any error message — field labels only.
 
-import { deserializeDelegation } from "@tinycloud/node-sdk";
+import { parseSpaceUri } from "@tinycloud/node-sdk";
 import type { PortableDelegation } from "@tinycloud/node-sdk";
 import { DelegationPolicyError } from "./errors";
+import { deserializeDelegationSafe } from "./delegation-policy";
 
 /** A single signed-derived grant entry. Matches node-sdk's DelegatedResource. */
 type GrantResource = NonNullable<PortableDelegation["resources"]>[number];
@@ -41,8 +42,13 @@ function decodeJwtPayload(authHeader: string): Record<string, unknown> {
   const jwt = authHeader.replace(BEARER_RE, "");
   const parts = jwt.split(".");
   if (parts.length < 2) {
+    // The signed UCAN JWT is the SOLE source of capability truth — a bare
+    // `Bearer <cid>` (or any non-JWT) carries no signed `att`, so we cannot derive
+    // trustworthy grants and refuse to fall back to the forgeable summary. Name the
+    // cause + remediation; never echo the header value (field labels only).
     throw new DelegationPolicyError(
-      "malformed delegation: Authorization is not a JWT",
+      "malformed delegation: Authorization carries no signed capability JWT " +
+        "(expected a UCAN bearer token; mint the delegation via the delegate-ui harness)",
       "MALFORMED",
       { field: "delegationHeader.Authorization" },
     );
@@ -69,32 +75,74 @@ function decodeJwtPayload(authHeader: string): Record<string, unknown> {
 }
 
 /**
+ * Parse a UCAN att resource URI into `(space, service, path)`.
+ *
+ * The canonical resource URI is `<space>/<serviceShort>/<path...>` where `<space>`
+ * is the colon-form space id (`tinycloud:pkh:eip155:1:0x...:default`, no `/`). Rather
+ * than trust positional segments, the candidate `<space>` is validated with the SDK's
+ * own `parseSpaceUri`: it returns null for the `tinycloud://authority/...` form
+ * (where `segs[0]` is just `"tinycloud:"`) and any other non-space shape. An att key we
+ * cannot map to `<space>/<service>/<path>` is therefore rejected LOUDLY here — never
+ * silently dropped, which would otherwise surface downstream as a confusing
+ * `MISSING_SQL_RESOURCE` on an otherwise-valid delegation (review #4).
+ */
+function parseResourceUri(uri: string): { space: string; service: string; path: string } {
+  const segs = uri.split("/");
+  const space = segs[0] ?? "";
+  const service = segs[1] ?? "";
+  if (!service || parseSpaceUri(space) === null) {
+    throw new DelegationPolicyError(
+      "malformed delegation: signed att resource URI is not <space>/<service>/<path>",
+      "MALFORMED",
+      { field: "delegationHeader.Authorization.att" },
+    );
+  }
+  return { space, service, path: segs.slice(2).join("/") };
+}
+
+/**
  * Build the signed grant breakdown from a UCAN `att` claim.
  *
  * `att` shape: `{ "<resource-uri>": { "<ability-urn>": [constraints], ... }, ... }`.
- * Each resource URI is `<space>/<serviceShort>/<path...>` where `<space>` (e.g.
- * `tinycloud:pkh:eip155:1:0x...:default`) contains no `/`. So splitting on `/`:
- *   parts[0] = space, parts[1] = service, parts.slice(2).join("/") = path.
  * Abilities are already full-URN (`tinycloud.sql/read`), so they map directly to
- * `DelegatedResource.actions`.
+ * `DelegatedResource.actions`. Resource URIs are parsed + validated by
+ * {@link parseResourceUri}.
  */
 function resourcesFromAtt(att: Record<string, unknown>): GrantResource[] {
   const resources: GrantResource[] = [];
   for (const [uri, abilities] of Object.entries(att)) {
+    // An att value MUST be an abilities map (object). An ARRAY would pass a bare
+    // typeof-object check and yield bogus `["0"]` "actions" → a junk resource and a
+    // confusing INSUFFICIENT_ACTIONS later. Reject it as MALFORMED instead (review #7).
+    if (Array.isArray(abilities)) {
+      throw new DelegationPolicyError(
+        "malformed delegation: signed att value is an array, not an abilities map",
+        "MALFORMED",
+        { field: "delegationHeader.Authorization.att" },
+      );
+    }
     if (!abilities || typeof abilities !== "object") continue;
     const actions = Object.keys(abilities as Record<string, unknown>);
     if (actions.length === 0) continue;
-    const segs = uri.split("/");
-    const service = segs[1] ?? "";
-    if (!service) continue; // not a recognizable <space>/<service>/<path> URI
-    resources.push({
-      service,
-      space: segs[0] ?? "",
-      path: segs.slice(2).join("/"),
-      actions,
-    });
+    const { space, service, path } = parseResourceUri(uri);
+    resources.push({ service, space, path, actions });
   }
   return resources;
+}
+
+/**
+ * Extract the owner EVM address from the SIGNED side — the space id embedded in the
+ * normalized resource URIs (`tinycloud:pkh:eip155:{chain}:0x{owner}:default`). The
+ * top-level `ownerAddress` is unsigned and forgeable; this is the authoritative owner.
+ * Returns the canonical (EIP-55) address, or null if no resource carries a parseable
+ * space (review #6). Run AFTER {@link normalizeDelegationGrants}.
+ */
+export function signedOwnerAddress(delegation: PortableDelegation): string | null {
+  for (const r of delegation.resources ?? []) {
+    const parsed = parseSpaceUri(r.space);
+    if (parsed?.address) return parsed.address;
+  }
+  return null;
 }
 
 /**
@@ -110,7 +158,8 @@ export function normalizeDelegationGrants(delegation: PortableDelegation): Porta
   const auth = delegation.delegationHeader?.Authorization;
   if (!auth || typeof auth !== "string" || auth.trim() === "") {
     throw new DelegationPolicyError(
-      "malformed delegation: missing delegationHeader.Authorization",
+      "malformed delegation: no signed capability JWT in delegationHeader.Authorization " +
+        "(mint the delegation via the delegate-ui harness)",
       "MALFORMED",
       { field: "delegationHeader.Authorization" },
     );
@@ -152,16 +201,7 @@ export function normalizeDelegationGrants(delegation: PortableDelegation): Porta
  *   when the signed capability cannot be read.
  */
 export function deserializeAndNormalize(serialized: string): PortableDelegation {
-  let delegation: PortableDelegation;
-  try {
-    delegation = deserializeDelegation(serialized);
-  } catch (cause) {
-    throw new DelegationPolicyError(
-      "malformed delegation: could not deserialize",
-      "MALFORMED",
-      { field: "serialized" },
-      { cause },
-    );
-  }
-  return normalizeDelegationGrants(delegation);
+  // deserializeDelegationSafe wraps the SDK deserializer + maps throws to MALFORMED
+  // (shared with delegation-policy; review #8 dedup — was a byte-identical try/catch).
+  return normalizeDelegationGrants(deserializeDelegationSafe(serialized));
 }

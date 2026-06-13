@@ -48,6 +48,54 @@ class StubMemoryService extends (Service as never as typeof Service) {
   }
 }
 
+/**
+ * A SEPARATE class object (does NOT extend TinyCloudMemoryStorageService) that
+ * carries OUR providerId brand — stands in for a duplicate module copy (version
+ * skew / hoisting). The brand guard must treat it as "ours", not foreign (#3).
+ */
+class BrandedTwinService extends (Service as never as typeof Service) {
+  static override serviceType = TYPE as never;
+  static readonly providerId = "@tinycloud/eliza-plugin-memory";
+  capabilityDescription = "branded twin memoryStorage";
+  async storeLongTermMemory(m: unknown) {
+    return m;
+  }
+  async stop() {}
+  static override async start(runtime: never): Promise<Service> {
+    return new (this as never as new (r: never) => Service)(runtime);
+  }
+}
+
+/**
+ * Drives the REAL slot guard in isolation then injects a fake (offline) client,
+ * so the NON-rejecting path never touches the network. `assertSlotNotTaken` is
+ * protected on the base, reachable here because this is a subclass.
+ */
+class GuardOnlyService extends TinyCloudMemoryStorageService {
+  static override serviceType = TYPE as never;
+  static override async start(runtime: never): Promise<Service> {
+    this.assertSlotNotTaken(runtime);
+    const client = makeFakeClient();
+    const svc = new TinyCloudMemoryStorageService(runtime, { client });
+    await client.signIn();
+    await client.ensureSchema([]);
+    return svc as never;
+  }
+}
+
+/** Make a fresh in-memory runtime (initialized) for a guard test. */
+async function makeRuntime(): Promise<AgentRuntime> {
+  const runtime = new AgentRuntime({
+    adapter: new InMemoryDatabaseAdapter(),
+    settings: { ALLOW_NO_DATABASE: "true" },
+    logLevel: "error",
+  } as never);
+  if (typeof (runtime as { initialize?: () => Promise<void> }).initialize === "function") {
+    await (runtime as { initialize: () => Promise<void> }).initialize();
+  }
+  return runtime;
+}
+
 test("first-registered service wins the memoryStorage slot; both are registered", async () => {
   const runtime = new AgentRuntime({
     adapter: new InMemoryDatabaseAdapter(),
@@ -109,5 +157,59 @@ test("fail-fast guard: real start() throws (before any network) when a FOREIGN m
   }
   expect(caught).toBeInstanceOf(Error);
   expect((caught as Error).message).toMatch(/before "@elizaos\/plugin-sql"/i);
+  expect((caught as Error).message).toContain("StubMemoryService");
+});
+
+test("fail-fast guard (LAZY): foreign incumbent registered but NOT YET STARTED still throws loud (review #2)", async () => {
+  const runtime = await makeRuntime();
+
+  // Register a foreign incumbent FIRST but DO NOT resolve its load promise — it is
+  // registered-but-not-started, so getServicesByType returns [] (the exact false-
+  // negative the old presence-only guard missed). The winner-class check (B) reads
+  // the registered class list (set synchronously at registration) and still rejects.
+  await runtime.registerService(StubMemoryService as never);
+  expect((runtime.getServicesByType(TYPE) ?? []).length).toBe(0); // not started → presence check is blind
+
+  let caught: unknown = null;
+  try {
+    await TinyCloudMemoryStorageService.start(runtime as never);
+  } catch (e) {
+    caught = e;
+  }
+  // Loud failure (NOT a silent pass), and it fired before any client/network bring-up.
+  expect(caught).toBeInstanceOf(Error);
+  expect((caught as Error).message).toMatch(/before "@elizaos\/plugin-sql"/i);
+  expect((caught as Error).message).toContain("StubMemoryService");
+});
+
+test("brand detection: a DIFFERENT class object carrying our providerId is treated as OURS, not foreign (review #3)", async () => {
+  const runtime = await makeRuntime();
+
+  // A duplicate-module twin (separate class identity, same providerId brand) wins
+  // the slot first. instanceof would mis-flag it foreign; the brand guard must not.
+  await runtime.registerService(BrandedTwinService as never);
+
+  let caught: unknown = null;
+  try {
+    await GuardOnlyService.start(runtime as never);
+  } catch (e) {
+    caught = e;
+  }
+  // The guard must NOT reject — the branded twin is recognized as ours.
+  expect(caught).toBeNull();
+});
+
+test("brand detection: a genuinely foreign class (no brand) is still rejected (review #3)", async () => {
+  const runtime = await makeRuntime();
+
+  await runtime.registerService(StubMemoryService as never);
+
+  let caught: unknown = null;
+  try {
+    await GuardOnlyService.start(runtime as never);
+  } catch (e) {
+    caught = e;
+  }
+  expect(caught).toBeInstanceOf(Error);
   expect((caught as Error).message).toContain("StubMemoryService");
 });

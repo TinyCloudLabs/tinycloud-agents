@@ -8,10 +8,12 @@ import { expect, test } from "bun:test";
 import { DelegatedTransport, type DelegatedSqlAccess } from "./delegated-transport.ts";
 import type { IDatabaseHandle } from "@tinycloud/node-sdk";
 import type { PortableDelegation } from "@tinycloud/node-sdk";
+import { deserializeDelegation } from "@tinycloud/node-sdk";
 import type { BatchData, ExecuteData, QueryData, Transport } from "./transport.ts";
 import { resolveDelegationConfig } from "./config.ts";
-import { AuthError } from "./errors.ts";
+import { AuthError, DelegationPolicyError } from "./errors.ts";
 import type { AgentIdentity } from "./agent-identity.ts";
+import { DB_HANDLE, FULL_SQL_ACTIONS, makeAtt, makeJwt, OWNER } from "./delegation-fixtures.test.ts";
 
 // ---------------------------------------------------------------------------
 // Shared fakes
@@ -28,21 +30,30 @@ function makeResolvedConfig(overrides: Partial<ReturnType<typeof resolveDelegati
   });
 }
 
-/** Minimal fake PortableDelegation (only the fields DelegatedTransport reads). */
-function fakeDelegation(ownerAddress = "0xowner1234567890abcdef1234567890abcdef12"): PortableDelegation {
+// delegateDID must match fakeIdentity.did so validateDelegationShape passes.
+const FAKE_AGENT_DID = "did:pkh:eip155:1:0xfakeagent";
+
+/**
+ * Fake PortableDelegation carrying a REAL signed-att JWT. signIn() now normalizes
+ * structurally (review #5), so the SIGNED `att` — not the top-level summary — is the
+ * source of truth; the owner address must be valid 0x+40-hex so the signed space URI
+ * parses. `sqlActions` controls what the SIGNED capability grants (default: full).
+ */
+function fakeDelegation(
+  ownerAddress = OWNER,
+  sqlActions: readonly string[] = FULL_SQL_ACTIONS,
+): PortableDelegation {
+  const space = `tinycloud:pkh:eip155:1:${ownerAddress}:default`;
+  const att = makeAtt({ sqlActions, space });
   return {
     ownerAddress,
-    // delegateDID must match fakeIdentity.did ("did:pkh:eip155:1:0xfakeagent")
-    // so validateDelegationShape passes.
-    delegateDID: "did:pkh:eip155:1:0xfakeagent",
-    spaceId: "tinycloud:pkh:eip155:1:0xowner1234567890abcdef1234567890abcdef12:default",
-    path: "xyz.tinycloud.eliza/memory",
-    // Real delegations grant admin (Phase 5 runs ensureSchema DDL) — the wired
-    // deep policy validator (defaultElizaMemoryPolicy) requires read+write+admin.
-    actions: ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"],
+    delegateDID: FAKE_AGENT_DID,
+    spaceId: space,
+    path: DB_HANDLE,
+    actions: [...sqlActions],
     expiry: new Date(Date.now() + 60 * 60 * 1000), // 1 hour from now (required by shape validator)
     cid: "fake-cid",
-    delegationHeader: { Authorization: "Bearer SECRET-NEVER-LOGGED" },
+    delegationHeader: { Authorization: makeJwt(att, { aud: FAKE_AGENT_DID }) },
     chainId: 1,
   } as unknown as PortableDelegation;
 }
@@ -82,7 +93,7 @@ function fakeSqlAccess(
 
 /** Fake agent identity (no real crypto). */
 const fakeIdentity: AgentIdentity = {
-  did: "did:pkh:eip155:1:0xfakeagent",
+  did: FAKE_AGENT_DID,
   normalizedKey: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
 };
 
@@ -323,8 +334,10 @@ test("SDK batch error maps to redacted TransportError", async () => {
 // 6. signIn() with injected fakes returns correct SignInResult
 // ---------------------------------------------------------------------------
 
-test("signIn() with injected fakes returns SignInResult from access.spaceId and delegation.ownerAddress", async () => {
-  const owner = "0xowner0000000000000000000000000000000001";
+test("signIn() with injected fakes returns SignInResult from access.spaceId and the SIGNED owner address", async () => {
+  // Valid 0x+40-hex (all-digit → its EIP-55 checksum is identical) so the signed
+  // space URI parses and the signed-derived address equals `owner` (review #6).
+  const owner = "0x0000000000000000000000000000000000000001";
   const access = fakeSqlAccess("tinycloud:pkh:eip155:1:" + owner + ":default");
   const delegation = fakeDelegation(owner);
   const transport = new DelegatedTransport(makeResolvedConfig(), {
@@ -335,7 +348,7 @@ test("signIn() with injected fakes returns SignInResult from access.spaceId and 
 
   const result = await transport.signIn();
   expect(result.spaceId).toBe(access.spaceId);
-  expect(result.address).toBe(owner);
+  expect(result.address).toBe(owner); // signed-derived owner, cross-checked against ownerAddress
   expect(result.did).toBe(fakeIdentity.did);
 });
 
@@ -426,7 +439,9 @@ test("activation (network/SDK) failure surfaces as a typed AuthError with no sec
     agentKey: secretKey,
   });
   const transport = new DelegatedTransport(config, {
-    deserialize: () => ({ ...fakeDelegation(), delegationHeader: { Authorization: secretAuth } } as unknown as PortableDelegation),
+    // A valid signed delegation (normalization must pass so we actually REACH
+    // activate); the secret rides only on the activate fault below.
+    deserialize: () => fakeDelegation(),
     // Simulate a node.signIn()/useDelegation network fault that (worst case)
     // echoes the auth header in its own message.
     activate: async () => {
@@ -450,12 +465,12 @@ test("activation (network/SDK) failure surfaces as a typed AuthError with no sec
 });
 
 test("validation rejects are NOT masked as AuthError (insufficient-actions stays a policy error)", async () => {
-  // Inject a delegation that passes shape but fails the deep policy (no admin),
-  // and an activate spy that must NEVER run.
+  // Inject a delegation whose SIGNED att grants no admin (top-level `actions` is
+  // irrelevant after structural normalization — review #5). It passes shape but fails
+  // the deep policy; the activate spy must NEVER run.
   let activateCalls = 0;
   const transport = new DelegatedTransport(makeResolvedConfig(), {
-    deserialize: () =>
-      ({ ...fakeDelegation(), actions: ["tinycloud.sql/read", "tinycloud.sql/write"] } as unknown as PortableDelegation),
+    deserialize: () => fakeDelegation(OWNER, ["tinycloud.sql/read", "tinycloud.sql/write"]),
     activate: async () => {
       activateCalls++;
       return fakeSqlAccess();
@@ -505,10 +520,9 @@ test("forced SQL error: TransportError never includes agentKey, serializedDelega
 
   const access = fakeSqlAccess("space-1", leakyHandle);
   const transport = new DelegatedTransport(config, {
-    deserialize: () => ({
-      ...fakeDelegation(),
-      delegationHeader: { Authorization: secretAuth },
-    } as unknown as PortableDelegation),
+    // Valid signed delegation (normalization passes); the secret rides on the SQL
+    // handle's error meta below, which toTransportError must strip.
+    deserialize: () => fakeDelegation(),
     activate: async () => access,
     agentIdentity: async () => fakeIdentity,
   });
@@ -528,6 +542,132 @@ test("forced SQL error: TransportError never includes agentKey, serializedDelega
     expect(result.error.message).toBe("Unauthorized");
     expect(result.error.service).toBe("sql");
   }
+});
+
+// ---------------------------------------------------------------------------
+// 7b. Structural normalization (review #5): the deserialize seam controls only HOW
+//     bytes parse, never WHETHER grants are signed-derived. Even with the RAW SDK
+//     deserializer injected, signIn() normalizes from the signed att.
+// ---------------------------------------------------------------------------
+
+test("structural normalization: injecting the RAW SDK deserializer still rejects a forgery before activate (review #5)", async () => {
+  // Forged blob: top-level actions claim sql/admin, but the SIGNED att grants ONLY
+  // capabilities/read. deserialize is the RAW SDK parser (no normalization at the
+  // seam) — signIn() must STILL normalize structurally and strip the forged grant.
+  const forged = JSON.stringify({
+    cid: "bafytest",
+    delegateDID: FAKE_AGENT_DID,
+    spaceId: `tinycloud:pkh:eip155:1:${OWNER}:default`,
+    path: DB_HANDLE,
+    actions: ["tinycloud.sql/admin", "tinycloud.sql/read", "tinycloud.sql/write"], // FORGED summary
+    expiry: new Date("2099-01-01T00:00:00.000Z").toISOString(),
+    delegationHeader: { Authorization: makeJwt(makeAtt({ caps: true }), { aud: FAKE_AGENT_DID }) }, // caps only
+    ownerAddress: OWNER,
+    chainId: 1,
+    host: "https://node.tinycloud.xyz",
+  });
+  let activateCalls = 0;
+  const transport = new DelegatedTransport(
+    resolveDelegationConfig({
+      mode: "delegation",
+      serializedDelegation: forged,
+      agentKey: AGENT_KEY,
+      dbHandle: DB_HANDLE,
+    }),
+    {
+      deserialize: deserializeDelegation, // RAW — bypasses normalization AT THE SEAM
+      activate: async () => {
+        activateCalls++;
+        return fakeSqlAccess();
+      },
+      agentIdentity: async () => fakeIdentity,
+    },
+  );
+  let caught: unknown = null;
+  try {
+    await transport.signIn();
+  } catch (e) {
+    caught = e;
+  }
+  // Forged sql grant stripped by normalization → a validator rejects it (NOT an
+  // activation/AuthError), and useDelegation never ran.
+  expect(caught).toBeInstanceOf(Error);
+  expect(caught).not.toBeInstanceOf(AuthError);
+  expect(activateCalls).toBe(0);
+});
+
+test("structural normalization: injecting the RAW SDK deserializer for a VALID signed delegation still activates (review #5)", async () => {
+  const valid = JSON.stringify({
+    cid: "bafytest",
+    delegateDID: FAKE_AGENT_DID,
+    spaceId: `tinycloud:pkh:eip155:1:${OWNER}:default`,
+    path: DB_HANDLE,
+    actions: ["tinycloud.capabilities/read"], // lossy summary — corrected from the att
+    expiry: new Date("2099-01-01T00:00:00.000Z").toISOString(),
+    delegationHeader: { Authorization: makeJwt(makeAtt({ sqlActions: FULL_SQL_ACTIONS }), { aud: FAKE_AGENT_DID }) },
+    ownerAddress: OWNER,
+    chainId: 1,
+    host: "https://node.tinycloud.xyz",
+  });
+  let activateCalls = 0;
+  const transport = new DelegatedTransport(
+    resolveDelegationConfig({
+      mode: "delegation",
+      serializedDelegation: valid,
+      agentKey: AGENT_KEY,
+      dbHandle: DB_HANDLE,
+    }),
+    {
+      deserialize: deserializeDelegation,
+      activate: async () => {
+        activateCalls++;
+        return fakeSqlAccess(`tinycloud:pkh:eip155:1:${OWNER}:default`);
+      },
+      agentIdentity: async () => fakeIdentity,
+    },
+  );
+  const result = await transport.signIn();
+  expect(activateCalls).toBe(1);
+  expect(result.did).toBe(FAKE_AGENT_DID);
+});
+
+// ---------------------------------------------------------------------------
+// 7c. Signed-owner cross-check (review #6): SignInResult.address is the SIGNED
+//     owner; a top-level ownerAddress that disagrees with the signed space is rejected.
+// ---------------------------------------------------------------------------
+
+test("owner cross-check: ownerAddress disagreeing with the signed space owner is rejected before activate (review #6)", async () => {
+  const OTHER_OWNER = "0x0000000000000000000000000000000000000002";
+  const att = makeAtt({ sqlActions: FULL_SQL_ACTIONS, space: `tinycloud:pkh:eip155:1:${OWNER}:default` });
+  const delegation = {
+    ownerAddress: OTHER_OWNER, // mismatches the signed space owner (OWNER)
+    delegateDID: FAKE_AGENT_DID,
+    spaceId: `tinycloud:pkh:eip155:1:${OWNER}:default`,
+    path: DB_HANDLE,
+    actions: [...FULL_SQL_ACTIONS],
+    expiry: new Date(Date.now() + 60 * 60 * 1000),
+    cid: "fake-cid",
+    delegationHeader: { Authorization: makeJwt(att, { aud: FAKE_AGENT_DID }) },
+    chainId: 1,
+  } as unknown as PortableDelegation;
+  let activateCalls = 0;
+  const transport = new DelegatedTransport(makeResolvedConfig(), {
+    deserialize: () => delegation,
+    activate: async () => {
+      activateCalls++;
+      return fakeSqlAccess();
+    },
+    agentIdentity: async () => fakeIdentity,
+  });
+  let caught: unknown = null;
+  try {
+    await transport.signIn();
+  } catch (e) {
+    caught = e;
+  }
+  expect(caught).toBeInstanceOf(DelegationPolicyError);
+  expect((caught as DelegationPolicyError).reason).toBe("MALFORMED");
+  expect(activateCalls).toBe(0);
 });
 
 // ---------------------------------------------------------------------------

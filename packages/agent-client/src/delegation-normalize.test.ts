@@ -9,24 +9,17 @@ import type { PortableDelegation } from "@tinycloud/node-sdk";
 import { serializeDelegation } from "@tinycloud/node-sdk";
 import { DelegationPolicyError } from "./errors";
 import { deserializeAndNormalize, normalizeDelegationGrants } from "./delegation-normalize";
-
-const OWNER = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
-const AGENT_DID = "did:pkh:eip155:1:0x83cD9777d4128012F878376aCbd6a092DcdDE01c";
-const DB_HANDLE = "xyz.tinycloud.eliza/memory";
-const SPACE = `tinycloud:pkh:eip155:1:${OWNER}:default`;
-const SQL_URI = `${SPACE}/sql/${DB_HANDLE}`;
-const CAP_URI = `${SPACE}/capabilities/${DB_HANDLE}`;
-
-function b64url(obj: unknown): string {
-  return Buffer.from(JSON.stringify(obj)).toString("base64url");
-}
-
-/** Build an (unsigned, for-test) UCAN-shaped JWT carrying the given `att`. */
-function makeJwt(att: Record<string, unknown>): string {
-  const header = b64url({ alg: "EdDSA", typ: "JWT" });
-  const payload = b64url({ att, aud: AGENT_DID, exp: 9999999999 });
-  return `${header}.${payload}.sig`; // signature is never verified by the normalizer
-}
+import {
+  AGENT_DID,
+  b64url,
+  CAP_URI,
+  DB_HANDLE,
+  FULL_GRANT_ATT,
+  makeJwt,
+  OWNER,
+  SPACE,
+  SQL_URI,
+} from "./delegation-fixtures.test";
 
 /** A PortableDelegation with a controllable Authorization header + top-level summary. */
 function makeDelegation(
@@ -52,15 +45,6 @@ function makeDelegation(
     ...(topLevel.resources !== undefined ? { resources: topLevel.resources } : {}),
   } as unknown as PortableDelegation;
 }
-
-const FULL_GRANT_ATT = {
-  [CAP_URI]: { "tinycloud.capabilities/read": [{}] },
-  [SQL_URI]: {
-    "tinycloud.sql/admin": [{}],
-    "tinycloud.sql/read": [{}],
-    "tinycloud.sql/write": [{}],
-  },
-};
 
 describe("normalizeDelegationGrants — signed-att derivation", () => {
   test("derives resources[] from the signed att (service/space/path/actions)", () => {
@@ -146,6 +130,39 @@ describe("normalizeDelegationGrants — MALFORMED rejects (no unsigned fallback)
     expect(() => normalizeDelegationGrants(makeDelegation(makeJwt({})))).toThrow(
       DelegationPolicyError,
     );
+  });
+
+  test("att resource URI in the tinycloud:// authority form rejects LOUDLY (never silently drops the SQL grant) (review #4)", () => {
+    // The `tinycloud://my-space/sql/...` authority form yields an empty service segment
+    // under a positional split — the old code silently dropped the grant, later
+    // surfacing as a confusing MISSING_SQL_RESOURCE. It must now reject as MALFORMED.
+    const att = {
+      "tinycloud://my-space/sql/xyz.tinycloud.eliza/memory": {
+        "tinycloud.sql/admin": [{}],
+        "tinycloud.sql/read": [{}],
+        "tinycloud.sql/write": [{}],
+      },
+    };
+    try {
+      normalizeDelegationGrants(makeDelegation(makeJwt(att)));
+      throw new Error("expected throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(DelegationPolicyError);
+      expect((e as DelegationPolicyError).reason).toBe("MALFORMED");
+    }
+  });
+
+  test("att value that is an ARRAY → MALFORMED, not a junk resource (review #7)", () => {
+    // An array att value would pass a bare typeof-object check and yield bogus ["0"]
+    // actions; it must be a clean MALFORMED reject instead.
+    const att = { [SQL_URI]: ["tinycloud.sql/admin"] };
+    try {
+      normalizeDelegationGrants(makeDelegation(makeJwt(att)));
+      throw new Error("expected throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(DelegationPolicyError);
+      expect((e as DelegationPolicyError).reason).toBe("MALFORMED");
+    }
   });
 
   test("SECURITY: no MALFORMED error message leaks the Authorization header", () => {

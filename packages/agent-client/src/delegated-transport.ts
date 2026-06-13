@@ -15,11 +15,15 @@
 import { readFileSync } from "node:fs";
 import type { IDatabaseHandle, PortableDelegation } from "@tinycloud/node-sdk";
 import { TinyCloudNode } from "@tinycloud/node-sdk";
-import { agentIdentityFromFile, agentIdentityFromKey, normalizeAgentKey, type AgentIdentity } from "./agent-identity";
+import { agentIdentityFromFile, agentIdentityFromKey, type AgentIdentity } from "./agent-identity";
 import type { ResolvedDelegationConfig } from "./config";
-import { AuthError } from "./errors";
-import { defaultElizaMemoryPolicy, validateDelegationPolicy } from "./delegation-policy";
-import { deserializeAndNormalize } from "./delegation-normalize";
+import { AuthError, DelegationPolicyError } from "./errors";
+import {
+  defaultElizaMemoryPolicy,
+  deserializeDelegationSafe,
+  validateDelegationPolicy,
+} from "./delegation-policy";
+import { normalizeDelegationGrants, signedOwnerAddress } from "./delegation-normalize";
 import { validateDelegationShape } from "./delegation-validate";
 import { adapterBatch, adapterExecute, adapterQuery } from "./sql-handle-adapter";
 import type {
@@ -45,16 +49,16 @@ export interface DelegatedSqlAccess {
 }
 
 /**
- * Activation function type. Takes the resolved config and the deserialized
- * PortableDelegation; returns a ready DelegatedSqlAccess handle.
+ * Activation function type. Takes the resolved config, the deserialized
+ * PortableDelegation, and the agent identity already resolved by signIn() (whose
+ * `.normalizedKey` the default activator reuses — no second disk read).
  *
- * Default implementation throws "not activated" — Task 4 wires the real
- * wallet-mode path (TinyCloudNode({ privateKey, host }) → signIn() →
- * useDelegation(delegation)). Tests inject a fake that returns immediately.
+ * Tests inject a fake that returns immediately (and may ignore the extra params).
  */
 export type DelegatedActivateFn = (
   config: ResolvedDelegationConfig,
   delegation: PortableDelegation,
+  identity: AgentIdentity,
 ) => Promise<DelegatedSqlAccess>;
 
 /**
@@ -100,16 +104,12 @@ const NOT_ACTIVATED_RESULT: { ok: false; error: TransportError } = {
 export const defaultActivate: DelegatedActivateFn = async (
   config: ResolvedDelegationConfig,
   delegation: PortableDelegation,
+  identity: AgentIdentity,
 ): Promise<DelegatedSqlAccess> => {
-  const rawKey =
-    config.agentKey ??
-    (config.agentKeyFile ? readFileSync(config.agentKeyFile, "utf-8").trim() : null);
-  if (!rawKey) {
-    throw new Error(
-      "DelegatedTransport: no agent key source found in config (agentKey or agentKeyFile)",
-    );
-  }
-  const normalizedKey = normalizeAgentKey(rawKey);
+  // Reuse the agent key signIn() already resolved + normalized (AgentIdentity) — no
+  // second readFileSync of agentKeyFile and the raw key sits in memory for less time
+  // (review #8). signIn() guarantees identity.normalizedKey is present here.
+  const normalizedKey = identity.normalizedKey;
   // Wallet mode: construct node with the agent's privateKey and sign in as the
   // agent's own PKH identity (did:pkh:eip155:1:{address}). node-sdk 2.3.0's
   // useDelegation requires an established wallet session (auth.tinyCloudSession);
@@ -142,11 +142,12 @@ export class DelegatedTransport implements Transport {
   constructor(config: ResolvedDelegationConfig, deps: DelegatedTransportDeps = {}) {
     this.config = config;
     this.deps = {
-      // Default deserialize is the signed-att normalization CHOKEPOINT: it rewrites
-      // resources/actions from the SIGNED delegationHeader.Authorization `att`, so
-      // both validators below read signed-derived data, not the forgeable top-level
-      // summary (handoff F1). Tests inject their own deserialize to bypass normalization.
-      deserialize: deps.deserialize ?? deserializeAndNormalize,
+      // The deserialize seam controls ONLY how serialized bytes parse into a
+      // PortableDelegation — NOT whether grants are signed-derived. signIn() runs
+      // normalizeDelegationGrants UNCONDITIONALLY on the result (review #5), so no
+      // construction path (a refactor, a copied fixture) can bypass the signed-att
+      // chokepoint and re-open the F1 forgery hole. Default is the raw SDK deserializer.
+      deserialize: deps.deserialize ?? deserializeDelegationSafe,
       activate: deps.activate ?? defaultActivate,
       agentIdentity: deps.agentIdentity ?? agentIdentityFromKey,
     };
@@ -216,10 +217,12 @@ export class DelegatedTransport implements Transport {
             );
           })();
 
-    // Deserialize + normalize: the default deserializer (deserializeAndNormalize)
-    // rewrites resources/actions from the SIGNED `att`, so the validators below
-    // gate on signed-derived data rather than the forgeable summary (handoff F1).
-    const delegation = this.deps.deserialize(serialized);
+    // Deserialize, then normalize STRUCTURALLY. deps.deserialize only parses bytes;
+    // normalizeDelegationGrants rewrites resources/actions from the SIGNED `att` here
+    // — unconditionally — so the validators below gate on signed-derived data rather
+    // than the forgeable top-level summary, regardless of which deserializer ran
+    // (review #5 / handoff F1).
+    const delegation = normalizeDelegationGrants(this.deps.deserialize(serialized));
 
     // Shallow shape validation — cheap pre-check: field presence, delegatee, expiry,
     // a SQL grant exists. The authoritative gate is the deep policy check below.
@@ -238,6 +241,24 @@ export class DelegatedTransport implements Transport {
       policy: defaultElizaMemoryPolicy(this.config.dbHandle),
     });
 
+    // Owner identity is taken from the SIGNED side: the owner address embedded in the
+    // signed space URI (tinycloud:pkh:eip155:{chain}:0x{owner}:default). The top-level
+    // `ownerAddress` is unsigned/forgeable, so cross-check it against the signed owner
+    // and reject a mismatch BEFORE activation — the surfaced identity must not be
+    // attacker-set while grants are signed-correct (review #6).
+    const signedAddress = signedOwnerAddress(delegation);
+    if (
+      signedAddress &&
+      delegation.ownerAddress &&
+      signedAddress.toLowerCase() !== delegation.ownerAddress.toLowerCase()
+    ) {
+      throw new DelegationPolicyError(
+        "delegation ownerAddress does not match the signed space owner",
+        "MALFORMED",
+        { field: "ownerAddress" },
+      );
+    }
+
     // Activate via deps.activate — builds a fresh wallet-mode TinyCloudNode
     // and calls useDelegation(delegation) to obtain DelegatedAccess.
     // Re-activation rebuilds from stored config (not the old node instance) — the
@@ -251,7 +272,7 @@ export class DelegatedTransport implements Transport {
     // SDK error rides on `cause` for debugging only.
     let access: DelegatedSqlAccess;
     try {
-      access = await this.deps.activate(this.config, delegation);
+      access = await this.deps.activate(this.config, delegation, identity);
     } catch (cause) {
       throw new AuthError(
         "DelegatedTransport: delegation activation failed (signIn/useDelegation)",
@@ -262,7 +283,9 @@ export class DelegatedTransport implements Transport {
 
     const result: SignInResult = {
       spaceId: access.spaceId,
-      address: delegation.ownerAddress,
+      // Signed-derived owner (cross-checked above); fall back to ownerAddress only
+      // when no resource carried a parseable space (review #6).
+      address: signedAddress ?? delegation.ownerAddress,
       did: identity.did,
     };
     this._cachedSignInResult = result;

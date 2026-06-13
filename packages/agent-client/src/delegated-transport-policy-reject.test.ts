@@ -18,35 +18,8 @@ import type { DelegatedSqlAccess } from "./delegated-transport";
 import { DelegatedTransport } from "./delegated-transport";
 import { resolveDelegationConfig } from "./config";
 import type { AgentIdentity } from "./agent-identity";
-
-const OWNER = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
-const AGENT_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-const AGENT_DID = "did:pkh:eip155:1:0x83cD9777d4128012F878376aCbd6a092DcdDE01c";
-const OTHER_DID = "did:pkh:eip155:1:0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
-const DB_HANDLE = "xyz.tinycloud.eliza/memory";
-const SPACE = `tinycloud:pkh:eip155:1:${OWNER}:default`;
-
-function b64url(obj: unknown): string {
-  return Buffer.from(JSON.stringify(obj)).toString("base64url");
-}
-
-/** A UCAN-shaped JWT carrying `att` (signature is never verified by the client). */
-function makeJwt(att: Record<string, unknown>): string {
-  return `${b64url({ alg: "EdDSA", typ: "JWT" })}.${b64url({ att, aud: AGENT_DID })}.sig`;
-}
-
-/** Build a UCAN `att` granting the given SQL actions (at sqlPath) + optional capabilities. */
-function makeAtt(opts: { sqlActions?: string[]; sqlPath?: string; caps?: boolean }): Record<string, unknown> {
-  const { sqlActions, sqlPath = DB_HANDLE, caps = true } = opts;
-  const att: Record<string, unknown> = {};
-  if (caps) att[`${SPACE}/capabilities/${DB_HANDLE}`] = { "tinycloud.capabilities/read": [{}] };
-  if (sqlActions && sqlActions.length) {
-    const inner: Record<string, unknown> = {};
-    for (const a of sqlActions) inner[a] = [{}];
-    att[`${SPACE}/sql/${sqlPath}`] = inner;
-  }
-  return att;
-}
+import { DelegationPolicyError } from "./errors";
+import { AGENT_DID, AGENT_KEY, DB_HANDLE, makeAtt, makeJwt, OTHER_DID, OWNER, SPACE } from "./delegation-fixtures.test";
 
 /**
  * Serialize a delegation with INDEPENDENTLY controllable signed `att` and
@@ -185,6 +158,43 @@ test("forged-unsigned-actions: top-level claims sql/admin but signed att grants 
     topActions: ["tinycloud.sql/admin", "tinycloud.sql/read", "tinycloud.sql/write"], // FORGED summary
   });
   await expectRejectBeforeActivate(forged);
+});
+
+// ---------------------------------------------------------------------------
+// Non-JWT Authorization: a delegation with no signed capability JWT (a bare
+// `Bearer <cid>`) is hard-rejected — the strict contract (no signed att ⇒ no
+// trust). The reject is actionable and never reaches activate (review #1).
+// ---------------------------------------------------------------------------
+
+test("non-JWT Authorization (Bearer <cid>, no signed att) rejects before activate with an actionable cause (review #1)", async () => {
+  // Raw JSON so the non-JWT Authorization survives (serializeDelegation would not
+  // re-derive it). This is exactly the committed sample / harness-fallback shape.
+  const serialized = JSON.stringify({
+    cid: "bafytestcid",
+    delegateDID: AGENT_DID,
+    spaceId: SPACE,
+    path: DB_HANDLE,
+    actions: ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"],
+    expiry: new Date("2099-01-01T00:00:00.000Z").toISOString(),
+    delegationHeader: { Authorization: "Bearer bafytestcid" }, // not a JWT (no dots)
+    ownerAddress: OWNER,
+    chainId: 1,
+    host: "https://node.tinycloud.xyz",
+  });
+  const { transport, activated } = makeTransport(serialized);
+  let caught: unknown = null;
+  try {
+    await transport.signIn();
+  } catch (e) {
+    caught = e;
+  }
+  expect(caught).toBeInstanceOf(DelegationPolicyError);
+  expect((caught as DelegationPolicyError).reason).toBe("MALFORMED");
+  // Names the missing-signed-capability cause (actionable), without leaking the header.
+  expect((caught as Error).message).toMatch(/signed capability/i);
+  expect((caught as Error).message).not.toContain("bafytestcid");
+  // The critical invariant: NO activation/useDelegation happened.
+  expect(activated()).toBe(0);
 });
 
 test("forged delegation rejection error does not leak the signed JWT", async () => {
