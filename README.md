@@ -77,6 +77,30 @@ Full walkthrough — including the roomId-stability caveat for session summaries
 (long-term memories hydrate fully; old summaries may orphan harmlessly) — in
 [docs/hydration.md](docs/hydration.md).
 
+## Live scenario testing
+
+The deterministic test suite is offline. To test the real product path against a
+TinyCloud node, run the opt-in live Eliza scenario suite:
+
+```sh
+bun --bun run test:live:eliza
+TINYCLOUD_LIVE=1 bun --bun run test:live:eliza
+```
+
+Without `TINYCLOUD_LIVE=1`, the command prints a skipped JSON result and exits
+successfully. With `TINYCLOUD_LIVE=1`, it uses `TINYCLOUD_PRIVATE_KEY` if set;
+otherwise it generates and saves a throwaway key in the ignored file
+`packages/eliza-plugin-memory/.agents-audit/eliza-live-key.env`.
+
+The suite boots a real Eliza `AgentRuntime` with `advancedMemory: true`, registers
+`@tinycloud/eliza-plugin-memory` before `@elizaos/plugin-sql`, writes long-term
+memory and a session summary through Eliza's `MemoryService`, reads the same rows
+from a separate TinyCloud client workflow, then boots a fresh runtime with the
+same key and verifies hydration.
+
+This tests the current MVP auth shape: an agent-owned dedicated key. It does not
+test OpenKey/passkey login or user-to-agent delegation.
+
 ## Multi-tenancy
 
 - **One space per agent** (default; plan §6). The space is derived from the agent's

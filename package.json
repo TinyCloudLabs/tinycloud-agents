@@ -9,7 +9,8 @@
   "scripts": {
     "build": "bun --bun run --filter '*' build",
     "typecheck": "bun --bun run --filter '*' typecheck",
-    "test": "bun --bun run --filter '*' test"
+    "test": "bun --bun run --filter '*' test",
+    "test:live:eliza": "cd packages/eliza-plugin-memory && bun --bun run test:live:eliza"
   },
   "devDependencies": {
     "typescript": "5.7.2"

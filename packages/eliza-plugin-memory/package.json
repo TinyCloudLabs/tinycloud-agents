@@ -31,7 +31,8 @@
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "test:live:eliza": "bun --bun scripts/live-eliza-scenarios.ts"
   },
   "dependencies": {
     "@tinycloud/agent-client": "workspace:*"
