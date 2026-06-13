@@ -61,6 +61,14 @@ export interface SessionOptions {
   clock?: Clock;
   /** Logger. Defaults to consoleLogger. */
   logger?: Logger;
+  /**
+   * Whether to arm the proactive refresh timer after signIn.
+   * Set to false for delegated sessions: a portable delegation has a fixed
+   * expiry baked into its header, and re-running useDelegation on a timer
+   * cannot extend it — the timer would be pure churn.
+   * Defaults to true (private-key mode behavior unchanged).
+   */
+  proactiveRefresh?: boolean;
 }
 
 /** Outcome of one node attempt: a result (possibly an ok:false non-auth error) or an auth failure. */
@@ -78,6 +86,8 @@ export class Session {
   private readonly reSignInMs: number;
   private readonly clock: Clock;
   private readonly logger: Logger;
+  /** When false, the proactive refresh timer is never armed (delegation mode). */
+  private readonly proactiveRefresh: boolean;
 
   /** Cached established session; null until first signIn (or after a forced re-signIn). */
   private established: SignInResult | null = null;
@@ -96,6 +106,7 @@ export class Session {
     this.reSignInMs = options.reSignInMs;
     this.clock = options.clock ?? realClock;
     this.logger = options.logger ?? consoleLogger;
+    this.proactiveRefresh = options.proactiveRefresh ?? true;
   }
 
   /**
@@ -222,6 +233,10 @@ export class Session {
   /** Force a fresh signIn, invalidating the cached session and deduping concurrent callers. */
   private async reSignIn(): Promise<SignInResult> {
     this.established = null;
+    // Clear any transport-level cached session so the next signIn() performs a
+    // fresh activation. Required for DelegatedTransport (rebuilds TinyCloudNode
+    // from stored agent key + delegation) — no-op for transports that don't cache.
+    this.transport.invalidate?.();
     return this.ensureSignedIn();
   }
 
@@ -231,18 +246,23 @@ export class Session {
     return result;
   }
 
-  /** (Re)arm the proactive refresh timer; the handle is unref()'d (must not pin the process). */
+  /**
+   * (Re)arm the proactive refresh timer; the handle is unref()'d (must not pin the process).
+   * Does nothing when proactiveRefresh is false (delegation mode) — portable delegations
+   * have a fixed expiry that cannot be extended by re-running useDelegation on a timer.
+   */
   private scheduleRefresh(): void {
     if (this.stopped) return;
+    if (!this.proactiveRefresh) return;
     if (this.refreshTimer !== null) {
       this.clock.clearTimeout(this.refreshTimer);
     }
     this.refreshTimer = this.armUnref(() => {
-      void this.proactiveRefresh();
+      void this.doProactiveRefresh();
     }, this.reSignInMs);
   }
 
-  private async proactiveRefresh(): Promise<void> {
+  private async doProactiveRefresh(): Promise<void> {
     if (this.stopped) return;
     try {
       await this.reSignIn();

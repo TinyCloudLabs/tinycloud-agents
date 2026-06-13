@@ -1,7 +1,7 @@
 {
   "name": "@tinycloud/eliza-plugin-memory",
   "version": "0.1.0",
-  "description": "elizaOS plugin owning the advanced-memory \"memoryStorage\" slot, backed by a user-owned TinyCloud space.",
+  "description": "elizaOS plugin owning the advanced-memory \"memoryStorage\" slot, backed by a TinyCloud space.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -31,8 +31,10 @@
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc --noEmit",
-    "test": "bun test",
-    "test:live:eliza": "bun --bun scripts/live-eliza-scenarios.ts"
+    "test": "bun test && bun test scripts/consent-harness.test.ts && bun test scripts/fixtures/make-delegation-fixtures.test.ts && bun test scripts/live-delegated-negative.test.ts",
+    "test:live:eliza": "bun --bun scripts/live-eliza-scenarios.ts",
+    "test:live:eliza:delegated": "bun --bun scripts/live-delegated-scenarios.ts",
+    "consent:harness": "bun --bun scripts/consent-harness.ts"
   },
   "dependencies": {
     "@tinycloud/agent-client": "workspace:*"

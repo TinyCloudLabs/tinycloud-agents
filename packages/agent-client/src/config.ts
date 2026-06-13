@@ -32,6 +32,8 @@ export const DEFAULT_RE_SIGN_IN_MS = 50 * 60_000;
  * has a plan-dictated default (see {@link resolveConfig}).
  */
 export interface AgentClientConfig {
+  /** Auth mode discriminant. Optional; defaults to `private-key`. */
+  mode?: "private-key";
   /** Hex-encoded private key (with or without 0x). The agent owns its memory space. */
   privateKey: string;
   /** Node endpoint. SINGULAR `host`. Defaults to {@link DEFAULT_HOST}. */
@@ -51,6 +53,42 @@ export interface AgentClientConfig {
   /** Proactive re-signIn interval (ms). Defaults to {@link DEFAULT_RE_SIGN_IN_MS}. */
   reSignInMs?: number;
 }
+
+/**
+ * Caller-supplied configuration for delegation mode.
+ * Requires exactly one delegation source (serializedDelegation XOR delegationFile)
+ * and exactly one stable agent key source (agentKey XOR agentKeyFile).
+ * SECURITY: never pass secret values through error messages.
+ */
+export interface DelegationAgentClientConfig {
+  /** Auth mode discriminant — required for delegation mode. */
+  mode: "delegation";
+  /** Inline serialized portable delegation. Provide either this or delegationFile, not both. */
+  serializedDelegation?: string;
+  /** Path to file containing serialized delegation. Provide either this or serializedDelegation, not both. */
+  delegationFile?: string;
+  /** Inline stable agent identity key material. Provide either this or agentKeyFile, not both. */
+  agentKey?: string;
+  /** Path to file containing stable agent identity key material. Provide either this or agentKey, not both. */
+  agentKeyFile?: string;
+  /** Node endpoint. SINGULAR `host`. Defaults to {@link DEFAULT_HOST}. */
+  host?: string;
+  /** Full-path SQL db handle. Defaults to {@link DEFAULT_DB_HANDLE}. */
+  dbHandle?: string;
+  /** Hard per-call socket timeout (ms). Defaults to {@link DEFAULT_REQUEST_TIMEOUT_MS}. */
+  requestTimeoutMs?: number;
+  /** Bounded write-queue depth. Defaults to {@link DEFAULT_WRITE_QUEUE_LIMIT}. */
+  writeQueueLimit?: number;
+  /** Consecutive failures before the breaker opens. Defaults to {@link DEFAULT_BREAKER_THRESHOLD}. */
+  breakerThreshold?: number;
+  /** Breaker open duration (ms). Defaults to {@link DEFAULT_BREAKER_OPEN_MS}. */
+  breakerOpenMs?: number;
+  /** Proactive re-signIn interval (ms). Defaults to {@link DEFAULT_RE_SIGN_IN_MS}. */
+  reSignInMs?: number;
+}
+
+/** Auth config union — private-key mode or delegation mode. */
+export type AgentClientAuthConfig = AgentClientConfig | DelegationAgentClientConfig;
 
 /** {@link AgentClientConfig} with every optional knob filled in. */
 export interface ResolvedAgentClientConfig {
@@ -83,5 +121,98 @@ export function resolveConfig(config: AgentClientConfig): ResolvedAgentClientCon
     breakerThreshold: config.breakerThreshold ?? DEFAULT_BREAKER_THRESHOLD,
     breakerOpenMs: config.breakerOpenMs ?? DEFAULT_BREAKER_OPEN_MS,
     reSignInMs: config.reSignInMs ?? DEFAULT_RE_SIGN_IN_MS,
+  };
+}
+
+/** {@link DelegationAgentClientConfig} with every optional knob filled in. */
+export interface ResolvedDelegationConfig {
+  mode: "delegation";
+  /** Serialized portable delegation (set when serializedDelegation was provided). */
+  serializedDelegation?: string;
+  /** Delegation file path (set when delegationFile was provided). */
+  delegationFile?: string;
+  /** Inline agent identity key material (set when agentKey was provided). */
+  agentKey?: string;
+  /** Agent key file path (set when agentKeyFile was provided). */
+  agentKeyFile?: string;
+  host: string;
+  dbHandle: string;
+  requestTimeoutMs: number;
+  writeQueueLimit: number;
+  breakerThreshold: number;
+  breakerOpenMs: number;
+  reSignInMs: number;
+  /**
+   * Redacts agentKey and serializedDelegation so that accidental JSON.stringify
+   * or logger serialization cannot leak secret key material. Property access
+   * (resolved.agentKey) still returns the real value so the transport can consume it.
+   */
+  toJSON(): object;
+}
+
+/**
+ * Validate and fill plan-§5 defaults for a delegation config.
+ * Throws actionable errors on missing or conflicting inputs.
+ * SECURITY: error messages never include the value of agentKey, serializedDelegation,
+ * or any other secret material — only the field names.
+ */
+export function resolveDelegationConfig(
+  config: DelegationAgentClientConfig,
+): ResolvedDelegationConfig {
+  const hasDelegation = !!config.serializedDelegation;
+  const hasDelegationFile = !!config.delegationFile;
+  if (!hasDelegation && !hasDelegationFile) {
+    throw new Error(
+      "DelegationAgentClientConfig requires a delegation source: provide serializedDelegation or delegationFile",
+    );
+  }
+  if (hasDelegation && hasDelegationFile) {
+    throw new Error(
+      "DelegationAgentClientConfig: provide serializedDelegation or delegationFile, not both",
+    );
+  }
+
+  const hasAgentKey = !!config.agentKey;
+  const hasAgentKeyFile = !!config.agentKeyFile;
+  if (!hasAgentKey && !hasAgentKeyFile) {
+    throw new Error(
+      "DelegationAgentClientConfig requires a stable agent key source: provide agentKey or agentKeyFile",
+    );
+  }
+  if (hasAgentKey && hasAgentKeyFile) {
+    throw new Error(
+      "DelegationAgentClientConfig: provide agentKey or agentKeyFile, not both",
+    );
+  }
+
+  return {
+    mode: "delegation" as const,
+    serializedDelegation: config.serializedDelegation,
+    delegationFile: config.delegationFile,
+    agentKey: config.agentKey,
+    agentKeyFile: config.agentKeyFile,
+    host: config.host ?? DEFAULT_HOST,
+    dbHandle: config.dbHandle ?? DEFAULT_DB_HANDLE,
+    requestTimeoutMs: config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+    writeQueueLimit: config.writeQueueLimit ?? DEFAULT_WRITE_QUEUE_LIMIT,
+    breakerThreshold: config.breakerThreshold ?? DEFAULT_BREAKER_THRESHOLD,
+    breakerOpenMs: config.breakerOpenMs ?? DEFAULT_BREAKER_OPEN_MS,
+    reSignInMs: config.reSignInMs ?? DEFAULT_RE_SIGN_IN_MS,
+    toJSON() {
+      return {
+        mode: this.mode,
+        serializedDelegation: this.serializedDelegation !== undefined ? "[REDACTED]" : undefined,
+        delegationFile: this.delegationFile,
+        agentKey: this.agentKey !== undefined ? "[REDACTED]" : undefined,
+        agentKeyFile: this.agentKeyFile,
+        host: this.host,
+        dbHandle: this.dbHandle,
+        requestTimeoutMs: this.requestTimeoutMs,
+        writeQueueLimit: this.writeQueueLimit,
+        breakerThreshold: this.breakerThreshold,
+        breakerOpenMs: this.breakerOpenMs,
+        reSignInMs: this.reSignInMs,
+      };
+    },
   };
 }

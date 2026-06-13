@@ -167,6 +167,46 @@ test("LTM reads return Date objects and parsed JSON columns (not strings)", asyn
   expect(row.accessCount).toBe(4);
 });
 
+// ── embeddings round-trip through the PUBLIC store→get seam (handoff GAP 5) ────
+// The live run had no TEXT_EMBEDDING model so memories were stored without
+// embeddings. The model generation + vector ranking live in Eliza core; the part
+// WE own is persisting/returning the embedding vector intact. These prove the
+// write-path serialization + read-path parse survive a realistic-dimension vector
+// and the null case. (A real-model end-to-end pass remains a manual prod gate.)
+
+test("storeLongTermMemory → getLongTermMemories round-trips a realistic-dimension embedding intact", async () => {
+  // Deterministic 384-dim vector (a common embedding size). No RNG (Math.random is unavailable).
+  const vec = Array.from({ length: 384 }, (_, i) => Number(((i % 13) / 13).toFixed(6)));
+  await svc.storeLongTermMemory({
+    agentId: AGENT,
+    entityId: ENTITY,
+    category: "fact",
+    content: "the user prefers oat milk",
+    embedding: vec,
+    confidence: 0.8,
+    source: "evaluator",
+  } as never);
+
+  const [row] = await svc.getLongTermMemories(AGENT as never, ENTITY as never);
+  expect(Array.isArray(row.embedding)).toBe(true);
+  expect(row.embedding).toHaveLength(384);
+  expect(row.embedding).toEqual(vec); // full vector survives store(JSON) → get(parse)
+});
+
+test("storeLongTermMemory with no embedding reads back null (the live no-TEXT_EMBEDDING case)", async () => {
+  await svc.storeLongTermMemory({
+    agentId: AGENT,
+    entityId: ENTITY,
+    category: "fact",
+    content: "no embedding generated",
+    confidence: 0.5,
+    source: "evaluator",
+  } as never);
+
+  const [row] = await svc.getLongTermMemories(AGENT as never, ENTITY as never);
+  expect(row.embedding ?? null).toBeNull();
+});
+
 test("summary reads return Date objects and parsed topics/metadata", async () => {
   seedSummary(client.db, {
     id: "ts",

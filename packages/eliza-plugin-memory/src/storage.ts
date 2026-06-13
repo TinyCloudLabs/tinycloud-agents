@@ -131,9 +131,40 @@ export class TinyCloudMemoryStorageService
   // ── lifecycle (plan §3 / §5 start+stop rows) ────────────────────────────────
 
   static async start(runtime: IAgentRuntime): Promise<Service> {
+    // Fail-fast precedence guard FIRST — before any network bring-up (plan §2.2 /
+    // handoff GAP 5). We win the shared "memoryStorage" slot only by registering
+    // BEFORE @elizaos/plugin-sql (first-registered wins). If a foreign memoryStorage
+    // is already in the slot, the operator misordered plugins and our memory would
+    // silently route to local SQLite — throw loud instead of failing silently.
+    TinyCloudMemoryStorageService.assertSlotNotTaken(runtime);
     const service = new TinyCloudMemoryStorageService(runtime);
     await service.startClient(runtime);
     return service;
+  }
+
+  /**
+   * Throws (loud, actionable) if a NON-TinyCloud service already holds the
+   * "memoryStorage" slot — the signature of plugin-sql being listed first.
+   * Order-independent: when we are first, no foreign incumbent exists and this
+   * is a no-op; when plugin-sql is first, its AdvancedMemoryStorageService is
+   * already registered by the time our start() runs, so we detect and reject it.
+   * Degrades gracefully (no-op) on runtimes without getServicesByType.
+   */
+  private static assertSlotNotTaken(runtime: IAgentRuntime): void {
+    const byType = (runtime as { getServicesByType?: (t: string) => unknown[] }).getServicesByType;
+    if (typeof byType !== "function") return;
+    const incumbents = byType.call(runtime, TinyCloudMemoryStorageService.serviceType) ?? [];
+    const foreign = (incumbents as object[]).find(
+      (s) => !(s instanceof TinyCloudMemoryStorageService),
+    );
+    if (foreign) {
+      const name = (foreign as { constructor?: { name?: string } }).constructor?.name ?? "another service";
+      throw new Error(
+        `@tinycloud/eliza-plugin-memory: the "memoryStorage" slot is already held by ` +
+          `${name}. List "@tinycloud/eliza-plugin-memory" BEFORE "@elizaos/plugin-sql" in ` +
+          `character.plugins so it wins the slot (first-registered wins, plan §2.2).`,
+      );
+    }
   }
 
   /** signIn → ensureSchema(§4 DDL). Throws on failure → MemoryService disables (fail-open, §2.2). */

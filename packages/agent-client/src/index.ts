@@ -22,8 +22,15 @@ export {
   DEFAULT_BREAKER_OPEN_MS,
   DEFAULT_RE_SIGN_IN_MS,
   resolveConfig,
+  resolveDelegationConfig,
 } from "./config";
-export type { AgentClientConfig, ResolvedAgentClientConfig } from "./config";
+export type {
+  AgentClientConfig,
+  AgentClientAuthConfig,
+  DelegationAgentClientConfig,
+  ResolvedAgentClientConfig,
+  ResolvedDelegationConfig,
+} from "./config";
 
 export {
   TinyCloudClientError,
@@ -32,6 +39,7 @@ export {
   CircuitOpenError,
   AuthError,
   SqlError,
+  DelegationPolicyError,
 } from "./errors";
 
 export { consoleLogger, silentLogger } from "./logger";
@@ -50,6 +58,9 @@ export type {
 } from "./transport";
 
 export { NodeSdkTransport } from "./node-sdk-transport";
+export { DelegatedTransport } from "./delegated-transport";
+export type { DelegatedSqlAccess, DelegatedTransportDeps, DelegatedActivateFn } from "./delegated-transport";
+export { validateDelegationShape, DelegationShapeError } from "./delegation-validate";
 
 export { Worker, realClock } from "./worker";
 export type {
@@ -72,3 +83,14 @@ export type { EnsureSchema } from "./schema";
 
 export { createAgentClient } from "./client";
 export type { AgentClient, AgentClientDeps } from "./client";
+
+export { normalizeAgentKey, agentIdentityFromKey, agentIdentityFromFile } from "./agent-identity";
+export type { AgentIdentity } from "./agent-identity";
+
+export { defaultElizaMemoryPolicy, deserializeDelegationSafe, assertWellFormed, validateDelegationPolicy, computePolicyHash, evaluateDelegationStatus } from "./delegation-policy";
+export type { DelegationPolicy, PolicyResource } from "./delegation-policy";
+
+export { deserializeAndNormalize, normalizeDelegationGrants } from "./delegation-normalize";
+
+export { serializeDelegation, deserializeDelegation } from "@tinycloud/node-sdk";
+export type { PortableDelegation } from "@tinycloud/node-sdk";

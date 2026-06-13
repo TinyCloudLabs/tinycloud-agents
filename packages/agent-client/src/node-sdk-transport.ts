@@ -1,8 +1,9 @@
-// The real Transport over @tinycloud/node-sdk.
+// The real Transport over @tinycloud/node-sdk (private-key mode).
 //
-// This is the ONLY file in agent-client that imports the node-sdk. It performs
-// no queueing/retry/timeout — it just adapts node-sdk calls to the Transport seam
-// (./transport.ts). The resilience layer (T3/T4) wraps this.
+// This file adapts node-sdk calls to the Transport seam (./transport.ts).
+// It performs no queueing/retry/timeout — the resilience layer (T3/T4) wraps it.
+//
+// SQL result mapping is shared with DelegatedTransport via sql-handle-adapter.ts.
 //
 // HARD CONTRACT: zero host-framework (Eliza) imports — see ./index.ts.
 
@@ -10,6 +11,7 @@ import { TinyCloudNode } from "@tinycloud/node-sdk";
 import type { IDatabaseHandle } from "@tinycloud/node-sdk";
 import type { ResolvedAgentClientConfig } from "./config";
 import { AuthError } from "./errors";
+import { adapterBatch, adapterExecute, adapterQuery } from "./sql-handle-adapter";
 import type {
   BatchData,
   ExecuteData,
@@ -18,33 +20,8 @@ import type {
   SqlStatement,
   SqlValue,
   Transport,
-  TransportError,
   TransportResult,
 } from "./transport";
-
-/**
- * The node-sdk Result discriminant, structurally. We don't import the node-sdk's
- * `Result`/`ServiceError` (not re-exported from its entrypoint), so we describe
- * the success/error shapes we read locally.
- */
-type SdkResult<T> =
-  | { ok: true; data: T }
-  | { ok: false; error: { code: string; message: string; service?: string } };
-
-/** Map a node-sdk ServiceError shape to a redacted {@link TransportError} (drops `cause`). */
-function toTransportError(error: {
-  code: string;
-  message: string;
-  service?: string;
-}): TransportError {
-  return { code: error.code, message: error.message, service: error.service };
-}
-
-/** Adapt a node-sdk Result to a Transport Result, mapping data on success. */
-function mapResult<T, U>(result: SdkResult<T>, mapData: (data: T) => U): TransportResult<U> {
-  if (result.ok) return { ok: true, data: mapData(result.data) };
-  return { ok: false, error: toTransportError(result.error) };
-}
 
 /** Real Transport: a thin adapter over a signed-in {@link TinyCloudNode}. */
 export class NodeSdkTransport implements Transport {
@@ -84,29 +61,14 @@ export class NodeSdkTransport implements Transport {
   }
 
   async query(sql: string, params?: SqlValue[]): Promise<TransportResult<QueryData>> {
-    const result = await this.db().query(sql, params);
-    return mapResult(result, (data) => ({
-      columns: data.columns,
-      rows: data.rows,
-      rowCount: data.rowCount,
-    }));
+    return adapterQuery(this.db(), sql, params);
   }
 
   async execute(sql: string, params?: SqlValue[]): Promise<TransportResult<ExecuteData>> {
-    const result = await this.db().execute(sql, params);
-    return mapResult(result, (data) => ({
-      changes: data.changes,
-      lastInsertRowId: data.lastInsertRowId,
-    }));
+    return adapterExecute(this.db(), sql, params);
   }
 
   async batch(statements: SqlStatement[]): Promise<TransportResult<BatchData>> {
-    const result = await this.db().batch(statements);
-    return mapResult(result, (data) => ({
-      results: data.results.map((r) => ({
-        changes: r.changes,
-        lastInsertRowId: r.lastInsertRowId,
-      })),
-    }));
+    return adapterBatch(this.db(), statements);
   }
 }

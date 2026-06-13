@@ -16,7 +16,13 @@
 //
 // HARD CONTRACT: zero host-framework (Eliza) imports — see ./index.ts.
 
-import { resolveConfig, type AgentClientConfig } from "./config";
+import {
+  resolveConfig,
+  resolveDelegationConfig,
+  type AgentClientAuthConfig,
+  type AgentClientConfig,
+} from "./config";
+import { DelegatedTransport } from "./delegated-transport";
 import { consoleLogger, type Logger } from "./logger";
 import { NodeSdkTransport } from "./node-sdk-transport";
 import { createEnsureSchema, type EnsureSchema } from "./schema";
@@ -50,16 +56,53 @@ export interface AgentClient {
 }
 
 /**
- * Build a client from a {@link AgentClientConfig}. Knob defaults come from plan §5
- * (see ./config). Side-effect-free until first use — signIn is lazy.
+ * Build a client from an {@link AgentClientAuthConfig}. Supports both
+ * private-key mode and delegation mode.
  */
 export function createAgentClient(
-  config: AgentClientConfig,
+  config: AgentClientAuthConfig,
   deps: AgentClientDeps = {},
 ): AgentClient {
-  const resolved = resolveConfig(config);
   const clock = deps.clock ?? realClock;
   const logger = deps.logger ?? consoleLogger;
+
+  if (config.mode === "delegation") {
+    const resolved = resolveDelegationConfig(config);
+    const transport = deps.transport ?? new DelegatedTransport(resolved);
+    const worker =
+      deps.worker ??
+      new Worker({
+        requestTimeoutMs: resolved.requestTimeoutMs,
+        writeQueueLimit: resolved.writeQueueLimit,
+        breakerThreshold: resolved.breakerThreshold,
+        breakerOpenMs: resolved.breakerOpenMs,
+        clock,
+        logger,
+      });
+
+    const session = new Session({
+      transport,
+      worker,
+      reSignInMs: resolved.reSignInMs,
+      proactiveRefresh: false,
+      clock,
+      logger,
+    });
+
+    const sql = createSql(session, transport);
+    const ensureSchema = createEnsureSchema(sql, logger);
+
+    return {
+      sql,
+      ensureSchema,
+      signIn: () => session.ensureSignedIn(),
+      stop: async () => {
+        await session.stop();
+      },
+    };
+  }
+
+  const resolved = resolveConfig(config);
 
   const transport = deps.transport ?? new NodeSdkTransport(resolved);
   const worker =

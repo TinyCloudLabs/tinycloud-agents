@@ -1,13 +1,17 @@
 # OpenKey Auth Handoff
 
-Status: ready for an agent to start the proper-auth pass.
+Status: delegated auth implemented (Phases 3-7 complete). Delegated SQL activation,
+delegated transport, consent harness, and live delegated Eliza scenario are shipped.
+Remaining: revocation/policy-hash status (not yet wired), auth sidecar (product decision).
+
+Latest implementation handoff:
+`docs/openkey-auth-implementation-handoff.md`.
 
 This handoff is for the next agent working on TinyCloud auth for
-`tinycloud-agents`. The memory stack itself is implemented and tested against the
-current MVP auth model: a dedicated agent-owned private key. The missing work is
-to replace or extend that with the real OpenKey/user-to-agent delegation flow so
-an Eliza agent can operate on a user-authorized TinyCloud space without ever
-asking for the user's private key.
+`tinycloud-agents`. The memory stack is implemented and tested for both auth modes.
+Private-key mode uses a dedicated agent-owned key. Delegated mode (Phases 3-7, now
+shipped) allows an Eliza agent to operate on a user-authorized TinyCloud space
+through a portable delegation — the user's private key is never requested.
 
 ## TL;DR
 
@@ -44,7 +48,7 @@ Implemented packages:
   - Stores long-term memories and session summaries in SQL db handle
     `xyz.tinycloud.eliza/memory`.
 
-Current config:
+Current config — private-key mode (existing/dev/simple-agent path):
 
 ```env
 TINYCLOUD_PRIVATE_KEY=0x...
@@ -52,6 +56,34 @@ TINYCLOUD_HOST=https://node.tinycloud.xyz
 TINYCLOUD_DB_HANDLE=xyz.tinycloud.eliza/memory
 TINYCLOUD_SPACE_PREFIX=
 ```
+
+Delegated-mode config surface (shipped — Phases 3-7 complete):
+
+```env
+TINYCLOUD_AUTH_MODE=delegation
+# Exactly one delegation source:
+TINYCLOUD_DELEGATION=<inline serialized portable delegation>
+# or
+TINYCLOUD_DELEGATION_FILE=/path/to/delegation.json
+# Exactly one stable agent identity key source (not the user's key):
+TINYCLOUD_AGENT_KEY=0x...
+# or
+TINYCLOUD_AGENT_KEY_FILE=/path/to/agent-key.hex
+# Common to both modes:
+TINYCLOUD_HOST=https://node.tinycloud.xyz
+TINYCLOUD_DB_HANDLE=xyz.tinycloud.eliza/memory
+```
+
+Identity model:
+
+| Identity | DID shape | Purpose |
+| --- | --- | --- |
+| Human (OpenKey/passkey) | `did:pkh:eip155:{chainId}:{address}` | TinyCloud space owner; signs consent. |
+| Agent | `did:pkh:eip155:1:{address}` | Stable delegation target; derived from `TINYCLOUD_AGENT_KEY`. Not the user's key. |
+| Runtime session key | `did:key:...#...` | SDK session key; internal to TinyCloudNode. |
+
+The agent DID is stable across process restarts for the same `TINYCLOUD_AGENT_KEY`.
+Different key → different DID → existing user delegations will not match.
 
 Verification already passing:
 
@@ -527,7 +559,41 @@ bun run test
 
 ## Current Readiness Statement
 
-Everything below auth is ready to start testing proper auth against:
+Phases 3-7 shipped: delegated auth is implemented. The acceptance-matrix items for
+delegated SQL, consent delivery, and the live delegated Eliza scenario now pass.
+Remaining open items: auth sidecar (product decision, not committed) and
+revocation/policy-hash status (not yet wired in `delegation-validate.ts`).
+
+### Done
+
+- Auth config union: `private-key` (default) and `delegation` modes.
+- Backward-compatible: `createAgentClient({ privateKey })` still works unchanged.
+- Delegated-mode config parsing and error reporting (tests pass; build passes).
+- Stable agent DID helper (`agentIdentityFromKey`, `agentIdentityFromFile`) —
+  same key → same DID across process restarts; tests pass.
+- Docs env surface: both modes documented in README and plugin README.
+- Existing private-key build, typecheck, and unit tests: all pass.
+- Delegated SQL activation (`TinyCloudNode.useDelegation` called in `DelegatedTransport`) — Phase 3.
+- Delegated transport (`DelegatedAccess.sql` behind the `Transport` interface via
+  `DelegatedTransport` class in `packages/agent-client/src/delegated-transport.ts`) — Phase 3.
+- Delegation policy model and validation (`delegation-policy.ts`, `delegation-validate.ts`;
+  wrong delegatee, wrong owner, insufficient policy, and expired grant are rejected) — Phase 4.
+- Plugin delegated integration: `resolveMemoryClientConfig` resolves delegation config;
+  `createAgentClient` routes to `DelegatedTransport`; `TinyCloudMemoryStorageService` is
+  auth-mode-agnostic (no change needed in the plugin for delegation mode to work).
+- Live consent harness (offline; derives stable agent DID, emits delegation URL for manual
+  OpenKey/passkey step 1, computes policy hash) — Phase 6.
+- Live delegated Eliza scenario: agent writes long-term memory + session summary through
+  delegated SQL; separate user-authorized client reads the same rows from the user's space;
+  fresh agent process restores from the same delegation file and hydrates
+  (`TINYCLOUD_LIVE=1 TINYCLOUD_DELEGATION_FILE=...`; step 1 — OpenKey sign-in — is manual) — Phase 7.
+
+### Not yet done
+
+- Auth sidecar — product decision; not committed.
+- Revocation and policy-hash status — not yet wired (see `delegation-validate.ts` TODO at line 75).
+
+### What is solid to build on
 
 - Eliza runtime integration.
 - TinyCloud memory storage service ownership.
@@ -536,6 +602,7 @@ Everything below auth is ready to start testing proper auth against:
 - Fresh-runtime hydration.
 - Live prod TinyCloud node path at `https://node.tinycloud.xyz`.
 
-The next work should focus on identity, consent, delegation materialization,
-delegation activation, and lifecycle handling. Once those pass the acceptance
-matrix above, this becomes battle-ready for the auth layer.
+Phases 3-7 are complete: delegated transport, policy validation, consent harness,
+and the live delegated Eliza scenario all pass the acceptance matrix. The auth
+layer is now battle-ready for delegated mode. Remaining open items: revocation
+and policy-hash status (not yet wired), auth sidecar (product decision).

@@ -156,7 +156,20 @@ test("a failing read leaks no unhandled rejection", async () => {
 
 // ── start() failure propagates (→ MemoryService disables storage) ─────────────
 
-test("start() rejects when TINYCLOUD_PRIVATE_KEY is missing (fail-open at the slot)", async () => {
+test("start() rejects when TINYCLOUD_PRIVATE_KEY is missing in private-key mode (fail-open at the slot)", async () => {
   const runtime = { getSetting: () => undefined } as never;
   await expect(TinyCloudMemoryStorageService.start(runtime)).rejects.toThrow(/PRIVATE_KEY/);
+});
+
+test("start() rejects with an error when the delegation agent key is invalid (Phase 3: delegation mode is live)", async () => {
+  // Phase 3 implemented delegation mode, so the "not yet implemented" throw is gone.
+  // A structurally valid config but with an invalid agent key now fails during
+  // signIn/ensureSchema (key validation happens lazily, not at construction).
+  const settings: Record<string, string> = {
+    TINYCLOUD_AUTH_MODE: "delegation",
+    TINYCLOUD_DELEGATION: "fake-serialized-delegation",
+    TINYCLOUD_AGENT_KEY: "0xfakeagentkey",
+  };
+  const runtime = { getSetting: (key: string) => settings[key] ?? undefined } as never;
+  await expect(TinyCloudMemoryStorageService.start(runtime)).rejects.toThrow();
 });

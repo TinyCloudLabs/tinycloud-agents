@@ -70,6 +70,14 @@ export interface SignInResult {
 export interface Transport {
   /** Establish (or re-establish) the session; creates the space on first run. */
   signIn(): Promise<SignInResult>;
+  /**
+   * Clear any cached session state so the next signIn() performs a fresh
+   * activation. Optional — only implemented by transports that cache (e.g.
+   * DelegatedTransport caches DelegatedAccess). Session calls this before a
+   * forced re-signIn so delegation mode rebuilds the node from the stored agent
+   * key + serialized delegation, not the old (possibly expired) node instance.
+   */
+  invalidate?(): void;
   /** Run a SQL read. */
   query(sql: string, params?: SqlValue[]): Promise<TransportResult<QueryData>>;
   /** Run a single SQL write/DDL. */

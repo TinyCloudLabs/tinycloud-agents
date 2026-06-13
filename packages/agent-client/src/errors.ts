@@ -49,6 +49,32 @@ export class AuthError extends TinyCloudClientError {
 }
 
 /**
+ * Delegation policy validation failed. The `reason` code identifies the
+ * first failing check in the reject-matrix (malformed -> delegatee -> expired
+ * -> resource presence -> db handle -> actions).
+ *
+ * SECURITY: messages and context MUST NEVER include delegationHeader /
+ * Authorization / authHeader / agentKey or the serialized blob.
+ * DIDs, paths, service names, action URNs, and timestamps are non-secret.
+ */
+export class DelegationPolicyError extends TinyCloudClientError {
+  constructor(
+    message: string,
+    public readonly reason:
+      | "MALFORMED"
+      | "WRONG_DELEGATEE"
+      | "EXPIRED"
+      | "MISSING_SQL_RESOURCE"
+      | "WRONG_DB_HANDLE"
+      | "INSUFFICIENT_ACTIONS",
+    public readonly context?: Record<string, unknown>,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+  }
+}
+
+/**
  * A SQL query/execute/batch returned an error Result (or threw). Carries enough
  * op context to debug — code, the op kind, and a redacted/short SQL label — but
  * never the Authorization header or full request dump (plan §5 security posture).

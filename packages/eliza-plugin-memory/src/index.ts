@@ -30,7 +30,7 @@ export const tinycloudMemoryPlugin: Plugin = {
   name: PLUGIN_NAME,
   description:
     "Owns the elizaOS advanced-memory \"memoryStorage\" slot: stores long-term " +
-    "memories and session summaries in a user-owned TinyCloud space (portable, " +
+    "memories and session summaries in a TinyCloud space (portable, " +
     "durable system of record). Requires character.advancedMemory: true and must " +
     "be listed before @elizaos/plugin-sql in character.plugins.",
   services: [TinyCloudMemoryStorageService],

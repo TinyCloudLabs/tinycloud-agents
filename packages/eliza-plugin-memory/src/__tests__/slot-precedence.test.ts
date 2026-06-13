@@ -78,3 +78,36 @@ test("first-registered service wins the memoryStorage slot; both are registered"
   expect(names).toContain("TinyCloudMemoryStorageService");
   expect(names).toContain("StubMemoryService");
 });
+
+test("fail-fast guard: real start() throws (before any network) when a FOREIGN memoryStorage already holds the slot", async () => {
+  const runtime = new AgentRuntime({
+    adapter: new InMemoryDatabaseAdapter(),
+    settings: { ALLOW_NO_DATABASE: "true" },
+    logLevel: "error",
+  } as never);
+  if (typeof (runtime as { initialize?: () => Promise<void> }).initialize === "function") {
+    await (runtime as { initialize: () => Promise<void> }).initialize();
+  }
+
+  // Misordering: a foreign memoryStorage (stands in for @elizaos/plugin-sql's
+  // AdvancedMemoryStorageService) grabs the slot FIRST. Finalize its registration
+  // (resolve the load promise) so it is visible via getServicesByType — exactly the
+  // state a real prior-loaded plugin-sql would be in when our plugin starts.
+  await runtime.registerService(StubMemoryService as never);
+  if (typeof (runtime as { getServiceLoadPromise?: (t: string) => Promise<unknown> }).getServiceLoadPromise === "function") {
+    await (runtime as { getServiceLoadPromise: (t: string) => Promise<unknown> }).getServiceLoadPromise("memoryStorage");
+  }
+
+  // Our REAL start() must fail loud — and BEFORE any signIn/network (the guard is
+  // the first statement; no client is injected here, so reaching startClient would
+  // attempt a real signIn and surface a different error).
+  let caught: unknown = null;
+  try {
+    await TinyCloudMemoryStorageService.start(runtime as never);
+  } catch (e) {
+    caught = e;
+  }
+  expect(caught).toBeInstanceOf(Error);
+  expect((caught as Error).message).toMatch(/before "@elizaos\/plugin-sql"/i);
+  expect((caught as Error).message).toContain("StubMemoryService");
+});

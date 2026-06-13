@@ -8,6 +8,9 @@ import {
   AuthError,
   createAgentClient,
   silentLogger,
+  Session,
+  Worker,
+  DEFAULT_RE_SIGN_IN_MS,
   type BatchData,
   type Clock,
   type ExecuteData,
@@ -93,5 +96,109 @@ test("401 retry once: a second consecutive auth failure surfaces AuthError, no f
   await expect(client.sql.query("SELECT 1")).rejects.toBeInstanceOf(AuthError);
   expect(transport.signInCount).toBe(2); // initial + one re-signIn, never a loop
   expect(transport.queryCount).toBe(2); // first + retry, then it gives up
+  await client.stop();
+});
+
+// ---------------------------------------------------------------------------
+// proactiveRefresh: false — Session never arms the refresh timer
+// ---------------------------------------------------------------------------
+
+test("Session with proactiveRefresh: false never arms the refresh timer (fake clock)", async () => {
+  const setTimeoutMs: number[] = [];
+  const clock: Clock = {
+    now: () => 0,
+    setTimeout: (_handler: () => void, ms: number): TimerHandle => {
+      setTimeoutMs.push(ms);
+      return setTimeoutMs.length as unknown as TimerHandle;
+    },
+    clearTimeout: () => {},
+  };
+
+  const transport = new ScriptedTransport([OK_QUERY]);
+  const worker = new Worker({ clock, logger: silentLogger });
+  const session = new Session({
+    transport,
+    worker,
+    reSignInMs: DEFAULT_RE_SIGN_IN_MS,
+    clock,
+    proactiveRefresh: false,
+    logger: silentLogger,
+  });
+
+  // Trigger signIn + SQL (scheduleRefresh would normally fire here)
+  await session.run("read", () => transport.query("SELECT 1"), "test");
+
+  // No refresh timer should have been set with the reSignInMs cadence
+  const refreshTimerCalls = setTimeoutMs.filter((ms) => ms === DEFAULT_RE_SIGN_IN_MS);
+  expect(refreshTimerCalls).toHaveLength(0);
+
+  await session.stop();
+});
+
+// ---------------------------------------------------------------------------
+// auth-like SQL failure with proactiveRefresh: false (delegation mode lifecycle)
+// ---------------------------------------------------------------------------
+
+test("auth-like SQL failure with proactiveRefresh=false: one re-activation + one retry, then AuthError (no loop)", async () => {
+  const transport = new ScriptedTransport([AUTH_ERR, AUTH_ERR]);
+  const clock = new FakeClock();
+  const worker = new Worker({ clock, logger: silentLogger });
+  const session = new Session({
+    transport,
+    worker,
+    reSignInMs: DEFAULT_RE_SIGN_IN_MS,
+    clock,
+    proactiveRefresh: false,
+    logger: silentLogger,
+  });
+
+  await expect(
+    session.run("read", () => transport.query("SELECT 1"), "delegated-op"),
+  ).rejects.toBeInstanceOf(AuthError);
+
+  expect(transport.signInCount).toBe(2); // initial activation + one re-activation
+  expect(transport.queryCount).toBe(2); // first (auth-fail) + one retry, then AuthError
+
+  await session.stop();
+});
+
+// ---------------------------------------------------------------------------
+// Session.reSignIn() calls transport.invalidate() if present
+// (delegation re-activation contract — audit §Lifecycle minor finding)
+// ---------------------------------------------------------------------------
+
+test("Session.reSignIn() calls transport.invalidate() if present before re-signing in", async () => {
+  let invalidateCalls = 0;
+
+  class InvalidatableTransport extends ScriptedTransport {
+    invalidate(): void { invalidateCalls++; }
+  }
+
+  const transport = new InvalidatableTransport([AUTH_ERR, OK_QUERY]);
+  const client = createAgentClient(
+    { privateKey: "0xkey" },
+    { transport, clock: new FakeClock(), logger: silentLogger },
+  );
+
+  const data = await client.sql.query("SELECT 1");
+  expect(data.rowCount).toBe(1);
+  // Auth failure → reSignIn() → transport.invalidate() called once before re-activation
+  expect(invalidateCalls).toBe(1);
+  // signIn() still called twice (initial + re-signIn)
+  expect(transport.signInCount).toBe(2);
+  await client.stop();
+});
+
+test("Session.reSignIn() is safe when transport has no invalidate() (private-key transport)", async () => {
+  // ScriptedTransport has no invalidate() — the optional call must not throw.
+  const transport = new ScriptedTransport([AUTH_ERR, OK_QUERY]);
+  const client = createAgentClient(
+    { privateKey: "0xkey" },
+    { transport, clock: new FakeClock(), logger: silentLogger },
+  );
+
+  const data = await client.sql.query("SELECT 1");
+  expect(data.rowCount).toBe(1);
+  expect(transport.signInCount).toBe(2);
   await client.stop();
 });

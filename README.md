@@ -1,9 +1,8 @@
 # tinycloud-agents
 
-TinyCloud memory plugins for AI agent frameworks. A user-owned TinyCloud space
-becomes the system of record for an agent's long-term memories and session
-summaries — portable and durable across reinstalls (same key ⇒ the agent
-remembers).
+TinyCloud memory plugins for AI agent frameworks. A TinyCloud space becomes the
+system of record for an agent's long-term memories and session summaries —
+portable and durable across reinstalls.
 
 ## Planned layout
 
@@ -24,8 +23,8 @@ per-method behavior mapping, work plan. Both pre-build gates passed 2026-06-12
 
 ## Quick start
 
-The plugin makes a user-owned TinyCloud space the system of record for an
-elizaOS 2.0 agent's long-term memories and session summaries.
+The plugin makes a TinyCloud space the system of record for an elizaOS 2.0
+agent's long-term memories and session summaries.
 
 ### 1. Install
 
@@ -38,12 +37,67 @@ do not install it directly.)
 
 ### 2. Configure the environment
 
+Two auth modes are supported. Choose one.
+
+#### Private-key mode (default — local dev, simple agents)
+
+The agent owns its own TinyCloud memory space, identified by a dedicated private key.
+Memory is stored in the agent's space, not the user's space.
+
 | Env var | Required | Default | Purpose |
 |---|---|---|---|
+| `TINYCLOUD_AUTH_MODE` | no | `private-key` | Omit or set to `private-key`. |
 | `TINYCLOUD_PRIVATE_KEY` | **yes** | — | Hex private key for the agent's **own** memory space. Use a **dedicated, low-value** key — *never* the operator's main wallet (decision D3). Key compromise = memory-space compromise only. |
 | `TINYCLOUD_HOST` | no | `https://node.tinycloud.xyz` | TinyCloud node endpoint. **Self-host for sensitive deployments** (content is plaintext-at-rest today — see Caveats). |
+| `TINYCLOUD_NODE_HOST` | no | — | Legacy alias for `TINYCLOUD_HOST`. Prefer `TINYCLOUD_HOST`. |
 | `TINYCLOUD_DB_HANDLE` | no | `xyz.tinycloud.eliza/memory` | Full-path SQL db handle. |
 | `TINYCLOUD_SPACE_PREFIX` | no | — | node-sdk space `prefix`. |
+
+#### Delegated mode (user-owned memory via OpenKey + TinyCloud delegation)
+
+The user owns the TinyCloud memory space. The agent reads and writes through a
+portable delegation — a user-signed capability grant — rather than through a
+private key that controls the space.
+
+The agent has a **stable DID** derived from its own identity key. This is the
+delegation target the user delegates to. The agent key belongs to the agent,
+not the user.
+
+> **Status:** Delegated mode is shipped. The user owns the TinyCloud memory space;
+> the agent activates a user-signed portable delegation via `TinyCloudNode.useDelegation`
+> and reads/writes the user's space through delegated SQL. To obtain a delegation,
+> use the consent harness: `packages/eliza-plugin-memory/scripts/consent-harness.ts`
+> (Phase 6). Live end-to-end delegated scenarios are in
+> `packages/eliza-plugin-memory/scripts/live-delegated-scenarios.ts` (Phase 7).
+> **Not in scope:** delegation revocation, policy-hash status enforcement, and the
+> auth sidecar are not yet built.
+
+| Env var | Required | Default | Purpose |
+|---|---|---|---|
+| `TINYCLOUD_AUTH_MODE` | **yes** | — | Set to `delegation` to enable delegated mode. |
+| `TINYCLOUD_DELEGATION` | one of | — | Inline serialized portable delegation from the user. |
+| `TINYCLOUD_DELEGATION_FILE` | one of | — | Path to file containing the serialized delegation. Exactly one of `TINYCLOUD_DELEGATION` / `TINYCLOUD_DELEGATION_FILE` is required. |
+| `TINYCLOUD_AGENT_KEY` | one of | — | Inline stable agent identity key material (hex). The DID derived from this key must match the `delegateDID` in the delegation. |
+| `TINYCLOUD_AGENT_KEY_FILE` | one of | — | Path to file containing the agent identity key. Exactly one of `TINYCLOUD_AGENT_KEY` / `TINYCLOUD_AGENT_KEY_FILE` is required. |
+| `TINYCLOUD_HOST` | no | `https://node.tinycloud.xyz` | TinyCloud node endpoint. |
+| `TINYCLOUD_NODE_HOST` | no | — | Legacy alias for `TINYCLOUD_HOST`. Prefer `TINYCLOUD_HOST`. |
+| `TINYCLOUD_DB_HANDLE` | no | `xyz.tinycloud.eliza/memory` | Full-path SQL db handle. |
+
+#### Identity model
+
+- **Private-key mode** — the agent owns its TinyCloud memory space; memory is
+  agent-data, not user-data.
+- **Delegated mode** — the user owns the TinyCloud memory space; the agent reads
+  and writes through the user's space.
+- **Stable agent DID** — the agent has a stable DID `did:pkh:eip155:1:{address}`
+  derived from its own identity key (`TINYCLOUD_AGENT_KEY`), stable across process
+  restarts. This is the delegation target the user delegates to.
+- **Agent key ≠ user key** — the agent key is dedicated service identity material.
+  Compromise of the agent key grants only the delegated memory capability; it never
+  grants access to the user's account. Do not reuse a personal key.
+- **Distinct roles** — OpenKey proves the user's identity and signs consent; the
+  TinyCloud delegation (`TINYCLOUD_DELEGATION`) grants the actual memory capability.
+  These are distinct and must not be conflated.
 
 ### 3. Wire the character — TWO mandatory steps
 
@@ -79,11 +133,12 @@ Full walkthrough — including the roomId-stability caveat for session summaries
 
 ## Live scenario testing
 
-The deterministic test suite is offline. To test the real product path against a
-TinyCloud node, run the opt-in live Eliza scenario suite:
+The deterministic test suite is offline. Two opt-in live scenario suites exercise
+the real product path against a TinyCloud node.
+
+### Private-key live scenario
 
 ```sh
-bun --bun run test:live:eliza
 TINYCLOUD_LIVE=1 bun --bun run test:live:eliza
 ```
 
@@ -96,10 +151,48 @@ The suite boots a real Eliza `AgentRuntime` with `advancedMemory: true`, registe
 `@tinycloud/eliza-plugin-memory` before `@elizaos/plugin-sql`, writes long-term
 memory and a session summary through Eliza's `MemoryService`, reads the same rows
 from a separate TinyCloud client workflow, then boots a fresh runtime with the
-same key and verifies hydration.
+same key and verifies hydration. This is private-key mode: the agent owns its
+dedicated TinyCloud space.
 
-This tests the current MVP auth shape: an agent-owned dedicated key. It does not
-test OpenKey/passkey login or user-to-agent delegation.
+### Delegated live scenario (Phase 7)
+
+Tests user-to-agent delegation: the user's TinyCloud space is the store; the
+agent writes and reads through a portable delegation, never owning the space.
+
+**Step 1 — Manual setup (human-in-the-loop):** Follow
+`docs/openkey-phases/phase-7-runbook.md`. Sign in with OpenKey, create a
+TinyCloud session, and delegate the `xyz.tinycloud.eliza/memory` SQL capability
+to the stable agent DID (`did:pkh:eip155:1:{address}` derived from
+`TINYCLOUD_AGENT_KEY`). The consent harness
+(`packages/eliza-plugin-memory/scripts/consent-harness.ts`) prints the required
+permission JSON and the agent DID. Save the resulting serialized delegation to a
+file. This step is **documented-manual** — OpenKey/passkey sign-in is not
+automated.
+
+**Steps 2–4 — Automated (gated):** Once the delegation file exists, run:
+
+```sh
+TINYCLOUD_LIVE=1 \
+TINYCLOUD_DELEGATION_FILE=/path/to/delegation.json \
+TINYCLOUD_AGENT_KEY=0x… \
+bun --bun run test:live:eliza:delegated
+```
+
+Without `TINYCLOUD_LIVE=1` the command prints a skipped JSON result and exits 0.
+Without `TINYCLOUD_DELEGATION_FILE` (short alias: `DELEGATION_FILE`) it also skips.
+`TINYCLOUD_AGENT_KEY` (or `TINYCLOUD_AGENT_KEY_FILE`) is required; its derived
+DID must match the `delegateDID` in the delegation.
+
+The automated scenario:
+- Boots an `AgentRuntime` in `TINYCLOUD_AUTH_MODE=delegation`, activates
+  delegated SQL via `TinyCloudNode.useDelegation`, and writes a long-term memory
+  and session summary to the **user's** space.
+- Opens a separate `createAgentClient` instance (same delegation file) and reads
+  the same rows from the user's space, proving the writes landed there and not in
+  an agent-owned space.
+- Boots a fresh `AgentRuntime` from the same delegation file and stable agent key
+  and verifies that long-term memory and session summary hydrate from the user's
+  space.
 
 ## Multi-tenancy
 
@@ -146,8 +239,10 @@ trade-offs, not oversights.
 ## Docs
 
 - [docs/hydration.md](docs/hydration.md) — hydration / portability walkthrough.
+- [docs/openkey-auth-plan.md](docs/openkey-auth-plan.md) — phased plan for
+  moving from private-key auth to proper OpenKey/user-delegation auth.
 - [docs/openkey-auth-handoff.md](docs/openkey-auth-handoff.md) — onboarding map
-  for the OpenKey/user-delegation auth pass.
+  for the OpenKey/user-delegation auth pass; current readiness statement.
 - [docs/registry-entry.md](docs/registry-entry.md) — staged draft of the elizaOS
   registry entry (the actual registry PR is a post-publish step).
 - `packages/eliza-plugin-memory/README.md` — activation, configuration, and
