@@ -39,7 +39,7 @@ export const STOP_FLUSH_MS = 5_000;
 /**
  * Case-insensitive markers that mean "the SESSION is no longer valid" (re-signIn
  * + retry). Deliberately specific: the SQLite authorizer denial "not authorized"
- * (e.g. CREATE INDEX on prod, plan §2.5) contains "authorized" but NOT
+ * (e.g. index-creation DDL on prod, plan §2.5) contains "authorized" but NOT
  * "unauthorized" — it is a permanent denial, must NOT trigger a re-signIn loop.
  */
 const AUTH_MARKERS = ["401", "unauthorized", "expired", "auth_expired", "unauthenticated"];

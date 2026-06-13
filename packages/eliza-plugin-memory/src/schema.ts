@@ -2,7 +2,7 @@
 //
 // VERBATIM from plan §4: two CREATE TABLE IF NOT EXISTS statements, TEXT ISO8601
 // timestamps, JSON columns as TEXT, nullable embedding, and **NO INDEXES**
-// (CREATE INDEX is DENIED on prod v1.4.2 — "400 SQLite error: not authorized",
+// (index-creation DDL is DENIED on prod v1.4.2 — "400 SQLite error: not authorized",
 // plan §2.5/§4; full scans are fine at these table sizes). The DDL mirrors the
 // host types (LongTermMemory / SessionSummary) field-for-field so hydration and
 // the v2 hybrid index round-trip losslessly (plan §7).

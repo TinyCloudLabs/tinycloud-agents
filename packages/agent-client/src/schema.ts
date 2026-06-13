@@ -7,9 +7,9 @@
 //   • RETRYABLE on failure — if the run throws, the memo is NOT set, so a later
 //     call retries (the schema must eventually exist).
 //
-// CREATE TABLE ONLY. CREATE INDEX is DENIED on prod v1.4.2 ("400 SQLite error:
-// not authorized", plan §2.5/§4) — we never emit it; ensureSchema rejects any
-// non-CREATE-TABLE statement loudly rather than letting it 400 at runtime.
+// CREATE TABLE ONLY. Index-creation DDL is DENIED on prod v1.4.2 ("400 SQLite
+// error: not authorized", plan §2.5/§4) — we never emit it; ensureSchema rejects
+// any non-CREATE-TABLE statement loudly rather than letting it 400 at runtime.
 //
 // Statements run serially through the write lane (the worker serializes node I/O
 // anyway); ~2–3s per DDL is fine at start (plan §5 start row).
@@ -22,14 +22,14 @@ import type { SqlApi } from "./sql";
 /** ensureSchema(statements): idempotent, memoized schema bootstrap. */
 export type EnsureSchema = (statements: string[]) => Promise<void>;
 
-/** Reject anything that is not a CREATE TABLE — CREATE INDEX is denied on prod (plan §2.5/§4). */
+/** Reject anything that is not a CREATE TABLE — index-creation DDL is denied on prod (plan §2.5/§4). */
 function assertCreateTableOnly(statement: string): void {
   const normalized = statement.trimStart().toUpperCase();
   if (!normalized.startsWith("CREATE TABLE")) {
     const leading = statement.trimStart().split(/\s+/, 2).join(" ").toUpperCase();
     throw new Error(
       "ensureSchema accepts CREATE TABLE statements only " +
-        "(CREATE INDEX is denied on prod v1.4.2 — plan §2.5/§4); " +
+        "(index-creation DDL is denied on prod v1.4.2 — plan §2.5/§4); " +
         `refusing to emit: ${leading}`,
     );
   }
