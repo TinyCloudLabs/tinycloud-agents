@@ -146,6 +146,8 @@ trade-offs, not oversights.
 ## Docs
 
 - [docs/hydration.md](docs/hydration.md) — hydration / portability walkthrough.
+- [docs/openkey-auth-handoff.md](docs/openkey-auth-handoff.md) — onboarding map
+  for the OpenKey/user-delegation auth pass.
 - [docs/registry-entry.md](docs/registry-entry.md) — staged draft of the elizaOS
   registry entry (the actual registry PR is a post-publish step).
 - `packages/eliza-plugin-memory/README.md` — activation, configuration, and
