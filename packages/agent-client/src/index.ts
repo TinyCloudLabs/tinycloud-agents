@@ -7,7 +7,8 @@
 // @tinycloud/eliza-plugin-memory.
 //
 // T2 surface: config + errors + logger + the Transport seam + the real node-sdk
-// transport. Worker/session/SQL-helper logic lands in T3/T4.
+// transport. T3 adds the serialized worker (queue/breaker/timeouts). Session +
+// SQL helpers land in T4.
 
 export const AGENT_CLIENT_VERSION = "0.1.0";
 
@@ -48,3 +49,13 @@ export type {
 } from "./transport";
 
 export { NodeSdkTransport } from "./node-sdk-transport";
+
+export { Worker, realClock } from "./worker";
+export type {
+  Clock,
+  TimerHandle,
+  Lane,
+  BreakerState,
+  Job,
+  WorkerOptions,
+} from "./worker";
