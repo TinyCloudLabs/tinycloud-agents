@@ -1,0 +1,9 @@
+{
+  "_note": "Block 4(b) seam fixtures (plan §8.2 / §2.6). sha256 of the resolved @elizaos/core dist seam .d.ts files. A mismatch means the host MemoryStorageProvider / advanced-memory types drifted — re-verify against the plan before bumping. Regenerate ONLY after a deliberate re-pin + re-diff.",
+  "pinnedVersion": "@elizaos/core@2.0.0-beta.1",
+  "verifiedOn": "2026-06-12",
+  "seams": {
+    "dist/types/memory-storage.d.ts": "673bd1623c6bc1c5b3b146118af8af1ae3d791a11f92e8fb77547a87b8521dcd",
+    "dist/features/advanced-memory/types.d.ts": "981d6f7bc2d03617a69046f969cc8d1892b5fd4014591321a1f697947a135c93"
+  }
+}
