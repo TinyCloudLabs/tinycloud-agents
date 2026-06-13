@@ -1,0 +1,17 @@
+{
+  "name": "tinycloud-agents",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "bun --bun run --filter '*' build",
+    "typecheck": "bun --bun run --filter '*' typecheck",
+    "test": "bun --bun run --filter '*' test"
+  },
+  "devDependencies": {
+    "typescript": "5.7.2"
+  }
+}
