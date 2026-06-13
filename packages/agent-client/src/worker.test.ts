@@ -172,6 +172,29 @@ test("breaker: half-open probe failure re-opens the breaker", async () => {
   expect(worker.breakerState).toBe("open"); // re-opened, not closed
 });
 
+test("breaker: timeouts count as breaker failures — 5 stuck calls open the breaker", async () => {
+  const clock = new FakeClock();
+  const worker = new Worker({
+    clock,
+    logger: silentLogger,
+    requestTimeoutMs: 100,
+    breakerThreshold: 5,
+    breakerOpenMs: 1000,
+  });
+
+  // Five never-resolving calls, each timed out in turn. The worker is idle when
+  // each is submitted, so it dispatches and arms its timer synchronously; firing
+  // the timer rejects with TimeoutError and releases the slot for the next.
+  for (let i = 0; i < 5; i += 1) {
+    const stuck = worker.write(() => new Promise<never>(() => {}), "stuck");
+    clock.advance(100);
+    await expect(stuck).rejects.toBeInstanceOf(TimeoutError);
+  }
+
+  // Each TimeoutError routed through recordFailure (worker.ts) — invariant 4/5.
+  expect(worker.breakerState).toBe("open");
+});
+
 test("queue bound: the 51st pending write rejects QueueFullError; earlier ones unaffected", async () => {
   const worker = new Worker({ clock: new FakeClock(), logger: silentLogger }); // default limit 50
   const gate = deferred();
