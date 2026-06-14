@@ -1,0 +1,52 @@
+{
+  "name": "@tinycloud/eliza-plugin-memory",
+  "version": "0.1.0",
+  "description": "elizaOS plugin owning the advanced-memory \"memoryStorage\" slot, backed by a TinyCloud space.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "elizaos",
+    "plugin",
+    "tinycloud",
+    "memory"
+  ],
+  "author": "TinyCloud Labs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TinyCloudLabs/tinycloud-agents"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test && bun test scripts/consent-harness.test.ts && bun test scripts/fixtures/make-delegation-fixtures.test.ts && bun test scripts/live-delegated-negative.test.ts",
+    "test:live:eliza": "bun --bun scripts/live-eliza-scenarios.ts",
+    "test:live:eliza:delegated": "bun --bun scripts/live-delegated-scenarios.ts",
+    "consent:harness": "bun --bun scripts/consent-harness.ts"
+  },
+  "dependencies": {
+    "@tinycloud/agent-client": "workspace:*"
+  },
+  "peerDependencies": {
+    "@elizaos/core": "2.0.0-beta.1"
+  },
+  "devDependencies": {
+    "@elizaos/core": "2.0.0-beta.1",
+    "@elizaos/plugin-sql": "2.0.0-beta.1"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

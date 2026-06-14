@@ -1,0 +1,22 @@
+{
+  "//": "Minimal tsconfig so the manual live-smoke script typechecks. scripts/ is",
+  "//2": "outside both package tsconfigs (which exclude **/*.test.ts and only cover",
+  "//3": "src/); this maps the @tinycloud/* workspace imports to their built .d.ts.",
+  "//4": "NOT part of `bun test` or the regression — run by hand: tsc -p scripts.",
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "..",
+    "baseUrl": "..",
+    "types": ["node"],
+    "typeRoots": [
+      "../node_modules/@types",
+      "../node_modules/.bun/node_modules/@types"
+    ],
+    "paths": {
+      "@tinycloud/agent-client": ["packages/agent-client/dist/index"],
+      "@tinycloud/eliza-plugin-memory": ["packages/eliza-plugin-memory/dist/index"]
+    }
+  },
+  "include": ["live-smoke.ts"]
+}

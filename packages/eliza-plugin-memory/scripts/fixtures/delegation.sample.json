@@ -1,0 +1,14 @@
+{
+  "cid": "bafybeic3f6a5aql7ssp4b2pbfriob32kl6hmckcbwghpfq2mshopequf4e",
+  "delegateDID": "did:pkh:eip155:1:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+  "spaceId": "tinycloud:pkh:eip155:1:0x70997970c51812dc3a010c7d01b50e0d17dc79c8:default",
+  "path": "xyz.tinycloud.eliza/memory",
+  "actions": ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"],
+  "expiry": "2099-12-31T23:59:59.000Z",
+  "delegationHeader": {
+    "Authorization": "Bearer SCRUBBED_AUTH_TOKEN_PLACEHOLDER"
+  },
+  "ownerAddress": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+  "chainId": 1,
+  "host": "https://node.tinycloud.xyz"
+}
