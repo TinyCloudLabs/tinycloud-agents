@@ -29,6 +29,20 @@
         "@elizaos/core": "2.0.0-beta.1",
       },
     },
+    "packages/eliza-service": {
+      "name": "@tinycloud/eliza-service",
+      "version": "0.1.0",
+      "dependencies": {
+        "@elizaos/core": "2.0.0-beta.1",
+        "@elizaos/plugin-sql": "2.0.0-beta.1",
+        "@tinycloud/agent-client": "workspace:*",
+        "@tinycloud/eliza-plugin-memory": "workspace:*",
+      },
+      "devDependencies": {
+        "@elizaos/core": "2.0.0-beta.1",
+        "@elizaos/plugin-sql": "2.0.0-beta.1",
+      },
+    },
   },
   "packages": {
     "@adraffy/ens-normalize": ["@adraffy/ens-normalize@1.10.1", "", {}, "sha512-96Z2IP3mYmF1Xg2cDm8f1gWGf/HUVedQ3FMifV4kG/PQ4yEP51xDtRAEfhVNt5f/uzpNkZHwWQuUcu6D6K+Ekw=="],
@@ -162,6 +176,8 @@
     "@tinycloud/agent-client": ["@tinycloud/agent-client@workspace:packages/agent-client"],
 
     "@tinycloud/eliza-plugin-memory": ["@tinycloud/eliza-plugin-memory@workspace:packages/eliza-plugin-memory"],
+
+    "@tinycloud/eliza-service": ["@tinycloud/eliza-service@workspace:packages/eliza-service"],
 
     "@tinycloud/node-sdk": ["@tinycloud/node-sdk@2.3.0", "", { "dependencies": { "@tinycloud/node-sdk-wasm": "1.7.4", "@tinycloud/sdk-core": "2.3.0", "siwe": "^3.0.0" } }, "sha512-k6u4h+DGQRjNNSLDLqk28ONQq6Hl3QfXhriUpXUmmlZAEK3fkKM1Osb7QCpUmxM29VRH9I8Lp//l0GnMymw3aw=="],
 
