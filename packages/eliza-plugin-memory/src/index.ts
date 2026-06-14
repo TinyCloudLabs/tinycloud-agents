@@ -55,6 +55,16 @@ export { TinyCloudMemoryStorageService } from "./storage";
 export type { MemoryStorageTuning, MemoryStorageDeps } from "./storage";
 
 export {
+  EntityClientRegistry,
+  NoDelegationError,
+  DelegationExpiredError,
+} from "./entity-registry";
+export type { EntityClientRegistryDeps } from "./entity-registry";
+
+export { WriteLane, WriteLaneOverflowError, writeLane, runWrite } from "./write-lane";
+export type { WriteLaneOptions } from "./write-lane";
+
+export {
   SETTING_KEYS,
   DEFAULT_MEMORY_DB_HANDLE,
   settingString,

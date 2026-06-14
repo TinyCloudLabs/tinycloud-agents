@@ -63,10 +63,10 @@ export interface SessionOptions {
   logger?: Logger;
   /**
    * Whether to arm the proactive refresh timer after signIn.
-   * Set to false for delegated sessions: a portable delegation has a fixed
-   * expiry baked into its header, and re-running useDelegation on a timer
-   * cannot extend it — the timer would be pure churn.
-   * Defaults to true (private-key mode behavior unchanged).
+   * Both private-key and delegation mode set this to true. For delegation mode
+   * the timer calls invalidate()+reSignIn() which re-activates with the SAME
+   * stored delegation — it refreshes the ~1h node session, not the ~7d delegation.
+   * Defaults to true.
    */
   proactiveRefresh?: boolean;
 }
@@ -86,7 +86,7 @@ export class Session {
   private readonly reSignInMs: number;
   private readonly clock: Clock;
   private readonly logger: Logger;
-  /** When false, the proactive refresh timer is never armed (delegation mode). */
+  /** When false, the proactive refresh timer is never armed. Defaults to true for both modes. */
   private readonly proactiveRefresh: boolean;
 
   /** Cached established session; null until first signIn (or after a forced re-signIn). */
@@ -248,8 +248,8 @@ export class Session {
 
   /**
    * (Re)arm the proactive refresh timer; the handle is unref()'d (must not pin the process).
-   * Does nothing when proactiveRefresh is false (delegation mode) — portable delegations
-   * have a fixed expiry that cannot be extended by re-running useDelegation on a timer.
+   * Does nothing when proactiveRefresh is false (opt-out). Both private-key and delegation
+   * mode default to true — delegation re-activates with the same stored delegation.
    */
   private scheduleRefresh(): void {
     if (this.stopped) return;

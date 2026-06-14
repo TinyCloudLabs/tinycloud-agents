@@ -84,7 +84,7 @@ export function createAgentClient(
       transport,
       worker,
       reSignInMs: resolved.reSignInMs,
-      proactiveRefresh: false,
+      proactiveRefresh: true,
       clock,
       logger,
     });
@@ -120,6 +120,7 @@ export function createAgentClient(
     transport,
     worker,
     reSignInMs: resolved.reSignInMs,
+    proactiveRefresh: true,
     clock,
     logger,
   });

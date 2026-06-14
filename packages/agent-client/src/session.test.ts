@@ -202,3 +202,101 @@ test("Session.reSignIn() is safe when transport has no invalidate() (private-key
   expect(transport.signInCount).toBe(2);
   await client.stop();
 });
+
+// ---------------------------------------------------------------------------
+// proactiveRefresh: true for delegation mode — timer arms and fires
+// invalidate()+reSignIn() at ~50min (T5 flip)
+// ---------------------------------------------------------------------------
+
+test("delegation-mode Session (proactiveRefresh: true) arms the refresh timer at DEFAULT_RE_SIGN_IN_MS", async () => {
+  const scheduledMs: number[] = [];
+  const clock: Clock = {
+    now: () => 0,
+    setTimeout(handler: () => void, ms: number): TimerHandle {
+      scheduledMs.push(ms);
+      return scheduledMs.length as unknown as TimerHandle;
+    },
+    clearTimeout() {},
+  };
+
+  const transport = new ScriptedTransport([OK_QUERY]);
+  const worker = new Worker({ clock, logger: silentLogger });
+  const session = new Session({
+    transport,
+    worker,
+    reSignInMs: DEFAULT_RE_SIGN_IN_MS,
+    clock,
+    proactiveRefresh: true,
+    logger: silentLogger,
+  });
+
+  await session.run("read", () => transport.query("SELECT 1"), "test");
+
+  // Exactly one refresh timer should have been scheduled at the reSignInMs cadence
+  const refreshTimers = scheduledMs.filter((ms) => ms === DEFAULT_RE_SIGN_IN_MS);
+  expect(refreshTimers).toHaveLength(1);
+
+  await session.stop();
+});
+
+test("delegation-mode Session refresh timer fires invalidate()+reSignIn() at ~50min", async () => {
+  const timerHandlers: (() => void)[] = [];
+  const timerMs: number[] = [];
+  const clock: Clock = {
+    now: () => 0,
+    setTimeout(handler: () => void, ms: number): TimerHandle {
+      timerMs.push(ms);
+      timerHandlers.push(handler);
+      return timerHandlers.length as unknown as TimerHandle;
+    },
+    clearTimeout() {},
+  };
+
+  let invalidateCalls = 0;
+  let signInCalls = 0;
+  // Resolved when the proactive re-signIn completes (signInCalls reaches 2)
+  let resolveReSignIn!: () => void;
+  const reSignInDone = new Promise<void>((r) => { resolveReSignIn = r; });
+
+  class DelegationTransport implements Transport {
+    invalidate(): void { invalidateCalls++; }
+    async signIn(): Promise<SignInResult> {
+      signInCalls++;
+      if (signInCalls === 2) resolveReSignIn();
+      return SESSION;
+    }
+    async query(): Promise<TransportResult<QueryData>> { return OK_QUERY; }
+    async execute(): Promise<TransportResult<ExecuteData>> { return { ok: true, data: { changes: 0 } }; }
+    async batch(_statements: SqlStatement[]): Promise<TransportResult<BatchData>> {
+      return { ok: true, data: { results: [] } };
+    }
+  }
+
+  const transport = new DelegationTransport();
+  const worker = new Worker({ clock, logger: silentLogger });
+  const session = new Session({
+    transport,
+    worker,
+    reSignInMs: DEFAULT_RE_SIGN_IN_MS,
+    clock,
+    proactiveRefresh: true,
+    logger: silentLogger,
+  });
+
+  // Trigger initial signIn and arm the timer
+  await session.run("read", () => transport.query("SELECT 1"), "test");
+  expect(signInCalls).toBe(1);
+
+  // Find and fire the refresh timer (the one scheduled at DEFAULT_RE_SIGN_IN_MS)
+  const refreshIdx = timerMs.indexOf(DEFAULT_RE_SIGN_IN_MS);
+  expect(refreshIdx).toBeGreaterThanOrEqual(0);
+  timerHandlers[refreshIdx]();
+
+  // Wait for the async doProactiveRefresh → reSignIn → invalidate+signIn chain
+  await reSignInDone;
+
+  expect(invalidateCalls).toBe(1);   // transport.invalidate() called before re-activation
+  expect(signInCalls).toBe(2);       // initial + proactive re-signIn
+
+  await session.stop();
+});

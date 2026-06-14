@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { CircuitOpenError, type AgentClient } from "@tinycloud/agent-client";
 
+import { EntityClientRegistry } from "../entity-registry";
 import { TinyCloudMemoryStorageService } from "../storage";
 
 const AGENT = "11111111-1111-4111-8111-111111111111";
@@ -154,6 +155,18 @@ test("a failing read leaks no unhandled rejection", async () => {
   expect(unhandled).toEqual([]);
 });
 
+// ── getSessionSummaries fail-open for missing delegation ─────────────────────
+
+test("getSessionSummaries returns [] (never throws) when the room has no entity mapping (NoDelegationError)", async () => {
+  // Use an EntityClientRegistry with NO room mapping for ROOM — clientForRoom will
+  // throw NoDelegationError. The service must catch it and return [] (fail-open read
+  // contract, consistent with getLongTermMemories and getCurrentSessionSummary).
+  const registry = new EntityClientRegistry({ clients: new Map() });
+  const svc = new TinyCloudMemoryStorageService(undefined as never, { registry });
+  const rows = await svc.getSessionSummaries(AGENT as never, ROOM as never);
+  expect(rows).toEqual([]);
+});
+
 // ── start() failure propagates (→ MemoryService disables storage) ─────────────
 
 test("start() rejects when TINYCLOUD_PRIVATE_KEY is missing in private-key mode (fail-open at the slot)", async () => {
@@ -161,15 +174,17 @@ test("start() rejects when TINYCLOUD_PRIVATE_KEY is missing in private-key mode 
   await expect(TinyCloudMemoryStorageService.start(runtime)).rejects.toThrow(/PRIVATE_KEY/);
 });
 
-test("start() rejects with an error when the delegation agent key is invalid (Phase 3: delegation mode is live)", async () => {
-  // Phase 3 implemented delegation mode, so the "not yet implemented" throw is gone.
-  // A structurally valid config but with an invalid agent key now fails during
-  // signIn/ensureSchema (key validation happens lazily, not at construction).
+test("start() succeeds with delegation mode even if the agent key is invalid (T4: key validated lazily at registerDelegation)", async () => {
+  // T4 removed global signIn/ensureSchema from start(). Per-user clients are built
+  // lazily in registerDelegation(), so an invalid agent key is only caught then —
+  // not at startup. One user's bad key must not prevent other users or start().
   const settings: Record<string, string> = {
     TINYCLOUD_AUTH_MODE: "delegation",
     TINYCLOUD_DELEGATION: "fake-serialized-delegation",
     TINYCLOUD_AGENT_KEY: "0xfakeagentkey",
   };
   const runtime = { getSetting: (key: string) => settings[key] ?? undefined } as never;
-  await expect(TinyCloudMemoryStorageService.start(runtime)).rejects.toThrow();
+  const svc = await TinyCloudMemoryStorageService.start(runtime);
+  expect(svc).toBeInstanceOf(TinyCloudMemoryStorageService);
+  await svc.stop();
 });
