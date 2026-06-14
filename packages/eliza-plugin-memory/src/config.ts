@@ -10,7 +10,12 @@
 //   delegation:
 //     • TINYCLOUD_AUTH_MODE=delegation
 //     • TINYCLOUD_DELEGATION or TINYCLOUD_DELEGATION_FILE  (exactly one)
+//         OPTIONAL when TINYCLOUD_MULTI_TENANT=1 — see below.
 //     • TINYCLOUD_AGENT_KEY or TINYCLOUD_AGENT_KEY_FILE    (exactly one)
+//     • TINYCLOUD_MULTI_TENANT=1 (optional): makes the boot delegation source
+//         OPTIONAL. In multi-tenant mode there is no single boot delegation;
+//         per-user delegations are registered at runtime via registerDelegation().
+//         The agent-key source is still required (it identifies the delegatee).
 //
 //   Common to both modes:
 //     • TINYCLOUD_HOST         (optional)  node endpoint; defaults to the public node.
@@ -49,6 +54,12 @@ export const SETTING_KEYS = {
   agentKey: "TINYCLOUD_AGENT_KEY",
   /** Delegation mode: file path containing stable agent identity key material. */
   agentKeyFile: "TINYCLOUD_AGENT_KEY_FILE",
+  /**
+   * Delegation mode: "1"/"true" enables multi-tenant mode, making the boot
+   * delegation source optional (per-user delegations arrive at runtime via
+   * registerDelegation()). The agent-key source is still required.
+   */
+  multiTenant: "TINYCLOUD_MULTI_TENANT",
 } as const;
 
 /** Default db handle when {@link SETTING_KEYS.dbHandle} is unset. */
@@ -87,8 +98,15 @@ function resolveDelegationModeConfig(runtime: IAgentRuntime): DelegationAgentCli
   const delegationFile = settingString(runtime, SETTING_KEYS.delegationFile);
   const agentKey = settingString(runtime, SETTING_KEYS.agentKey);
   const agentKeyFile = settingString(runtime, SETTING_KEYS.agentKeyFile);
+  const multiTenantRaw = settingString(runtime, SETTING_KEYS.multiTenant);
+  const multiTenant =
+    multiTenantRaw !== undefined &&
+    ["1", "true"].includes(multiTenantRaw.toLowerCase());
 
-  if (!serializedDelegation && !delegationFile) {
+  // In multi-tenant mode a missing boot delegation source is VALID: there is no
+  // single boot delegation; per-user delegations are registered at runtime via
+  // registerDelegation(). The both-set conflict check below still applies.
+  if (!multiTenant && !serializedDelegation && !delegationFile) {
     throw new Error(
       `Delegation mode requires a delegation source: set ${SETTING_KEYS.delegation} ` +
         `or ${SETTING_KEYS.delegationFile}`,
@@ -131,7 +149,10 @@ function resolveDelegationModeConfig(runtime: IAgentRuntime): DelegationAgentCli
  * - No `TINYCLOUD_AUTH_MODE` (or `TINYCLOUD_AUTH_MODE=private-key`): requires
  *   `TINYCLOUD_PRIVATE_KEY`.
  * - `TINYCLOUD_AUTH_MODE=delegation`: requires delegation source and agent key
- *   source; missing or conflicting inputs throw clear errors.
+ *   source; missing or conflicting inputs throw clear errors. When
+ *   `TINYCLOUD_MULTI_TENANT=1`, the boot delegation source becomes optional
+ *   (per-user delegations are registered at runtime via registerDelegation());
+ *   the agent-key source is still required.
  */
 export function resolveMemoryClientConfig(runtime: IAgentRuntime): AgentClientAuthConfig {
   const authMode = settingString(runtime, SETTING_KEYS.authMode);

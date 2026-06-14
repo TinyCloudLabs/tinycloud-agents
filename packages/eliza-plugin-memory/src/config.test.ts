@@ -211,6 +211,51 @@ test("delegation: throws when both TINYCLOUD_AGENT_KEY and TINYCLOUD_AGENT_KEY_F
 });
 
 // ---------------------------------------------------------------------------
+// Delegation mode — multi-tenant: boot delegation source is optional
+// ---------------------------------------------------------------------------
+
+test("delegation+multi-tenant: resolves with agent key file and NO delegation source (no throw)", () => {
+  const runtime = makeRuntime({
+    TINYCLOUD_AUTH_MODE: "delegation",
+    TINYCLOUD_MULTI_TENANT: "1",
+    TINYCLOUD_AGENT_KEY_FILE: "/run/agent.key",
+  });
+  const config = resolveMemoryClientConfig(runtime);
+  expect(config.mode).toBe("delegation");
+  expect((config as { agentKeyFile?: string }).agentKeyFile).toBe("/run/agent.key");
+  expect((config as { serializedDelegation?: string }).serializedDelegation).toBeUndefined();
+  expect((config as { delegationFile?: string }).delegationFile).toBeUndefined();
+});
+
+test("delegation+multi-tenant: resolves with inline agent key and NO delegation source", () => {
+  const runtime = makeRuntime({
+    TINYCLOUD_AUTH_MODE: "delegation",
+    TINYCLOUD_MULTI_TENANT: "true",
+    TINYCLOUD_AGENT_KEY: "0xagentkey",
+  });
+  const config = resolveMemoryClientConfig(runtime);
+  expect(config.mode).toBe("delegation");
+  expect((config as { agentKey?: string }).agentKey).toBe("0xagentkey");
+  expect((config as { serializedDelegation?: string }).serializedDelegation).toBeUndefined();
+});
+
+test("delegation+multi-tenant: still requires an agent key source", () => {
+  const runtime = makeRuntime({
+    TINYCLOUD_AUTH_MODE: "delegation",
+    TINYCLOUD_MULTI_TENANT: "1",
+  });
+  expect(() => resolveMemoryClientConfig(runtime)).toThrow(/agent key source/);
+});
+
+test("delegation (single-tenant, no multi-tenant flag): missing delegation source still throws", () => {
+  const runtime = makeRuntime({
+    TINYCLOUD_AUTH_MODE: "delegation",
+    TINYCLOUD_AGENT_KEY: "0xkey",
+  });
+  expect(() => resolveMemoryClientConfig(runtime)).toThrow(/delegation source/);
+});
+
+// ---------------------------------------------------------------------------
 // Security: errors must not leak secret material
 // ---------------------------------------------------------------------------
 
