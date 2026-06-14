@@ -8,6 +8,7 @@ import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { IAgentRuntime, Plugin, UUID } from "@elizaos/core";
 import { RuntimeHost, SessionStore, startElizaService } from "../src/index.js";
+import { addressToEntityId } from "../src/entity-id.js";
 
 const DEFAULT_HOST = "https://node.tinycloud.xyz";
 
@@ -147,9 +148,10 @@ const DEFAULT_DELEGATION_FILE_B = new URL(
   import.meta.url,
 ).pathname;
 
-const AGENT_ID = "11111111-1111-4111-8111-111111111111" as UUID;
-const ENTITY_A = "aa000000-0000-4000-8000-000000000001" as UUID;
-const ENTITY_B = "bb000000-0000-4000-8000-000000000002" as UUID;
+// Frozen tinychat agentId — must match the value in app-registry.ts so the
+// body.agentId the server resolves from the credential agrees with what the
+// harness uses for storage probes (D §5 server-trusted agentId invariant).
+const AGENT_ID = "92361e74-91ed-43a2-9656-5cc37ff3a07a" as UUID;
 const ROOM_A = "cc000000-0000-4000-8000-000000000003" as UUID;
 const ROOM_B = "dd000000-0000-4000-8000-000000000004" as UUID;
 
@@ -208,10 +210,10 @@ async function readDelegation(path: string): Promise<string> {
   return (await readFile(path, "utf8")).trim();
 }
 
-async function postJson<T>(url: string, body: unknown, label: string): Promise<T> {
+async function postJson<T>(url: string, body: unknown, label: string, extraHeaders?: Record<string, string>): Promise<T> {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...extraHeaders },
     body: JSON.stringify(body),
   });
   const text = await response.text();
@@ -223,10 +225,10 @@ async function postJson<T>(url: string, body: unknown, label: string): Promise<T
   return (text ? JSON.parse(text) : null) as T;
 }
 
-async function postMessage(url: string, body: unknown, label: string): Promise<string> {
+async function postMessage(url: string, body: unknown, label: string, extraHeaders?: Record<string, string>): Promise<string> {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...extraHeaders },
     body: JSON.stringify(body),
   });
   const text = await response.text();
@@ -254,11 +256,13 @@ async function sendTurn(
   roomId: UUID,
   text: string,
   label: string,
+  extraHeaders?: Record<string, string>,
 ): Promise<string> {
   return postMessage(
     `${baseUrl}/messages`,
     { agentId: AGENT_ID, entityId, roomId, text },
     label,
+    extraHeaders,
   );
 }
 
@@ -312,11 +316,40 @@ async function runLive(): Promise<ScenarioSummary> {
     };
   }
 
+  // Layer-1 service credential (D-T2 scheme). Must be set for authenticated requests.
+  const serviceSecret = envString("ELIZA_SERVICE_SECRET");
+  if (!serviceSecret) {
+    return {
+      passed: false,
+      blocked: true,
+      summary: "BLOCKED: ELIZA_SERVICE_SECRET not set — Layer-1 service credential required.",
+      details: {
+        blocker: "eliza_service_secret_missing",
+        hint: "set ELIZA_SERVICE_SECRET to the shared service credential (see D §5)",
+      },
+    };
+  }
+
   const [serializedA, serializedB, sqlPlugin] = await Promise.all([
     readDelegation(delegationFileA),
     readDelegation(delegationFileB),
     loadPluginSql(),
   ]);
+
+  // Derive entityIds from the delegations' signed-owner addresses using the frozen
+  // tinychat agentId — byte-identical to @elizaos/core createUniqueUuid so B's
+  // registry routes to the correct per-user client (sha1 + version-0 quirk, not uuidv5).
+  // The delegatorDID format is did:pkh:eip155:1:0x<address>; addressToEntityId
+  // lowercases before hashing so checksummed and lowercase forms agree.
+  const TINYCHAT_AGENT_ID = "92361e74-91ed-43a2-9656-5cc37ff3a07a";
+  const delegationJsonA = JSON.parse(serializedA) as { delegatorDID?: string };
+  const delegationJsonB = JSON.parse(serializedB) as { delegatorDID?: string };
+  const addressA = (delegationJsonA.delegatorDID ?? "").split(":").pop() ?? "";
+  const addressB = (delegationJsonB.delegatorDID ?? "").split(":").pop() ?? "";
+  const ENTITY_A = addressToEntityId(addressA, TINYCHAT_AGENT_ID) as UUID;
+  const ENTITY_B = addressToEntityId(addressB, TINYCHAT_AGENT_ID) as UUID;
+  // Authorization header sent on every Layer-1 gated request (§5 shared-secret scheme).
+  const authHeaders = { authorization: `Bearer ${serviceSecret}` };
 
   // TEST-ONLY: register a RedPill TEXT model and lower the extraction threshold so
   // the advanced-memory long-term evaluator fires deterministically per turn. The
@@ -364,6 +397,7 @@ async function runLive(): Promise<ScenarioSummary> {
         roomId: ROOM_A,
       },
       "POST /sessions user A",
+      authHeaders,
     );
     const sessionB = await postJson<{ status: string }>(
       `${baseUrl}/sessions`,
@@ -374,6 +408,7 @@ async function runLive(): Promise<ScenarioSummary> {
         roomId: ROOM_B,
       },
       "POST /sessions user B",
+      authHeaders,
     );
 
     console.log(
@@ -398,7 +433,7 @@ async function runLive(): Promise<ScenarioSummary> {
       const sends: Array<Promise<void>> = [];
       if (!resultA.found) {
         sends.push(
-          sendTurn(baseUrl, ENTITY_A, ROOM_A, factA, `POST /messages user A (round ${round})`).then(
+          sendTurn(baseUrl, ENTITY_A, ROOM_A, factA, `POST /messages user A (round ${round})`, authHeaders).then(
             (sse) => {
               sseA = sse;
             },
@@ -407,7 +442,7 @@ async function runLive(): Promise<ScenarioSummary> {
       }
       if (!resultB.found) {
         sends.push(
-          sendTurn(baseUrl, ENTITY_B, ROOM_B, factB, `POST /messages user B (round ${round})`).then(
+          sendTurn(baseUrl, ENTITY_B, ROOM_B, factB, `POST /messages user B (round ${round})`, authHeaders).then(
             (sse) => {
               sseB = sse;
             },
@@ -502,7 +537,7 @@ async function run(): Promise<void> {
       passed: true,
       skipped: true,
       summary: "SKIP: eliza-service live harness is gated.",
-      reason: "set TINYCLOUD_LIVE=1 with TINYCLOUD_AGENT_KEY_FILE, DELEGATION_FILE_A, and DELEGATION_FILE_B",
+      reason: "set TINYCLOUD_LIVE=1 with ELIZA_SERVICE_SECRET, TINYCLOUD_AGENT_KEY_FILE, DELEGATION_FILE_A, and DELEGATION_FILE_B",
     };
     console.log(JSON.stringify(skipped, null, 2));
     return;

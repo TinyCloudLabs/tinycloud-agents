@@ -7,6 +7,8 @@ import {
   type SessionHandlerHost,
 } from "./handlers/sessions.js";
 import type { SessionStore } from "./session-store.js";
+import { checkServiceAuth } from "./auth/service-auth.js";
+import { defaultRateLimiter } from "./rate-limit.js";
 
 interface BunServer {
   hostname: string;
@@ -61,17 +63,26 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
       }
 
       if (request.method === "POST" && url.pathname === "/sessions") {
+        const auth = checkServiceAuth(request);
+        if (!auth.ok) return auth.response;
+
         const parsed = await readJsonObject(request);
         if (!parsed.ok) return parsed.response;
         if (!isPostSessionsBody(parsed.value)) {
           return json(400, { error: "invalid_body" });
         }
 
-        const result = await handlePostSessions(parsed.value, opts.host, opts.sessions);
+        // agentId is server-trusted: override caller-supplied value with the identity
+        // resolved from the credential map so callers cannot route into another app's space.
+        const sessionsBody: PostSessionsBody = { ...parsed.value, agentId: auth.resolved.agentId };
+        const result = await handlePostSessions(sessionsBody, opts.host, opts.sessions);
         return json(result.status, result.body);
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/sessions/")) {
+        const auth = checkServiceAuth(request);
+        if (!auth.ok) return auth.response;
+
         const entityId = decodeURIComponent(url.pathname.slice("/sessions/".length));
         if (!entityId || entityId.includes("/")) return json(404, { error: "not_found" });
 
@@ -80,16 +91,28 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
       }
 
       if (request.method === "POST" && url.pathname === "/messages") {
+        const auth = checkServiceAuth(request);
+        if (!auth.ok) return auth.response;
+
         const parsed = await readJsonObject(request);
         if (!parsed.ok) return parsed.response;
         if (!isPostMessagesBody(parsed.value)) {
           return json(400, { error: "invalid_body" });
         }
 
-        const preflight = await runMessagePreflight(opts.host, parsed.value);
+        // agentId is server-trusted: override caller-supplied value with the identity
+        // resolved from the credential map so callers cannot route into another app's space.
+        const messagesBody: PostMessagesBody = { ...parsed.value, agentId: auth.resolved.agentId };
+
+        const rateLimit = defaultRateLimiter.check(auth.resolved.appId, messagesBody.entityId);
+        if (!rateLimit.allowed) {
+          return json(429, { error: "rate_limit_exceeded" });
+        }
+
+        const preflight = await runMessagePreflight(opts.host, messagesBody);
         if (preflight) return preflight;
 
-        return streamMessageResponse(opts.host, parsed.value);
+        return streamMessageResponse(opts.host, messagesBody);
       }
 
       return json(404, { error: "not_found" });
