@@ -33,6 +33,11 @@ RUN cd packages/agent-client        && bun run build \
 
 WORKDIR /app/packages/eliza-service
 
+# Entrypoint materializes the agent key file from the TINYCLOUD_AGENT_KEY env var
+# when present (Phala CVMs inject secrets as env vars, not files).
+COPY packages/eliza-service/docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
 # Bun binds 0.0.0.0:3000 by default (server.ts readPort default, index.ts HOST
 # default). The dstack-ingress sidecar terminates TLS on :443 and forwards here.
 ENV PORT=3000 \
@@ -42,4 +47,5 @@ EXPOSE 3000
 # Run the built entry. dist/index.js's import.meta.main guard calls main(),
 # which boots RuntimeHost (derives agentDid from TINYCLOUD_AGENT_KEY_FILE) and
 # starts Bun.serve.
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["bun", "dist/index.js"]

@@ -30,8 +30,11 @@ services:
       # Must be byte-identical to tinychat's ELIZA_SERVICE_SECRET.
       ELIZA_SERVICE_SECRET: ${ELIZA_SERVICE_SECRET}
       # ── Agent identity (REQUIRED) ──
-      # Path to the mounted agent key file (see volumes/secrets below). The agent
-      # DID is derived from this key and MUST match tinychat's AGENT_DID.
+      # The agent DID is derived from this key and MUST match tinychat's AGENT_DID.
+      # Phala CVMs inject secrets as encrypted ENV VARS (no file mounts), so pass
+      # the hex private key here; the image entrypoint writes it to the key file
+      # the runtime reads (TINYCLOUD_AGENT_KEY_FILE).
+      TINYCLOUD_AGENT_KEY: ${TINYCLOUD_AGENT_KEY}
       TINYCLOUD_AGENT_KEY_FILE: ${TINYCLOUD_AGENT_KEY_FILE:-/run/secrets/agent.key}
       # ── TinyCloud node (REQUIRED) ──
       # Prod TEE node. Falls back to public node if unset.
@@ -45,14 +48,11 @@ services:
       #    production boot; leave unset unless you know you need them) ──
       TINYCLOUD_AUTH_MODE: ${TINYCLOUD_AUTH_MODE:-}
       TINYCLOUD_MULTI_TENANT: ${TINYCLOUD_MULTI_TENANT:-}
-    # Provide the agent key as a mounted file. Two options (pick ONE):
-    #  (A) Phala secret mounted at /run/secrets/agent.key (preferred; see DEPLOY.md).
-    #  (B) A host bind-mount of the key file into the CVM.
-    # The compose volume mount below is the bind-mount form (B); comment it out if
-    # you use a Phala secret (A) and instead point TINYCLOUD_AGENT_KEY_FILE at the
-    # secret mount path.
-    volumes:
-      - ${AGENT_KEY_HOST_PATH:-./.tinycloud/agent.key}:/run/secrets/agent.key:ro
+    # No bind-mount: a remote Phala CVM has no access to a local host file. The
+    # agent key arrives via the encrypted TINYCLOUD_AGENT_KEY env var above and
+    # the entrypoint materializes it to /run/secrets/agent.key inside the
+    # container. (For a local `docker compose` run you can still bind-mount a key
+    # file at /run/secrets/agent.key instead of setting TINYCLOUD_AGENT_KEY.)
     restart: unless-stopped
 
   dstack-ingress:
