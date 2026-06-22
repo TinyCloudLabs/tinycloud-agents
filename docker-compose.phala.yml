@@ -1,0 +1,79 @@
+# Phala CVM deployment for @tinycloud/eliza-service.
+#
+# Mirrors the org's standard two-service shape (service + dstack-ingress TLS
+# sidecar; see listen/tinychat). The operator runs `phala cvms create` with this
+# compose and sets the env vars / secrets below.
+#
+#   phala cvms create \
+#     --name eliza-service \
+#     --compose docker-compose.phala.yml \
+#     --env-file .env.phala
+#
+# ── PERSISTENCE NOTE (important) ──────────────────────────────────────────────
+# eliza-service holds NO local durable state. The Eliza AgentRuntime boots with
+# an InMemoryDatabaseAdapter (runtime-host.ts) and ALLOW_NO_DATABASE=true; all
+# durable memory is written to the REMOTE TinyCloud node (TINYCLOUD_HOST) via the
+# delegated SQL transport (per-space SQLite ON THE NODE, not in this CVM). So this
+# container is effectively stateless and safe to restart — there is no local
+# SQLite file to mount. The single-writer-SQLite constraint lives on the node.
+# The only persistent artifacts are: (1) the ingress TLS certs (named volume
+# below) and (2) the agent key file, which is provided as a Phala secret/mounted
+# file — NOT a data volume. See DEPLOY.md.
+services:
+  eliza-service:
+    image: ${ELIZA_SERVICE_IMAGE:-ghcr.io/tinycloudlabs/eliza-service:latest}
+    platform: linux/amd64
+    ports:
+      - "3000:3000"
+    environment:
+      # ── Layer-1 service auth (REQUIRED) ──
+      # Must be byte-identical to tinychat's ELIZA_SERVICE_SECRET.
+      ELIZA_SERVICE_SECRET: ${ELIZA_SERVICE_SECRET}
+      # ── Agent identity (REQUIRED) ──
+      # Path to the mounted agent key file (see volumes/secrets below). The agent
+      # DID is derived from this key and MUST match tinychat's AGENT_DID.
+      TINYCLOUD_AGENT_KEY_FILE: ${TINYCLOUD_AGENT_KEY_FILE:-/run/secrets/agent.key}
+      # ── TinyCloud node (REQUIRED) ──
+      # Prod TEE node. Falls back to public node if unset.
+      TINYCLOUD_HOST: ${TINYCLOUD_HOST:-https://tee.node.tinycloud.xyz}
+      # ── Tools (REQUIRED for web_search) ──
+      TAVILY_API_KEY: ${TAVILY_API_KEY}
+      # ── Server bind (defaults baked into the image) ──
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      # ── Optional auth/tenant overrides (runtime-host sets these itself in
+      #    production boot; leave unset unless you know you need them) ──
+      TINYCLOUD_AUTH_MODE: ${TINYCLOUD_AUTH_MODE:-}
+      TINYCLOUD_MULTI_TENANT: ${TINYCLOUD_MULTI_TENANT:-}
+    # Provide the agent key as a mounted file. Two options (pick ONE):
+    #  (A) Phala secret mounted at /run/secrets/agent.key (preferred; see DEPLOY.md).
+    #  (B) A host bind-mount of the key file into the CVM.
+    # The compose volume mount below is the bind-mount form (B); comment it out if
+    # you use a Phala secret (A) and instead point TINYCLOUD_AGENT_KEY_FILE at the
+    # secret mount path.
+    volumes:
+      - ${AGENT_KEY_HOST_PATH:-./.tinycloud/agent.key}:/run/secrets/agent.key:ro
+    restart: unless-stopped
+
+  dstack-ingress:
+    image: ${ELIZA_INGRESS_IMAGE:-ghcr.io/tinycloudlabs/eliza-service:ingress-latest}
+    ports:
+      - "443:443"
+    depends_on:
+      - eliza-service
+    environment:
+      DOMAIN: ${PHALA_INGRESS_DOMAIN:-eliza.tinycloud.xyz}
+      TARGET_ENDPOINT: http://eliza-service:3000
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      GATEWAY_DOMAIN: ${PHALA_GATEWAY_CNAME}
+      CERTBOT_EMAIL: ${CERTBOT_EMAIL}
+      SET_CAA: "true"
+      DNS_PROVIDER: cloudflare
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - cert-data:/etc/letsencrypt
+    restart: unless-stopped
+
+volumes:
+  # TLS certs only. No memory/data volume — see PERSISTENCE NOTE above.
+  cert-data:
