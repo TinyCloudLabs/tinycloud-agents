@@ -81,6 +81,36 @@ function makeMessageHost(opts: {
   };
 }
 
+function makeToolHost(action: { name: string; result?: unknown }): ElizaServiceHost {
+  const runtime = {
+    agentId: TEST_AGENT_ID as UUID,
+    actions: [
+      {
+        name: action.name,
+        description: "test tool",
+        validate: async () => true,
+        handler: async (
+          _r: IAgentRuntime,
+          _m: Memory,
+          _s: unknown,
+          _o: unknown,
+          callback?: (content: Content) => Promise<Memory[]>,
+        ) => {
+          if (callback) await callback({ text: "tool ran" });
+          return { success: true, text: "tool ran", data: action.result ?? null };
+        },
+      },
+    ],
+  } as unknown as IAgentRuntime;
+
+  return {
+    agentDid: TEST_AGENT_DID,
+    storageFor: async () => new FakeStorage(),
+    runtimeFor: async () => runtime,
+    preflight: async () => {},
+  };
+}
+
 describe("eliza-service HTTP server", () => {
   let server: ReturnType<typeof startElizaService> | undefined;
   let savedSecret: string | undefined;
@@ -259,6 +289,59 @@ describe("eliza-service HTTP server", () => {
 
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ status: "none" });
+  });
+
+  it("POST /tools/:name dispatches to the action and returns JSON", async () => {
+    const host = makeToolHost({ name: "WEB_SEARCH", result: { answer: "42" } });
+    server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+
+    const res = await fetch(url("/tools/web_search"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "Authorization": `Bearer ${TEST_SERVICE_SECRET}`,
+      },
+      body: JSON.stringify({ args: { query: "meaning of life" } }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json");
+    expect(await res.json()).toEqual({
+      ok: true,
+      tool: "WEB_SEARCH",
+      result: { text: "tool ran", data: { answer: "42" }, frames: [{ text: "tool ran" }] },
+    });
+  });
+
+  it("POST /tools/:name without auth returns 401", async () => {
+    const host = makeToolHost({ name: "WEB_SEARCH" });
+    server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+
+    const res = await fetch(url("/tools/web_search"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ args: { query: "x" } }),
+    });
+
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
+  it("POST /tools/:name returns 404 for an unknown tool", async () => {
+    const host = makeToolHost({ name: "WEB_SEARCH" });
+    server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+
+    const res = await fetch(url("/tools/does_not_exist"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "Authorization": `Bearer ${TEST_SERVICE_SECRET}`,
+      },
+      body: JSON.stringify({ args: {} }),
+    });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "tool_not_found", tool: "does_not_exist" });
   });
 
   it("returns 404 for an unknown route", async () => {

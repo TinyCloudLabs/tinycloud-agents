@@ -6,6 +6,7 @@ import {
   type PostSessionsBody,
   type SessionHandlerHost,
 } from "./handlers/sessions.js";
+import { handlePostTool, type PostToolBody } from "./handlers/tools.js";
 import type { SessionStore } from "./session-store.js";
 import { checkServiceAuth } from "./auth/service-auth.js";
 import { defaultRateLimiter } from "./rate-limit.js";
@@ -115,8 +116,35 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
         return streamMessageResponse(opts.host, messagesBody);
       }
 
+      if (request.method === "POST" && url.pathname.startsWith("/tools/")) {
+        const auth = checkServiceAuth(request);
+        if (!auth.ok) return auth.response;
+
+        const toolName = decodeURIComponent(url.pathname.slice("/tools/".length));
+        if (!toolName || toolName.includes("/")) {
+          return json(404, { error: "tool_not_found" });
+        }
+
+        const parsed = await readJsonObject(request);
+        if (!parsed.ok) return parsed.response;
+        if (!isPostToolBody(parsed.value)) {
+          return json(400, { error: "invalid_body" });
+        }
+
+        // agentId is server-trusted: resolved from the credential, never caller-supplied.
+        const result = await handlePostTool(toolName, auth.resolved.agentId, parsed.value, opts.host);
+        return json(result.status, result.body);
+      }
+
       return json(404, { error: "not_found" });
-    } catch {
+    } catch (err) {
+      // Surface the cause (message + stack only — never the request body, which may
+      // carry the serialized delegation per the security invariant) so an
+      // unexpected handler throw is debuggable instead of a silent 500.
+      console.error(
+        "[eliza-service] unhandled request error:",
+        err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err),
+      );
       return json(500, { error: "internal_error" });
     }
   };
@@ -194,6 +222,15 @@ function isPostSessionsBody(value: unknown): value is PostSessionsBody {
     && typeof value.entityId === "string"
     && typeof value.serializedDelegation === "string"
     && (value.roomId === undefined || typeof value.roomId === "string")
+  );
+}
+
+function isPostToolBody(value: unknown): value is PostToolBody {
+  if (!isObject(value)) return false;
+  return (
+    (value.entityId === undefined || typeof value.entityId === "string")
+    && (value.roomId === undefined || typeof value.roomId === "string")
+    && (value.args === undefined || isObject(value.args))
   );
 }
 
