@@ -30,6 +30,62 @@ The credential MUST NOT appear in any response body, log line, error message, or
 - `POST /sessions`
 - `POST /messages`
 - `GET /sessions/:entityId`
+- `POST /tools/:name`
+
+---
+
+## 1a. Tool dispatch — `POST /tools/:name` (Milestone E, §4)
+
+Discrete agent-tool/action dispatch. The integration model is: RedPill stays the
+conversational responder; when the model emits a tool call, tinychat dispatches it
+here and feeds the result back into the RedPill turn. This endpoint runs the named
+action's handler **directly** — it does NOT route a whole turn through the agent's
+compose→model→action→evaluator pipeline (that is `POST /messages`, which needs the
+agent TEXT model). A pure-API tool therefore works in prod with no TEXT model.
+
+**Request**
+
+```
+POST /tools/:name
+Authorization: Bearer {ELIZA_SERVICE_SECRET}
+Content-Type: application/json
+
+{ "args": { ... }, "entityId"?: "...", "roomId"?: "..." }
+```
+
+- `:name` matches an action's `name` case-insensitively (e.g. `web_search` → `WEB_SEARCH`).
+- `args` carries the tool arguments; for `web_search`, `{ "query": "..." }`.
+- `entityId`/`roomId` are optional and only consulted by tools that touch the user's
+  own space (those resolve a per-user delegated client). Pure-API tools ignore them.
+- `agentId` is **server-trusted** — derived from the credential, never sent by the caller.
+
+**Response** — JSON (not SSE; a tool call resolves to one discrete result):
+
+```
+200 { "ok": true, "tool": "WEB_SEARCH",
+      "result": { "text": "...", "data": { ... } | null, "frames": [ Content, ... ] } }
+```
+
+`result.text` is the summarized result to feed back into the turn; `result.data` is
+the structured payload; `result.frames` are the raw `@elizaos/core` Content objects
+the action emitted.
+
+**Errors**
+
+| HTTP | Body | Trigger |
+|------|------|---------|
+| 401 | `{ error: "unauthorized" }` | missing/malformed credential |
+| 403 | `{ error: "forbidden" }` | unknown credential |
+| 404 | `{ error: "tool_not_found", tool }` | no action with that name |
+| 400 | `{ error: "invalid_body" }` | body not `{ args?, entityId?, roomId? }` |
+| 400 | `{ error: "invalid_args" }` | tool received unusable args (e.g. empty query) |
+| 409 | `{ error: "delegation_required" \| "delegation_expired" }` | a per-user tool with no/expired delegation |
+| 500 | `{ error: "tool_misconfigured" }` | tool's server-side config missing (e.g. `TAVILY_API_KEY`) |
+| 502 | `{ error: "tool_upstream_error" }` | the tool's upstream API failed |
+| 502 | `{ error: "tool_failed" }` | any other action throw |
+
+**First tool — `web_search` (Tavily).** Requires `TAVILY_API_KEY` in the service env.
+Pure-API, no delegation, no TEXT model. `args: { query }`.
 
 ---
 

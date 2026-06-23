@@ -24,6 +24,7 @@ import { agentIdentityFromFile } from "@tinycloud/agent-client";
 import tinycloudMemoryPlugin, {
   TinyCloudMemoryStorageService,
 } from "@tinycloud/eliza-plugin-memory";
+import { webSearchPlugin } from "./actions/web-search.js";
 
 const DEFAULT_AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" as UUID;
 const DEFAULT_HOST = "https://node.tinycloud.xyz";
@@ -345,10 +346,13 @@ export class RuntimeHost {
       settings: delegationSettings,
     });
 
+    // webSearchPlugin is passed as an instance only (no character.plugins string):
+    // it is a local plugin with no installable package name to resolve. Its action
+    // is pure-API (no useModel) so it works with no TEXT model registered in prod.
     const runtime = new AgentRuntime({
       agentId,
       character,
-      plugins: [tinycloudMemoryPlugin, sqlPlugin],
+      plugins: [tinycloudMemoryPlugin, sqlPlugin, webSearchPlugin],
       adapter: new InMemoryDatabaseAdapter(),
       settings: delegationSettings,
       logLevel: "warn",
