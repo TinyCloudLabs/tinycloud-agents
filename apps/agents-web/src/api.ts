@@ -9,22 +9,19 @@
 // Base URL is same-origin `/api` (Vite proxies it in dev; the Bun server
 // serves it in prod).
 //
-// AUTH (finalized): SIWE nonce + bearer session, signed via the OpenKey
-// EIP-1193 provider.
+// AUTH: SIWE nonce + bearer session, signed via the OpenKey EIP-1193 provider
+// (docs/agents-api.md).
 //   GET  /api/auth/nonce           -> { nonce }
-//   build SIWE message (domain agents.tinycloud.xyz + nonce)
-//   personal_sign via the OpenKey provider (same path tcw.signIn uses)
-//   POST /api/auth/verify {message, signature} -> { token }
+//   build a SIWE message (siwe SiweMessage.prepareMessage(): domain
+//     agents.tinycloud.xyz, address, chainId 1, nonce) and personal_sign it
+//     via the OpenKey provider (same path tcw.signIn uses)
+//   POST /api/auth/verify {message, signature} -> { token, address, expiresAt }
 //   Authorization: Bearer <token> on all /api/agents* calls
-//   401 -> session expired, re-run the flow and retry once.
-//
-// The EXACT SIWE message fields/shapes come from M2's docs/agents-api.md —
-// that contract is authoritative. `buildSiweMessage` below is the one spot to
-// reconcile when it lands; everything else (nonce fetch, verify, bearer cache,
-// 401 re-auth) is contract-stable.
+//   401 { error: "unauthorized" } -> session expired, re-run the flow and retry.
 // ---------------------------------------------------------------------------
 
 import type { TinyCloudWeb } from "@tinycloud/web-sdk";
+import { SiweMessage } from "siwe";
 
 const BASE = "/api";
 const AUTH_DOMAIN = "agents.tinycloud.xyz";
@@ -47,26 +44,20 @@ export function signerFromTcw(tcw: TinyCloudWeb): Signer {
   };
 }
 
-// Build the SIWE message to sign, given a server-issued nonce.
-//
-// PLACEHOLDER shape — reconcile with docs/agents-api.md when M2 lands. The
-// service builds and re-parses this message server-side to verify, so its
-// exact field set/formatting must match the contract exactly. Kept as EIP-4361
-// (SIWE) canonical text as a reasonable default.
+// Build the SIWE message to sign, given a server-issued nonce. Uses the `siwe`
+// library's canonical serialization so it matches the server's SiweMessage
+// parse byte-for-byte (docs/agents-api.md: domain agents.tinycloud.xyz,
+// address, chainId 1, nonce).
 function buildSiweMessage(address: string, nonce: string): string {
-  const issuedAt = new Date().toISOString();
-  return [
-    `${AUTH_DOMAIN} wants you to sign in with your Ethereum account:`,
+  return new SiweMessage({
+    domain: AUTH_DOMAIN,
     address,
-    ``,
-    `Sign in to TinyCloud Agents.`,
-    ``,
-    `URI: https://${AUTH_DOMAIN}`,
-    `Version: 1`,
-    `Chain ID: 1`,
-    `Nonce: ${nonce}`,
-    `Issued At: ${issuedAt}`,
-  ].join("\n");
+    statement: "Sign in to TinyCloud Agents.",
+    uri: `https://${AUTH_DOMAIN}`,
+    version: "1",
+    chainId: 1,
+    nonce,
+  }).prepareMessage();
 }
 
 // Per-session bearer token cache. Acquired lazily on the first authed request
@@ -90,7 +81,11 @@ async function authenticate(signer: Signer): Promise<string> {
     const detail = await verifyRes.json().catch(() => ({}));
     throw new ApiError(verifyRes.status, detail?.message ?? "auth verify failed", detail?.error);
   }
-  const { token } = (await verifyRes.json()) as { token: string };
+  const { token } = (await verifyRes.json()) as {
+    token: string;
+    address: string;
+    expiresAt: number;
+  };
   bearerToken = token;
   return token;
 }
@@ -204,12 +199,15 @@ export function getAgent(signer: Signer, agentId: string): Promise<Agent> {
   return request(signer, "GET", `/agents/${agentId}`);
 }
 
+// Register the user's minted delegation. The server derives entityId from the
+// authed owner + agentId — do not send it. Returns the resulting delegation
+// status (active|expired|stale).
 export function submitDelegation(
   signer: Signer,
   agentId: string,
   serializedDelegation: string,
   roomId?: string
-): Promise<{ status: DelegationStatus }> {
+): Promise<{ entityId: string; status: "active" | "expired" | "stale" }> {
   return request(signer, "POST", `/agents/${agentId}/delegation`, {
     serializedDelegation,
     roomId,
@@ -221,15 +219,16 @@ export function setEnabled(signer: Signer, agentId: string, enabled: boolean): P
 }
 
 // --- Chat (SSE) ---
-// Streams the assistant turn. The service emits `data:` frames terminated by a
-// final `data: [DONE]` line. `onChunk` receives each text delta; the promise
-// resolves when the stream closes.
+// Streams the assistant turn. Per the contract each chunk is a
+// `data: <json Content>\n\n` frame, terminated by `data: [DONE]\n\n`; the
+// elizaOS Content carries the reply in its `text` field. `onChunk` receives
+// each text delta; the promise resolves when the stream closes.
 export async function sendMessage(
   signer: Signer,
   agentId: string,
   text: string,
   onChunk: (delta: string) => void,
-  roomId?: string
+  roomId: string
 ): Promise<void> {
   const path = `/agents/${agentId}/messages`;
   const res = await authedFetch(signer, "POST", path, { text, roomId });
@@ -259,10 +258,11 @@ export async function sendMessage(
       if (!line.startsWith("data:")) continue;
       const data = line.slice("data:".length).trimStart();
       if (data === "[DONE]") return;
-      // Frames may be raw text or JSON `{ "delta": "..." }`; handle both.
+      // Each frame is a JSON Content object; the reply text is in `text`.
+      // Tolerate raw strings / `delta` too in case the shape shifts.
       try {
         const parsed = JSON.parse(data);
-        const delta = typeof parsed === "string" ? parsed : parsed.delta ?? parsed.text ?? "";
+        const delta = typeof parsed === "string" ? parsed : parsed.text ?? parsed.delta ?? "";
         if (delta) onChunk(delta);
       } catch {
         onChunk(data);
@@ -272,11 +272,14 @@ export async function sendMessage(
 }
 
 // --- Tools ---
+// Body is { args?, roomId? } per the contract; the response is the raw tool
+// result JSON. Only `web_search` exists today (needs no delegation).
 export function callTool<T = unknown>(
   signer: Signer,
   agentId: string,
   name: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  roomId?: string
 ): Promise<T> {
-  return request(signer, "POST", `/agents/${agentId}/tools/${name}`, args);
+  return request(signer, "POST", `/agents/${agentId}/tools/${name}`, { args, roomId });
 }

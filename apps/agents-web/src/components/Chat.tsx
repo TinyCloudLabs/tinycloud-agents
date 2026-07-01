@@ -23,6 +23,8 @@ export function Chat({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Stable conversation room for this chat session.
+  const roomId = useRef(crypto.randomUUID()).current;
 
   const scrollDown = () => {
     requestAnimationFrame(() => {
@@ -39,17 +41,23 @@ export function Chat({
     scrollDown();
     setBusy(true);
     try {
-      await sendMessage(signer, agentId, text, (delta) => {
-        setMsgs((m) => {
-          const next = [...m];
-          next[next.length - 1] = {
-            who: "agent",
-            text: next[next.length - 1].text + delta,
-          };
-          return next;
-        });
-        scrollDown();
-      });
+      await sendMessage(
+        signer,
+        agentId,
+        text,
+        (delta) => {
+          setMsgs((m) => {
+            const next = [...m];
+            next[next.length - 1] = {
+              who: "agent",
+              text: next[next.length - 1].text + delta,
+            };
+            return next;
+          });
+          scrollDown();
+        },
+        roomId
+      );
     } catch (err) {
       if (err instanceof DelegationRequiredError) {
         onDelegationRequired();
