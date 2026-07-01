@@ -25,8 +25,8 @@ export function tinyCloudAgentsManifest(): Manifest {
       {
         service: "tinycloud.sql",
         space: AGENTS_SPACE,
-        path: "",
-        actions: ["read", "write"],
+        path: "default",
+        actions: ["read", "write", "schema"],
         skipPrefix: true,
       },
       {

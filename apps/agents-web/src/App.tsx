@@ -32,7 +32,12 @@ export function App() {
 
       {!session ? (
         <div className="card">
-          <button className="primary" disabled={signingIn} onClick={handleSignIn}>
+          <button
+            className="primary"
+            data-testid="connect-openkey"
+            disabled={signingIn}
+            onClick={handleSignIn}
+          >
             {signingIn ? "Signing in…" : "Sign in with passkey"}
           </button>
           {error && <div className="error" style={{ marginTop: 8 }}>{error}</div>}
@@ -119,7 +124,9 @@ function Dashboard({ session }: { session: Session }) {
         </div>
         <div className="field" style={{ marginTop: 4 }}>
           <label>Your DID</label>
-          <Copyable text={session.did} />
+          <span data-testid="auth-did">
+            <Copyable text={session.did} />
+          </span>
         </div>
       </div>
 
@@ -128,6 +135,7 @@ function Dashboard({ session }: { session: Session }) {
           <label>Agent name (optional)</label>
           <div className="row">
             <input
+              data-testid="agent-name-input"
               value={name}
               placeholder="e.g. Research assistant"
               disabled={creating}
@@ -136,7 +144,12 @@ function Dashboard({ session }: { session: Session }) {
                 if (e.key === "Enter") create();
               }}
             />
-            <button className="primary" disabled={creating} onClick={create}>
+            <button
+              className="primary"
+              data-testid="create-agent"
+              disabled={creating}
+              onClick={create}
+            >
               {creating ? "Creating…" : "Create agent"}
             </button>
           </div>

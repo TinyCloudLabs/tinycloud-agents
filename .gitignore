@@ -9,3 +9,6 @@ dist/
 .agents-audit/
 *-audit/
 .tinycloud/
+test-results/
+playwright-report/
+.last-run.log

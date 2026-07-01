@@ -59,22 +59,26 @@ export function AgentCard({
   const promptRedelegate = () => onChange({ ...agent, delegationStatus: "none" });
 
   return (
-    <div className="card">
+    <div className="card" data-testid="agent-card" data-agent-id={agent.agentId}>
       <div className="spread">
         <strong>{agent.name || "Untitled agent"}</strong>
-        <span className={`badge ${status}`}>{STATUS_LABEL[status]}</span>
+        <span className={`badge ${status}`} data-testid="delegation-status" data-status={status}>
+          {STATUS_LABEL[status]}
+        </span>
       </div>
 
       <div className="field" style={{ marginTop: 8 }}>
         <label>Agent DID</label>
-        <Copyable text={agent.agentDid} />
+        <span data-testid="agent-did">
+          <Copyable text={agent.agentDid} />
+        </span>
       </div>
 
       <div className="row" style={{ margin: "12px 0" }}>
-        <button className="primary" disabled={delegating} onClick={delegate}>
+        <button className="primary" data-testid="delegate" disabled={delegating} onClick={delegate}>
           {delegating ? "Delegating…" : status === "active" ? "Re-delegate" : "Delegate"}
         </button>
-        <button disabled={toggling} onClick={toggle}>
+        <button data-testid="toggle-enabled" disabled={toggling} onClick={toggle}>
           {agent.enabled ? "Disable" : "Enable"}
         </button>
       </div>
