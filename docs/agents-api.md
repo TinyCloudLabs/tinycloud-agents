@@ -210,18 +210,43 @@ re-submits their delegation. Treat 409 as "prompt to re-delegate."
 
 ### `POST /api/agents/:agentId/messages` — SSE
 
+Bearer-authed. Request body (both required strings; `entityId` is server-derived —
+do not send it):
+
 ```json
-Body: { "text": string, "roomId": string }
+{ "text": string, "roomId": string }
 ```
 
-Server-Sent Events: each response chunk is a `data: <json Content>\n\n` frame,
-terminated by `data: [DONE]\n\n`. `entityId` is server-derived.
+On success the response is `200` with `Content-Type: text/event-stream`. The wire
+format is **exact** (the server writes these bytes literally):
 
-- `403 { "error": "agent_disabled" }` when the agent is off.
-- `409 { "error": "delegation_required" | "delegation_expired" }` (pre-stream) when
-  the delegation is missing/expired. No SSE frame is written on the 409 path.
-- Real text responses require the service to be configured with a TEXT model
-  (`MODEL_API_URL` / `MODEL_API_KEY`); otherwise the pipeline runs without one.
+- Each response chunk is one frame: `data: <json>\n\n` — the literal ASCII `data: `
+  (with the trailing space), then a single line of JSON, then **two** `\n`.
+- `<json>` is Eliza's `Content` object, at minimum `{ "text": string }` (other keys
+  may be present; parse `text` and ignore unknown keys). Parse each frame's payload
+  with `JSON.parse`.
+- The stream terminates with the literal sentinel frame `data: [DONE]\n\n`. `[DONE]`
+  is NOT JSON — match it as a literal string before attempting `JSON.parse`.
+- There is no `event:` line and no per-frame `id:` — only `data:` frames.
+
+```
+data: {"text":"Hello"}\n\n
+data: {"text":" world"}\n\n
+data: [DONE]\n\n
+```
+
+Error responses (returned BEFORE the stream opens — no SSE frame is written on these
+paths, so they arrive as normal JSON responses, not `data:` frames):
+
+- `403 { "error": "agent_disabled" }` — the agent is off.
+- `409 { "error": "delegation_required" | "delegation_expired" }` — delegation missing
+  or expired (treat as "prompt to re-delegate").
+- `404 { "error": "not_found" }` — unknown / not-owned agent.
+- `400 { "error": "invalid_body" }` — `text`/`roomId` missing or not strings.
+
+Real text responses require the service to be configured with a TEXT model
+(`MODEL_API_URL` / `MODEL_API_KEY`); otherwise the pipeline runs without one and the
+turn may yield no assistant text.
 
 ### `POST /api/agents/:agentId/tools/:name`
 
