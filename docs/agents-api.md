@@ -35,16 +35,47 @@ No auth. Body:
 { "message": "<SIWE message string, prepareMessage()>", "signature": "0x..." }
 ```
 
-The client builds a SIWE message with `domain = agents.tinycloud.xyz`, the user's
-address, chainId 1, and the issued `nonce`, then signs it via the OpenKey EIP-1193
-provider (`personal_sign` — the same path `tcw.signIn()` uses). On success:
+The client builds the SIWE message with the `siwe` package and these **exact
+fields**, then signs `prepareMessage()` via the OpenKey EIP-1193 provider
+(`personal_sign` — the same path `tcw.signIn()` uses):
+
+```ts
+import { SiweMessage } from "siwe";
+
+const msg = new SiweMessage({
+  domain:  "agents.tinycloud.xyz",   // MUST match the server's AGENTS_AUTH_DOMAIN
+  address,                            // the OpenKey wallet address (EIP-55 checksummed)
+  uri:     "https://agents.tinycloud.xyz",
+  version: "1",
+  chainId: 1,
+  nonce,                              // the nonce from GET /api/auth/nonce
+  // statement, issuedAt, etc. are optional and not validated by the server;
+  // the server binds ONLY domain + nonce (+ signature recovery).
+});
+const message = msg.prepareMessage();
+const signature = await provider.request({ method: "personal_sign", params: [message, address] });
+// POST { message, signature } to /api/auth/verify
+```
+
+The server runs `SiweMessage.verify({ signature, domain, nonce })` — binding the
+configured domain and the issued (single-use) nonce — and recovers the address.
+On success:
 
 ```json
 200 { "token": "<64-hex>", "address": "0x<lowercased>", "expiresAt": 1730000000000 }
 ```
 
-Failures: `401 { "error": "invalid_message" | "invalid_nonce" | "invalid_signature" }`.
-Session TTL is 24h.
+- `token` is opaque, 32 random bytes hex-encoded. Send it as `Authorization: Bearer <token>`.
+- `expiresAt` is epoch ms; session TTL is 24h. After a redeploy the in-memory session
+  store is empty, so the user simply signs in again (same as the registry — v1 is in-memory).
+
+Failures — all `401`:
+- `invalid_message` — the message isn't a parseable SIWE message.
+- `invalid_nonce` — the nonce was never issued, already consumed (single-use), or expired
+  (5-min TTL). Fetch a fresh nonce and re-sign. Hard failure — no fallback.
+- `invalid_signature` — signature doesn't recover to the claimed address, or the domain
+  doesn't match. The nonce is NOT consumed on this path, so a genuine retry with a correct
+  signature over the same message still works until the nonce's 5-min TTL lapses.
 
 ### Authenticated requests
 
