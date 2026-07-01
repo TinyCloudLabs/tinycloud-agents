@@ -22,6 +22,9 @@ WORKDIR /app
 # Workspace manifests + lockfile first for a cacheable install layer.
 COPY package.json bun.lock tsconfig.base.json ./
 COPY packages ./packages
+# apps/ holds the agents-web SPA (M3). Uncomment once apps/agents-web exists so the
+# workspace install resolves it (root package.json workspaces already includes apps/*).
+# COPY apps ./apps
 
 RUN bun install --frozen-lockfile
 
@@ -30,6 +33,16 @@ RUN bun install --frozen-lockfile
 RUN cd packages/agent-client        && bun run build \
  && cd ../eliza-plugin-memory       && bun run build \
  && cd ../eliza-service             && bun run build
+
+# ── agents-web SPA build → PUBLIC_DIR (M4, gated on M3) ───────────────────────
+# The Bun server serves this dir after API/legacy routes miss (server.ts
+# serveStatic; PUBLIC_DIR below). Uncomment the two lines once apps/agents-web
+# exists and its `build` script emits dist/:
+#   RUN cd apps/agents-web && bun run build
+#   RUN cp -r apps/agents-web/dist /app/packages/eliza-service/public
+# Until then PUBLIC_DIR points at a dir that may not exist; serveStatic returns
+# null (falls through to 404) when index.html is absent, so the service still runs.
+ENV PUBLIC_DIR=/app/packages/eliza-service/public
 
 WORKDIR /app/packages/eliza-service
 

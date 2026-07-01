@@ -41,23 +41,35 @@ the delegation-space findings below).
   reads/writes the owner's `agents` space at the per-agent path — this is the only
   place the space vs path coupling is proven for real.
 
-## Frontend-independent groundwork (can do before M3 lands)
+## Frontend-independent groundwork — DONE (committed, tested)
 
-1. Static-fallback route in `server.ts`: after all API/legacy route matches fail,
-   for GET serve files from `PUBLIC_DIR` (Bun.file), falling back to `index.html`
-   for SPA routing. Must NOT shadow `/api/*` or the legacy tinychat routes
-   (`/health`, `/sessions`, `/messages`, `/tools`). Gate the whole thing on
-   `PUBLIC_DIR` being set so tests/other deploys are unaffected.
-2. Root `package.json` `workspaces`: add `apps/*` so the frontend package is part
-   of the workspace (currently only `packages/*`).
-3. `.env.phala` / `docker-compose.phala.yml`: `PHALA_INGRESS_DOMAIN=agents.tinycloud.xyz`;
-   new env vars introduced by M2/M2.1 that prod needs:
-   - `AGENTS_AUTH_DOMAIN` (defaults `agents.tinycloud.xyz`) — SIWE domain.
-   - `MODEL_API_URL` / `MODEL_API_KEY` (+ optional `MODEL_NAME`) — TEXT model, if
-     real chat is wanted; omit both to run tools-only.
-   - Master key stays the existing `TINYCLOUD_AGENT_KEY` (no new secret).
-4. `Dockerfile`: build `apps/agents-web` (once it exists), copy its `dist/` into the
-   image, set `PUBLIC_DIR` to it. This step DEPENDS on M3.
+1. ✅ Static-fallback route in `server.ts` (`serveStatic`): GET requests that miss
+   every API and legacy route serve a file from `staticDir` (wired from `PUBLIC_DIR`
+   in main()), with `index.html` SPA fallback. Path-traversal-safe (escapes rejected).
+   Never shadows `/api/*` or legacy routes (they match first). Unset `PUBLIC_DIR` →
+   404 (unchanged). Missing dir/index → returns null → 404 (service still runs).
+   Tests: `packages/eliza-service/src/static-serving.test.ts` (10 cases incl.
+   traversal, index fallback, method/route precedence).
+2. ✅ Root `package.json` `workspaces`: added `apps/*`.
+3. ✅ `docker-compose.phala.yml`: passes `AGENTS_AUTH_DOMAIN`, `PUBLIC_DIR`,
+   `MODEL_API_URL`/`MODEL_API_KEY`/`MODEL_NAME` through to eliza-service.
+   `DEPLOY.md` env template updated: `PHALA_INGRESS_DOMAIN=agents.tinycloud.xyz` +
+   the new vars + the note that `TINYCLOUD_AGENT_KEY` (derivation master) is unchanged.
+   (`.env.phala` itself is gitignored — operator fills it from DEPLOY.md step 3.)
+4. ⏳ `Dockerfile`: `ENV PUBLIC_DIR=/app/packages/eliza-service/public` set; the
+   `apps/agents-web` build + `cp dist → public` lines + `COPY apps ./apps` are
+   present but COMMENTED, gated on M3. Uncomment once `apps/agents-web` exists and
+   its `build` emits `dist/`.
+
+## Remaining for M4 (BLOCKED on M3)
+
+- Uncomment the Dockerfile apps-web build/copy + `COPY apps ./apps`.
+- Build the image at repo root: `docker build -f packages/eliza-service/Dockerfile -t eliza-service .`
+- Fill `.env.phala` (DEPLOY.md §3, agents.tinycloud.xyz values), provide the agent
+  key (§4), `phala cvms create` (§5).
+- Run the HARD GATE above (live delegated harness) — then get team-lead approval —
+  BEFORE the prod deploy. Verify `https://agents.tinycloud.xyz/health` + full flow +
+  tinychat regression (legacy /sessions + /messages with ELIZA_SERVICE_SECRET).
 
 ## Deploy discipline
 

@@ -1,3 +1,4 @@
+import { normalize, join, resolve, sep } from "node:path";
 import { mapDelegationError } from "./errors.js";
 import { handlePostMessages, type MessageHandlerHost, type PostMessagesBody } from "./handlers/messages.js";
 import {
@@ -29,6 +30,12 @@ interface BunServer {
   stop(closeActiveConnections?: boolean): void | Promise<void>;
 }
 
+interface BunFile {
+  exists(): Promise<boolean>;
+  readonly type: string;
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
 declare const Bun: {
   serve(opts: {
     hostname: string;
@@ -36,6 +43,7 @@ declare const Bun: {
     idleTimeout?: number;
     fetch(request: Request): Response | Promise<Response>;
   }): BunServer;
+  file(path: string): BunFile;
 };
 
 export type ElizaServiceHost = SessionHandlerHost
@@ -57,6 +65,15 @@ export interface ElizaServiceOptions {
     /** Per-owner create limiter. Defaults to 30/min. */
     createLimiter?: RateLimiter;
   };
+  /**
+   * Optional directory of built SPA static assets (the agents-web `dist/`). When
+   * set, GET requests that miss every API and legacy route serve a file from this
+   * directory, falling back to `index.html` for client-side routing. When unset,
+   * a miss returns 404 (unchanged behavior). API (`/api/*`) and legacy tinychat
+   * routes always take precedence — the static fallback runs only after they miss.
+   * main() wires this from the PUBLIC_DIR env var.
+   */
+  staticDir?: string;
 }
 
 export interface StartElizaServiceOptions extends ElizaServiceOptions {
@@ -163,6 +180,13 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
 
       if (opts.api && url.pathname.startsWith("/api/")) {
         return handleApi(request, url, opts, opts.api);
+      }
+
+      // Static SPA fallback — runs ONLY after every API and legacy route misses.
+      // GET-only; never intercepts /api/* (handled above) or the legacy routes.
+      if (opts.staticDir && request.method === "GET") {
+        const staticResponse = await serveStatic(opts.staticDir, url.pathname);
+        if (staticResponse) return staticResponse;
       }
 
       return json(404, { error: "not_found" });
@@ -334,6 +358,94 @@ function disabledGate(
   if (!record) return json(404, { error: "not_found" });
   if (!record.enabled) return json(403, { error: "agent_disabled" });
   return null;
+}
+
+// Minimal content-type map for the SPA build's static assets. Bun.file infers a
+// type from the extension, but be explicit for the ones the site actually ships so
+// browsers don't sniff (and so .js is always a module-friendly type).
+const CONTENT_TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".map": "application/json; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+};
+
+function contentTypeFor(path: string): string | undefined {
+  const dot = path.lastIndexOf(".");
+  if (dot < 0) return undefined;
+  return CONTENT_TYPES[path.slice(dot).toLowerCase()];
+}
+
+/**
+ * Serve a static asset from the SPA build dir, with index.html fallback for
+ * client-side routing. Returns null only when the request cannot be served at all
+ * (index.html itself missing) so the caller falls through to 404.
+ *
+ * Path safety: the request path is normalized and joined under staticDir, then the
+ * result is verified to stay within staticDir — a `..` traversal that escapes the
+ * root is rejected (falls back to index.html), never reads outside the build dir.
+ */
+async function serveStatic(staticDir: string, pathname: string): Promise<Response | null> {
+  const root = resolve(staticDir);
+  const decoded = safeDecode(pathname);
+  if (decoded === null) return serveIndex(root);
+
+  // Normalize the URL path and strip leading slashes so join() treats it as
+  // relative to root; normalize collapses `..`/`.` segments.
+  const rel = normalize(decoded).replace(/^(\.\.(\/|\\|$))+/, "").replace(/^[/\\]+/, "");
+  const candidate = resolve(join(root, rel));
+
+  // Escape guard: the resolved path must be root itself or live under root + sep.
+  if (candidate !== root && !candidate.startsWith(root + sep)) {
+    return serveIndex(root);
+  }
+
+  // A bare "/" (or a path resolving to the root dir) serves index.html.
+  if (candidate === root) return serveIndex(root);
+
+  const file = Bun.file(candidate);
+  if (await file.exists()) {
+    return fileResponse(candidate, file);
+  }
+  // Unknown path with an extension (e.g. a missing asset) is a real 404; a
+  // path without an extension is an SPA route -> index.html.
+  if (contentTypeFor(candidate)) return null;
+  return serveIndex(root);
+}
+
+async function serveIndex(root: string): Promise<Response | null> {
+  const indexPath = join(root, "index.html");
+  const file = Bun.file(indexPath);
+  if (!(await file.exists())) return null;
+  return fileResponse(indexPath, file);
+}
+
+async function fileResponse(path: string, file: BunFile): Promise<Response> {
+  const body = await file.arrayBuffer();
+  const type = contentTypeFor(path) ?? file.type ?? "application/octet-stream";
+  return new Response(body, { status: 200, headers: { "content-type": type } });
+}
+
+/** Decode a URL path; return null on malformed encoding so the caller serves index. */
+function safeDecode(pathname: string): string | null {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
 }
 
 async function runMessagePreflight(

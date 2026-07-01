@@ -70,11 +70,27 @@ TAVILY_API_KEY=<tavily key>
 AGENT_KEY_HOST_PATH=./.tinycloud/agent.key
 
 # ingress / DNS (Cloudflare)
-PHALA_INGRESS_DOMAIN=eliza.tinycloud.xyz
+PHALA_INGRESS_DOMAIN=agents.tinycloud.xyz
 PHALA_GATEWAY_CNAME=<phala gateway domain for this CVM>
 CLOUDFLARE_API_TOKEN=<cloudflare token>
 CERTBOT_EMAIL=<ops email>
+
+# agents.tinycloud.xyz site (M2/M2.1/M4)
+# SIWE auth domain — MUST equal PHALA_INGRESS_DOMAIN (the site's public host).
+AGENTS_AUTH_DOMAIN=agents.tinycloud.xyz
+# Where the Bun server serves the built agents-web SPA from (matches the image).
+PUBLIC_DIR=/app/packages/eliza-service/public
+# Optional OpenAI-compatible TEXT model for real /messages chat. Set BOTH to
+# enable; leave BOTH unset for tools-only (web_search). No silent fallback.
+MODEL_API_URL=
+MODEL_API_KEY=
+MODEL_NAME=
 ```
+
+> `TINYCLOUD_AGENT_KEY` (the encrypted CVM secret / mounted key) is **unchanged** —
+> the same key is reused as the per-agent-derivation master (M1). No new secret.
+> Users re-sign-in and re-delegate after a redeploy (registry + sessions are
+> in-memory, v1).
 
 ## 4. Provide the agent key (REQUIRED, never committed)
 

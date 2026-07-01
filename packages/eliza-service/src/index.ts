@@ -37,6 +37,9 @@ export async function main(): Promise<void> {
       auth: new UserAuth({ domain: process.env.AGENTS_AUTH_DOMAIN ?? "agents.tinycloud.xyz" }),
       agents,
     },
+    // Serve the built agents-web SPA when PUBLIC_DIR is set (the Phala image sets it
+    // to the copied dist/). Unset in local/dev and legacy deploys -> API-only.
+    staticDir: process.env.PUBLIC_DIR || undefined,
     hostname: process.env.HOST ?? process.env.TINYCLOUD_ELIZA_SERVICE_HOST ?? "0.0.0.0",
     port: readPort(process.env.PORT ?? process.env.TINYCLOUD_ELIZA_SERVICE_PORT),
   });
