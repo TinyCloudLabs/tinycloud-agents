@@ -46,6 +46,13 @@ export interface PostSessionsBody {
   /** Opaque serialized delegation — never log or leak. */
   serializedDelegation: string;
   roomId?: string;
+  /**
+   * SQL db handle (== delegation `path`) to validate the grant against. The
+   * legacy tinychat /sessions route omits it → falls back to MEMORY_DB_HANDLE.
+   * The /api/agents delegation route passes the per-agent dbHandle
+   * (e.g. "default/memory") so each agent validates against its own path.
+   */
+  dbHandle?: string;
 }
 
 export interface HandlerResult {
@@ -59,7 +66,8 @@ export async function handlePostSessions(
   store: SessionStore,
 ): Promise<HandlerResult> {
   const { agentId, entityId, serializedDelegation, roomId } = body;
-  const policy = defaultElizaMemoryPolicy();
+  const dbHandle = body.dbHandle ?? MEMORY_DB_HANDLE;
+  const policy = defaultElizaMemoryPolicy(dbHandle);
   // Per-agent delegation target: each agent validates against its own DID, not a
   // single service-wide DID.
   const agentDid = await host.agentDidFor(agentId);
@@ -74,7 +82,7 @@ export async function handlePostSessions(
 
   // 2. Shape validation (shallow: ownerAddress, delegateDID, expiry, SQL presence)
   try {
-    validateDelegationShape(deleg, { agentDid, dbHandle: MEMORY_DB_HANDLE });
+    validateDelegationShape(deleg, { agentDid, dbHandle });
   } catch (e) {
     if (e instanceof DelegationShapeError) {
       return { status: 400, body: { error: "invalid_shape", message: e.message } };
@@ -100,8 +108,9 @@ export async function handlePostSessions(
   await storage.registerDelegation(entityId, serializedDelegation, roomId);
 
   // 5. Record in C-local store so GET /sessions can re-evaluate liveness without
-  //    touching entity-registry.ts (B's frozen keystone)
-  store.set(entityId, { agentId, serializedDelegation, roomId });
+  //    touching entity-registry.ts (B's frozen keystone). Persist dbHandle so the
+  //    GET re-evaluation uses the same per-agent path.
+  store.set(entityId, { agentId, serializedDelegation, roomId, dbHandle });
 
   // 6. Return liveness status
   const status = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: agentDid });
@@ -125,7 +134,7 @@ export async function handleGetSessions(
     return { status: 404, body: { status: "none" } };
   }
 
-  const policy = defaultElizaMemoryPolicy();
+  const policy = defaultElizaMemoryPolicy(record.dbHandle ?? MEMORY_DB_HANDLE);
   // Resolve the delegation target for the agent this session was registered against.
   const agentDid = await host.agentDidFor(record.agentId);
 

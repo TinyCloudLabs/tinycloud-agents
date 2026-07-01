@@ -56,12 +56,29 @@ token → `401 { "error": "unauthorized" }`.
 `AgentView` (returned by create/list/get/patch):
 
 ```ts
-{ agentId: string; agentDid: string; name: string; enabled: boolean; createdAt: string }
+{
+  agentId: string;
+  agentDid: string;
+  name: string;
+  enabled: boolean;
+  space: string;       // TinyCloud space to mint the delegation in: tcw.space(space)
+  pathPrefix: string;  // per-agent prefix within the space, e.g. "default/"
+  dbHandle: string;    // delegation `path` to grant: `${pathPrefix}memory`
+  createdAt: string;
+}
 ```
 
 - `agentId` is deterministic per owner: `stringToUuid(ownerAddress.toLowerCase() + ":agent:" + index)`.
 - `agentDid` is `did:pkh:eip155:1:{address}`, derived from the service master key
   (stable forever for a given agentId).
+- Memory-space scheme: every agent's memory lives in the owner's `space` (currently
+  `"agents"` for all) under a per-agent `pathPrefix` — `"default/"` for the owner's
+  first (index 0) agent, a slugified name (e.g. `"research-bot/"`) for the rest — so
+  multiple agents don't collide. The delegation grants `dbHandle` = `${pathPrefix}memory`;
+  the server validates against exactly that path and boots the agent runtime with
+  `TINYCLOUD_DB_HANDLE = dbHandle` so writes land where the grant allows. **Mint the
+  delegation using `space`, `dbHandle`, and `agentDid` straight from the AgentView — do
+  not hardcode them.**
 
 ### `POST /api/agents`
 
@@ -109,11 +126,23 @@ Body: { "serializedDelegation": string, "roomId"?: string }
 ```
 
 The `serializedDelegation` is the blob produced by
-`tools/delegate-ui/src/delegate.ts` — mint with `@tinycloud/web-sdk@2.3.0`
-`space("default").delegations.create({ delegateDID: agentDid, path: "xyz.tinycloud.eliza/memory", actions: [...], expiry })`,
-then **rewrite the top-level `actions` from the JWT `att` claim** (web-sdk 2.3.0
+`tools/delegate-ui/src/delegate.ts` — mint with `@tinycloud/web-sdk@2.3.0`, but
+**parameterize the space and path from the AgentView** (do not use the old fixed
+`space("default")` / `xyz.tinycloud.eliza/memory`):
+
+```ts
+tcw.space(view.space).delegations.create({
+  delegateDID: view.agentDid,   // MUST equal the AgentView.agentDid
+  path: view.dbHandle,          // e.g. "default/memory"
+  actions: SQL_ACTIONS,
+  expiry,
+});
+```
+
+Then **rewrite the top-level `actions` from the JWT `att` claim** (web-sdk 2.3.0
 serializes `actions` lossily — see `actionsFromAuthJwt` in delegate.ts, carry it
-over verbatim). The `delegateDID` MUST equal the `agentDid` from the AgentView.
+over verbatim). The server validates `delegateDID == agentDid` and the granted
+`path == dbHandle`; a mismatch on either → 400.
 
 Restart caveat: the registry and delegations are in-memory (v1). After a CVM
 redeploy, `/messages` and `/tools` return `409 delegation_required` until the user
@@ -154,7 +183,7 @@ Only tool today is `web_search` (pure-API; needs no delegation and no TEXT model
 1. `openkey.connect()` → address + EIP-1193 provider.
 2. `GET /api/auth/nonce` → build SIWE message → sign via provider → `POST /api/auth/verify` → store token.
 3. `POST /api/agents` (or `GET` to list). Show each agent's `agentDid` + copy button.
-4. Per agent: mint delegation to `agentDid` (ported delegate.ts) → `POST /api/agents/:id/delegation`.
+4. Per agent: mint the delegation with `tcw.space(view.space).delegations.create({ delegateDID: view.agentDid, path: view.dbHandle, ... })` (ported delegate.ts) → `POST /api/agents/:id/delegation`.
 5. Toggle via `PATCH`. Chat via `POST /api/agents/:id/messages` (consume SSE). `web_search` via tools route.
 
 Keep all endpoint paths + the `Authorization` header construction in a single

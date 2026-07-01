@@ -163,15 +163,21 @@ describe("/api/agents lifecycle", () => {
           body: JSON.stringify({ name: "d" }),
         }),
       )
-    ).json()) as { agentId: string };
+    ).json()) as { agentId: string; space: string; pathPrefix: string; dbHandle: string };
 
-    // A delegation whose delegateDID == the agent's DID passes the full
-    // deserialize -> shape -> policy validation chain.
+    // The default (index 0) agent uses space "agents", pathPrefix "default/",
+    // dbHandle "default/memory".
+    expect(created.space).toBe("agents");
+    expect(created.pathPrefix).toBe("default/");
+    expect(created.dbHandle).toBe("default/memory");
+
+    // A delegation whose delegateDID == the agent's DID and whose path == the
+    // agent's dbHandle passes the full deserialize -> shape -> policy chain.
     const serializedDelegation = JSON.stringify({
       cid: "bafy-api-deleg-test",
       delegateDID: AGENT_DID,
-      spaceId: "tinycloud:pkh:eip155:1:0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2:default",
-      path: MEMORY_DB_HANDLE,
+      spaceId: `tinycloud:pkh:eip155:1:0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2:${created.space}`,
+      path: created.dbHandle,
       actions: ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"],
       expiry: new Date("2099-01-01T00:00:00.000Z").toISOString(),
       ownerAddress: "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2",

@@ -10,7 +10,7 @@
 // delegation under someone else's identity.
 
 import { addressToEntityId } from "../entity-id.js";
-import type { AgentStore, AgentRecord } from "../agents/agent-store.js";
+import { dbHandleForRecord, type AgentStore, type AgentRecord } from "../agents/agent-store.js";
 import type { SessionStore } from "../session-store.js";
 import {
   handlePostSessions,
@@ -33,6 +33,12 @@ export interface AgentView {
   agentDid: string;
   name: string;
   enabled: boolean;
+  /** TinyCloud space the client mints the delegation in: tcw.space(space). */
+  space: string;
+  /** Per-agent path prefix within the space (e.g. "default/"). */
+  pathPrefix: string;
+  /** Delegation `path` to grant: `${pathPrefix}memory`. delegateDID must be agentDid. */
+  dbHandle: string;
   createdAt: string;
 }
 
@@ -42,6 +48,9 @@ async function toView(record: AgentRecord, host: AgentsHandlerHost): Promise<Age
     agentDid: await host.agentDidFor(record.agentId),
     name: record.name,
     enabled: record.enabled,
+    space: record.space,
+    pathPrefix: record.pathPrefix,
+    dbHandle: dbHandleForRecord(record),
     createdAt: record.createdAt,
   };
 }
@@ -119,8 +128,11 @@ export async function handleAgentDelegation(
   const roomId = typeof body.roomId === "string" ? body.roomId : undefined;
 
   const entityId = addressToEntityId(ownerAddress, agentId);
+  // Validate the grant against THIS agent's per-agent path (space "agents",
+  // path "<pathPrefix>memory") rather than the legacy single handle.
+  const dbHandle = dbHandleForRecord(record);
   return handlePostSessions(
-    { agentId, entityId, serializedDelegation: body.serializedDelegation, roomId },
+    { agentId, entityId, serializedDelegation: body.serializedDelegation, roomId, dbHandle },
     host,
     sessions,
   );

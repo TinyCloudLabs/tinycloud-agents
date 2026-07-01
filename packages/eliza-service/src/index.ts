@@ -1,7 +1,7 @@
 import type { Plugin } from "@elizaos/core";
 import { RuntimeHost } from "./runtime-host.js";
 import { resolveTextModelConfig } from "./agents/text-model.js";
-import { AgentStore } from "./agents/agent-store.js";
+import { AgentStore, dbHandleForRecord } from "./agents/agent-store.js";
 import { UserAuth } from "./auth/user-auth.js";
 import { SessionStore } from "./session-store.js";
 import { startElizaService } from "./server.js";
@@ -15,11 +15,18 @@ export { UserAuth } from "./auth/user-auth.js";
 
 export async function main(): Promise<void> {
   const sqlPlugin = await loadSqlPlugin();
+  const agents = new AgentStore();
   const runtimeHost = new RuntimeHost({
     agentKeyFile: process.env.TINYCLOUD_AGENT_KEY_FILE,
     host: process.env.TINYCLOUD_HOST,
     sqlPlugin,
     textModel: resolveTextModelConfig(),
+    // Per-agent SQL db handle so each agent's runtime targets the path its
+    // delegation grants (space "agents", path "<pathPrefix>memory").
+    dbHandleFor: (agentId) => {
+      const record = agents.get(agentId);
+      return record ? dbHandleForRecord(record) : undefined;
+    },
   });
   await runtimeHost.init();
 
@@ -28,7 +35,7 @@ export async function main(): Promise<void> {
     sessions: new SessionStore(),
     api: {
       auth: new UserAuth({ domain: process.env.AGENTS_AUTH_DOMAIN ?? "agents.tinycloud.xyz" }),
-      agents: new AgentStore(),
+      agents,
     },
     hostname: process.env.HOST ?? process.env.TINYCLOUD_ELIZA_SERVICE_HOST ?? "0.0.0.0",
     port: readPort(process.env.PORT ?? process.env.TINYCLOUD_ELIZA_SERVICE_PORT),

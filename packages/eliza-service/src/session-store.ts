@@ -16,6 +16,8 @@ export interface SessionRecord {
   /** Stored verbatim — never log or leak this value. */
   serializedDelegation: string;
   roomId?: string;
+  /** SQL db handle the delegation was validated against (per-agent path). */
+  dbHandle?: string;
 }
 
 export class SessionStore {

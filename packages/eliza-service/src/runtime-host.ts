@@ -88,6 +88,15 @@ export interface RuntimeHostConfig {
    */
   textModel?: TextModelConfig | null;
   /**
+   * Optional per-agent SQL db handle resolver. When it returns a handle for an
+   * agentId, _bootProduction sets TINYCLOUD_DB_HANDLE so the agent's SQL calls
+   * target the same path its delegation grants (space "agents", path
+   * "<pathPrefix>memory"). Returns undefined → the plugin falls back to
+   * MEMORY_DB_HANDLE (legacy single-handle behavior; e.g. the tinychat agentId).
+   * main() wires this to the AgentStore; tests leave it unset.
+   */
+  dbHandleFor?: (agentId: string) => string | undefined;
+  /**
    * Override the per-agentId boot factory (unit tests only).
    * When set, every _bootOnce call uses this factory for every agentId instead of
    * the production or stub boot paths.
@@ -379,12 +388,18 @@ export class RuntimeHost {
     // key, so TINYCLOUD_PRIVATE_KEY is left unset.
     const { normalizedKey: agentKey } = await this.identityFor(agentId);
 
+    // Per-agent SQL db handle: the delegation grants space "agents" path
+    // "<pathPrefix>memory", so the agent must read/write that exact handle
+    // (DelegatedTransport calls sql.db(dbHandle)). Undefined → plugin default.
+    const dbHandle = this.config.dbHandleFor?.(agentId);
+
     const delegationSettings: Record<string, string> = {
       ALLOW_NO_DATABASE: "true",
       TINYCLOUD_AUTH_MODE: "delegation",
       TINYCLOUD_MULTI_TENANT: "1",
       TINYCLOUD_AGENT_KEY: agentKey,
       TINYCLOUD_HOST: host,
+      ...(dbHandle ? { TINYCLOUD_DB_HANDLE: dbHandle } : {}),
       // TEST-ONLY: live-gate threshold overrides (no-op in prod where _extraSettings
       // is unset). Must be in character.settings before initialize() so MemoryService
       // picks them up via runtime.getSetting().

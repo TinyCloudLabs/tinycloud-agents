@@ -45,6 +45,16 @@ describe("AgentStore.create", () => {
     const other0 = store.create(OTHER, "b");
     expect(other0.index).toBe(0);
   });
+
+  it("assigns the agents space and per-agent path prefix (default agent -> default/)", () => {
+    const store = new AgentStore();
+    const first = store.create(OWNER, "First Agent");
+    const second = store.create(OWNER, "Research Bot");
+    expect(first.space).toBe("agents");
+    expect(first.pathPrefix).toBe("default/");
+    expect(second.space).toBe("agents");
+    expect(second.pathPrefix).toBe("research-bot/");
+  });
 });
 
 describe("AgentStore.get / listByOwner", () => {

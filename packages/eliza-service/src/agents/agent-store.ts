@@ -13,6 +13,7 @@
 // this is a process-local Map — records are lost on CVM redeploy.
 
 import { stringToUuid } from "../entity-id.js";
+import { AGENTS_SPACE, dbHandleFor, pathPrefixFor } from "./agent-space.js";
 
 export interface AgentRecord {
   agentId: string;
@@ -22,7 +23,16 @@ export interface AgentRecord {
   enabled: boolean;
   /** Zero-based index of this agent within the owner's set. */
   index: number;
+  /** TinyCloud space holding this agent's memory (AGENTS_SPACE for all agents in v1). */
+  space: string;
+  /** Per-agent path prefix within the space (e.g. "default/", "research-bot/"). */
+  pathPrefix: string;
   createdAt: string;
+}
+
+/** The SQL db handle (== delegation `path`) for an agent record. */
+export function dbHandleForRecord(record: Pick<AgentRecord, "pathPrefix">): string {
+  return dbHandleFor(record.pathPrefix);
 }
 
 /** Compute the deterministic agentId for an owner's Nth agent. */
@@ -63,6 +73,8 @@ export class AgentStore {
       name,
       enabled: true,
       index,
+      space: AGENTS_SPACE,
+      pathPrefix: pathPrefixFor(index, name),
       createdAt: new Date(now()).toISOString(),
     };
     this._byAgentId.set(agentId, record);
