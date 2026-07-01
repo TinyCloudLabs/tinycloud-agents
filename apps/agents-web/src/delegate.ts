@@ -5,18 +5,7 @@ import {
   serializeDelegation,
 } from "@tinycloud/web-sdk";
 import { TINYCLOUD_HOST } from "./tinycloud";
-
-// SQL policy the Eliza memory agent requires. Ported verbatim from
-// tools/delegate-ui/src/delegate.ts.
-export const SQL_ACTIONS = [
-  "tinycloud.sql/read",
-  "tinycloud.sql/write",
-  "tinycloud.sql/admin",
-  "tinycloud.capabilities/read",
-];
-
-// Path (db handle) the memory plugin reads/writes.
-export const DB_HANDLE = "xyz.tinycloud.eliza/memory";
+import { AGENTS_SPACE, SQL_ACTIONS, memoryPath } from "./config";
 
 // Decode a url-safe base64 string (handles `-`/`_` and missing padding).
 // Pure browser-safe JS — no node-only crypto / ethers.
@@ -84,19 +73,37 @@ export interface MintedDelegation {
   actions: string[];
 }
 
+// Ensure the canonical "agents" space exists before minting against it.
+// `space.delegations.create()` requires the space to already exist on the host.
+async function ensureAgentsSpace(tcw: TinyCloudWeb): Promise<void> {
+  const exists = await tcw.spaces.exists(AGENTS_SPACE);
+  if (exists.ok && exists.data) return;
+  const created = await tcw.spaces.create(AGENTS_SPACE);
+  if (!created.ok) {
+    throw new Error(`failed to create "${AGENTS_SPACE}" space: ${created.error.message}`);
+  }
+}
+
 // Mint an SQL delegation from the signed-in user to `delegateDID` (the agent
 // DID). Ported from tools/delegate-ui/src/delegate.ts, minus the download/DOM
 // bits — returns the serialized blob for the caller to submit to the API.
+//
+// Per the design change: the delegation is scoped to the user's canonical
+// "agents" space at the agent's memory path (default agent -> "default/"
+// prefix), not the "default" space at xyz.tinycloud.eliza/memory.
 export async function mintDelegation(
   tcw: TinyCloudWeb,
-  delegateDID: string
+  delegateDID: string,
+  prefix?: string
 ): Promise<MintedDelegation> {
-  const space = tcw.space("default");
+  await ensureAgentsSpace(tcw);
+
+  const space = tcw.space(AGENTS_SPACE);
   const expiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
   const result = await space.delegations.create({
     delegateDID,
-    path: DB_HANDLE,
+    path: memoryPath(prefix),
     actions: SQL_ACTIONS,
     expiry,
   });
