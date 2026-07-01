@@ -1,6 +1,8 @@
 import type { Plugin } from "@elizaos/core";
 import { RuntimeHost } from "./runtime-host.js";
 import { resolveTextModelConfig } from "./agents/text-model.js";
+import { AgentStore } from "./agents/agent-store.js";
+import { UserAuth } from "./auth/user-auth.js";
 import { SessionStore } from "./session-store.js";
 import { startElizaService } from "./server.js";
 
@@ -8,6 +10,8 @@ export { RuntimeHost, bootStubRuntime } from "./runtime-host.js";
 export { createElizaServiceFetch, startElizaService } from "./server.js";
 export type { ElizaServiceHost, ElizaServiceOptions, StartElizaServiceOptions } from "./server.js";
 export { SessionStore } from "./session-store.js";
+export { AgentStore } from "./agents/agent-store.js";
+export { UserAuth } from "./auth/user-auth.js";
 
 export async function main(): Promise<void> {
   const sqlPlugin = await loadSqlPlugin();
@@ -22,6 +26,10 @@ export async function main(): Promise<void> {
   const server = startElizaService({
     host: runtimeHost,
     sessions: new SessionStore(),
+    api: {
+      auth: new UserAuth({ domain: process.env.AGENTS_AUTH_DOMAIN ?? "agents.tinycloud.xyz" }),
+      agents: new AgentStore(),
+    },
     hostname: process.env.HOST ?? process.env.TINYCLOUD_ELIZA_SERVICE_HOST ?? "0.0.0.0",
     port: readPort(process.env.PORT ?? process.env.TINYCLOUD_ELIZA_SERVICE_PORT),
   });
