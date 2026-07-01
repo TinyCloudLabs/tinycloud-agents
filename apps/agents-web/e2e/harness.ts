@@ -148,11 +148,19 @@ export async function runE2E(): Promise<{ results: LegResult[]; agent?: Agent }>
     return "enabled=true";
   }, results);
 
-  // web_search without a Tavily key -> clean error (no crash, no silent success).
-  await step("web_search w/o Tavily key -> clean error", async () => {
+  // web_search: with a real Tavily key configured, expect a real result; without
+  // one, a clean tool_misconfigured error (no crash, no silent success).
+  await step("web_search (real result, or clean error w/o key)", async () => {
     try {
-      const r = await callTool(signer!, agent!.agentId, "web_search", { query: "tinycloud" }, "e2e-room");
-      throw new Error(`expected error, got result: ${JSON.stringify(r).slice(0, 120)}`);
+      const r = await callTool<{ ok?: boolean }>(
+        signer!,
+        agent!.agentId,
+        "web_search",
+        { query: "tinycloud" },
+        "e2e-room"
+      );
+      if (r?.ok !== true) throw new Error(`unexpected result: ${JSON.stringify(r).slice(0, 120)}`);
+      return `real result: ${JSON.stringify(r).slice(0, 100)}`;
     } catch (err) {
       if (err instanceof ApiError) return `clean ApiError ${err.status} ${err.code ?? err.message}`;
       throw err;
