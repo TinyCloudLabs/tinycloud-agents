@@ -73,6 +73,14 @@ the delegation-space findings below).
    `DEPLOY.md` env template updated: `PHALA_INGRESS_DOMAIN=agents.tinycloud.xyz` +
    the new vars + the note that `TINYCLOUD_AGENT_KEY` (derivation master) is unchanged.
    (`.env.phala` itself is gitignored — operator fills it from DEPLOY.md step 3.)
+
+   **Prod chat model = RedPill (Sam's Q7 decision), via the existing env:**
+   - `MODEL_API_URL` = RedPill's OpenAI-compatible base URL.
+   - `MODEL_API_KEY` = `REDPILL_API_KEY` (real value in the rapid workspace
+     `secrets.md`).
+   - `MODEL_NAME` = the RedPill model id tinychat uses.
+   No bring-your-own-key. Same OpenAI-compatible handler already wired
+   (`src/agents/text-model.ts`); RedPill is just the configured provider.
 4. ⏳ `Dockerfile`: `ENV PUBLIC_DIR=/app/packages/eliza-service/public` set; the
    `apps/agents-web` build + `cp dist → public` lines + `COPY apps ./apps` are
    present but COMMENTED, gated on M3. Uncomment once `apps/agents-web` exists and
