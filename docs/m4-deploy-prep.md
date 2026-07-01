@@ -88,6 +88,37 @@ the delegation-space findings below).
   BEFORE the prod deploy. Verify `https://agents.tinycloud.xyz/health` + full flow +
   tinychat regression (legacy /sessions + /messages with ELIZA_SERVICE_SECRET).
 
+## Local run recipe (frontend E2E — verified booting)
+
+The agents-web E2E runs the service locally against a throwaway master key. Boot is
+network-free (the DID is derived locally); a live node is only needed when a
+delegation is actually registered/used.
+
+```sh
+bun install && bun run build          # exports point at gitignored dist/
+mkdir -p .tinycloud
+printf '0x%s' "$(openssl rand -hex 32)" > .tinycloud/agent.key   # throwaway master key
+
+TINYCLOUD_AGENT_KEY_FILE=./.tinycloud/agent.key \
+AGENTS_AUTH_DOMAIN=localhost \
+TINYCLOUD_HOST=https://node.tinycloud.xyz \
+HOST=127.0.0.1 PORT=3000 \
+bun packages/eliza-service/dist/index.js
+```
+
+- `TINYCLOUD_AGENT_KEY_FILE` REQUIRED (init() throws without it). Keep the key file
+  stable across restarts in a run so derived DIDs / delegations keep matching.
+- `AGENTS_AUTH_DOMAIN` MUST equal the frontend origin's host — the signed
+  `SiweMessage.domain` must match it exactly.
+- `PUBLIC_DIR` unset in dev (SPA served by Vite separately; API-only).
+- Intentionally absent (must fail cleanly, not crash boot): `ELIZA_SERVICE_SECRET`
+  (legacy routes only), `TAVILY_API_KEY` (web_search errors cleanly), `MODEL_API_URL`/
+  `MODEL_API_KEY` (no TEXT model → /messages SSE opens + [DONE], no assistant text).
+- CORS: the server sets NO CORS headers (prod is same-origin via the static
+  fallback). For cross-origin Vite dev, proxy `/api` through Vite
+  (`server.proxy: { '/api': 'http://127.0.0.1:3000' }`) so the browser sees
+  same-origin (matches prod). An env-gated dev CORS mode can be added if needed.
+
 ## Deploy discipline
 
 - Never deploy uncommitted code. Every deploy maps to a commit + PR.
