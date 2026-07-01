@@ -69,9 +69,18 @@ Two E2E harnesses live under `e2e/`:
 
 **Verified (against a local service + the real node, no passkey):** SIWE
 nonce→verify→bearer auth, agent create (DID returned), list, enable/disable gate
-(disabled → 403), and both tool/chat error paths (web_search without a Tavily key
-→ clean error; chat without a model → clean 409/close). The API E2E also caught
-and fixed a real client bug (`listAgents` must unwrap `{ agents: [...] }`).
+(disabled → 403), a **real `web_search` round-trip** (with a real Tavily key the
+tool returns a live result), and the chat gate (409 `delegation_required` when no
+delegation is registered). The API E2E also caught and fixed a real client bug
+(`listAgents` must unwrap `{ agents: [...] }`).
+
+**Text model (chat) — config verified, in-service round-trip is an M4 item.** The
+prod chat model is RedPill (OpenAI-compatible). Verified working values:
+`MODEL_API_URL=https://api.redpill.ai/v1`, `MODEL_API_KEY=<REDPILL_API_KEY>`,
+`MODEL_NAME=openai/gpt-4o-mini` (a direct completion returns a real reply; the
+service boots cleanly with these). A full in-service chat SSE turn additionally
+needs a registered delegation, which is gated by the same live-node account
+requirement as the mint leg — so it lands with M4.
 
 **Deferred to M4 pre-launch / live-node verification (documented residual):**
 
