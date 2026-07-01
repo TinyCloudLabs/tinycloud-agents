@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { signIn, type Session } from "./tinycloud";
 import { signerFromTcw, type Signer, type Agent, listAgents, createAgent } from "./api";
+import { delegateAgent } from "./delegate";
 import { randomAgentName } from "./names";
 import { AgentCard } from "./components/AgentCard";
 import { Copyable } from "./components/Copyable";
@@ -51,23 +52,44 @@ function Dashboard({ session }: { session: Session }) {
   const [name, setName] = useState(randomAgentName);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [bootstrapNote, setBootstrapNote] = useState<string | null>(null);
 
+  // Sign-in bootstrap: signing in = having (and delegating to) a default agent.
+  // List the owner's agents; if none exist, idempotently create the default one
+  // and auto-mint+submit its delegation. Explicit create/delegate below remain
+  // for ADDITIONAL agents. Delegation failures here are non-fatal — the per-agent
+  // Delegate button is the fallback (e.g. when the node needs a fresh grant).
   useEffect(() => {
     let cancelled = false;
-    listAgents(signer)
-      .then((list) => {
+    (async () => {
+      try {
+        let list = await listAgents(signer);
+        if (list.length === 0) {
+          setBootstrapNote("Setting up your default agent…");
+          const created = await createAgent(signer, randomAgentName());
+          list = [created];
+          try {
+            const status = await delegateAgent(session.tcw, signer, created);
+            list = [{ ...created, delegationStatus: status }];
+          } catch {
+            // Non-fatal: leave the default agent undelegated; the Delegate
+            // button prompts the user to complete it.
+          }
+        }
         if (!cancelled) setAgents(list);
-      })
-      .catch((err) => {
+      } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+          setBootstrapNote(null);
+        }
+      }
+    })();
     return () => {
       cancelled = true;
     };
-    // signer is derived per-render but stable for a session; list once on mount.
+    // signer/tcw are stable for a session; bootstrap once on mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -123,7 +145,7 @@ function Dashboard({ session }: { session: Session }) {
       </div>
 
       {loading ? (
-        <div className="muted">Loading agents…</div>
+        <div className="muted">{bootstrapNote ?? "Loading agents…"}</div>
       ) : agents.length === 0 ? (
         <div className="muted">No agents yet. Create one above.</div>
       ) : (

@@ -1,8 +1,8 @@
 import { useState } from "react";
 import type { TinyCloudWeb } from "@tinycloud/web-sdk";
 import type { Agent, DelegationStatus, Signer } from "../api";
-import { setEnabled as apiSetEnabled, submitDelegation } from "../api";
-import { mintDelegation } from "../delegate";
+import { setEnabled as apiSetEnabled } from "../api";
+import { delegateAgent } from "../delegate";
 import { Copyable } from "./Copyable";
 import { Chat } from "./Chat";
 import { ToolPanel } from "./ToolPanel";
@@ -34,12 +34,8 @@ export function AgentCard({
     setDelegating(true);
     setError(null);
     try {
-      const minted = await mintDelegation(tcw, agent.agentDid, {
-        space: agent.space,
-        path: agent.dbHandle,
-      });
-      const res = await submitDelegation(signer, agent.agentId, minted.serialized);
-      onChange({ ...agent, delegationStatus: res.status ?? "active" });
+      const status = await delegateAgent(tcw, signer, agent);
+      onChange({ ...agent, delegationStatus: status ?? "active" });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

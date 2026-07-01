@@ -6,6 +6,7 @@ import {
 } from "@tinycloud/web-sdk";
 import { TINYCLOUD_HOST } from "./tinycloud";
 import { SQL_ACTIONS } from "./config";
+import { submitDelegation, type Agent, type DelegationStatus, type Signer } from "./api";
 
 // Decode a url-safe base64 string (handles `-`/`_` and missing padding).
 // Pure browser-safe JS — no node-only crypto / ethers.
@@ -144,4 +145,20 @@ export async function mintDelegation(
     delegateDID: delegation.delegateDID,
     actions: completedActions,
   };
+}
+
+// Mint the delegation for `agent` and register it with the service. Shared by
+// the sign-in auto-provision bootstrap and the per-agent Delegate button.
+// Returns the resulting delegation status.
+export async function delegateAgent(
+  tcw: TinyCloudWeb,
+  signer: Signer,
+  agent: Agent
+): Promise<DelegationStatus> {
+  const minted = await mintDelegation(tcw, agent.agentDid, {
+    space: agent.space,
+    path: agent.dbHandle,
+  });
+  const res = await submitDelegation(signer, agent.agentId, minted.serialized);
+  return res.status;
 }
