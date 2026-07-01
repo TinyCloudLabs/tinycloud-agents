@@ -19,6 +19,11 @@ verifying a SIWE signature, then issues a short-lived opaque bearer session.
 > timestamp — per the repo's cryptographic-verifiability principle. The nonce is
 > consumed on the first successful verify.
 
+Both `/api/auth/*` endpoints are **rate-limited per IP** (default 60/min/IP, keyed on
+`x-forwarded-for`); over the limit → `429 { "error": "rate_limit_exceeded" }`. This
+bounds signature-retry against a live nonce during its TTL (nonces are consumed only
+on a successful verify).
+
 ### `GET /api/auth/nonce`
 
 No auth. Returns a single-use nonce (TTL 5 min). Exact response body — the ONLY key

@@ -14,6 +14,7 @@ import { SessionStore } from "./session-store.js";
 import { AgentStore } from "./agents/agent-store.js";
 import { UserAuth } from "./auth/user-auth.js";
 import { addressToEntityId } from "./entity-id.js";
+import { createRateLimiter } from "./rate-limit.js";
 
 const DOMAIN = "agents.test";
 const PK = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -83,6 +84,46 @@ describe("/api auth", () => {
     const { fetch } = makeFetch();
     const res = await fetch(new Request("https://agents.test/api/agents"));
     expect(res.status).toBe(401);
+  });
+
+  it("rate-limits /api/auth/nonce per IP (429 after the limit)", async () => {
+    // 2 requests/min per IP; the 3rd from the same IP is 429.
+    const authLimiter = createRateLimiter({ maxRequests: 2, windowMs: 60_000 });
+    const fetch = createElizaServiceFetch({
+      host: makeHost(),
+      sessions: new SessionStore(),
+      api: { auth: new UserAuth({ domain: DOMAIN }), agents: new AgentStore(), authLimiter },
+    });
+    const req = () =>
+      new Request("https://agents.test/api/auth/nonce", { headers: { "x-forwarded-for": "203.0.113.5" } });
+    expect((await fetch(req())).status).toBe(200);
+    expect((await fetch(req())).status).toBe(200);
+    const limited = await fetch(req());
+    expect(limited.status).toBe(429);
+    expect(((await limited.json()) as { error: string }).error).toBe("rate_limit_exceeded");
+  });
+
+  it("rate-limits /api/auth/verify per IP and buckets are per-IP", async () => {
+    const authLimiter = createRateLimiter({ maxRequests: 1, windowMs: 60_000 });
+    const fetch = createElizaServiceFetch({
+      host: makeHost(),
+      sessions: new SessionStore(),
+      api: { auth: new UserAuth({ domain: DOMAIN }), agents: new AgentStore(), authLimiter },
+    });
+    const verify = (ip: string) =>
+      fetch(
+        new Request("https://agents.test/api/auth/verify", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-forwarded-for": ip },
+          body: JSON.stringify({ message: "x", signature: "0x" }),
+        }),
+      );
+    // First from IP A is allowed through to verify (401 invalid, not rate-limited).
+    expect((await verify("198.51.100.1")).status).toBe(401);
+    // Second from IP A is rate-limited.
+    expect((await verify("198.51.100.1")).status).toBe(429);
+    // A different IP has its own bucket — allowed through to verify again.
+    expect((await verify("198.51.100.2")).status).toBe(401);
   });
 });
 

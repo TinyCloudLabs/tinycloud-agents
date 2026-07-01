@@ -64,6 +64,12 @@ export interface ElizaServiceOptions {
     agents: AgentStore;
     /** Per-owner create limiter. Defaults to 30/min. */
     createLimiter?: RateLimiter;
+    /**
+     * Per-IP limiter for the unauthenticated auth endpoints (/api/auth/nonce +
+     * /api/auth/verify). Bounds signature-retry against a live nonce during its
+     * TTL (nonces are consumed only on successful verify). Defaults to 60/min/IP.
+     */
+    authLimiter?: RateLimiter;
   };
   /**
    * Optional directory of built SPA static assets (the agents-web `dist/`). When
@@ -207,6 +213,23 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
 // supply one. Keyed by (owner, "create") through the (appId, entityId) signature.
 const defaultCreateLimiter = createRateLimiter({ maxRequests: 30, windowMs: 60_000 });
 
+// Default per-IP limiter for the unauthenticated auth endpoints (60/min/IP).
+const defaultAuthLimiter = createRateLimiter({ maxRequests: 60, windowMs: 60_000 });
+
+/**
+ * Best-effort client IP for per-IP rate limiting. Behind dstack-ingress the real
+ * client is in x-forwarded-for (first hop); fall back to a fixed bucket when absent
+ * so the limit still bounds total unauthenticated auth traffic rather than failing open.
+ */
+function clientIp(request: Request): string {
+  const xff = request.headers.get("x-forwarded-for");
+  if (xff) {
+    const first = xff.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  return request.headers.get("x-real-ip")?.trim() || "unknown";
+}
+
 type ApiConfig = NonNullable<ElizaServiceOptions["api"]>;
 
 /**
@@ -228,13 +251,20 @@ async function handleApi(
 ): Promise<Response> {
   const { auth, agents } = api;
   const createLimiter = api.createLimiter ?? defaultCreateLimiter;
+  const authLimiter = api.authLimiter ?? defaultAuthLimiter;
   const path = url.pathname;
 
-  // ── Unauthenticated auth endpoints ──
+  // ── Unauthenticated auth endpoints (per-IP rate-limited) ──
   if (request.method === "GET" && path === "/api/auth/nonce") {
+    if (!authLimiter.check("auth", clientIp(request)).allowed) {
+      return json(429, { error: "rate_limit_exceeded" });
+    }
     return json(200, { nonce: auth.issueNonce() });
   }
   if (request.method === "POST" && path === "/api/auth/verify") {
+    if (!authLimiter.check("auth", clientIp(request)).allowed) {
+      return json(429, { error: "rate_limit_exceeded" });
+    }
     const parsed = await readJsonObject(request);
     if (!parsed.ok) return parsed.response;
     const { message, signature } = parsed.value;
