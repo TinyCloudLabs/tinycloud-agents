@@ -196,8 +196,10 @@ export function createAgent(signer: Signer, name?: string): Promise<Agent> {
   return request(signer, "POST", "/agents", { name });
 }
 
-export function listAgents(signer: Signer): Promise<Agent[]> {
-  return request(signer, "GET", "/agents");
+export async function listAgents(signer: Signer): Promise<Agent[]> {
+  // Contract: GET /api/agents -> { agents: AgentView[] }.
+  const { agents } = await request<{ agents: Agent[] }>(signer, "GET", "/agents");
+  return agents;
 }
 
 export function getAgent(signer: Signer, agentId: string): Promise<Agent> {
