@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { signIn, type Session } from "./tinycloud";
 import { signerFromTcw, type Signer, type Agent, listAgents, createAgent } from "./api";
+import { randomAgentName } from "./names";
 import { AgentCard } from "./components/AgentCard";
 import { Copyable } from "./components/Copyable";
 
@@ -46,7 +47,8 @@ function Dashboard({ session }: { session: Session }) {
   const signer: Signer = signerFromTcw(session.tcw);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [loading, setLoading] = useState(true);
-  const [name, setName] = useState("");
+  // Prefill with a friendly suggestion; the user can edit or replace it.
+  const [name, setName] = useState(randomAgentName);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -75,7 +77,7 @@ function Dashboard({ session }: { session: Session }) {
     try {
       const agent = await createAgent(signer, name.trim() || undefined);
       setAgents((a) => [...a, agent]);
-      setName("");
+      setName(randomAgentName());
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
