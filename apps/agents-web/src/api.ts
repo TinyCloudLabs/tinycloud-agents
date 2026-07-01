@@ -7,8 +7,12 @@
 // and never sees a URL or a header.
 //
 // Base URL is same-origin `/api` (Vite proxies it in dev; the Bun server
-// serves it in prod). Auth follows plan §2: per-request EIP-191 personal_sign
-// over a canonical payload, sent as `Authorization: TCW1 <b64(payload)>.<sig>`.
+// serves it in prod).
+//
+// AUTH: the locked decision is OpenKey (like the secrets site). The exact
+// header/verification mechanics come from M2's docs/agents-api.md — that
+// contract is authoritative. Until it lands, `authHeader` below is a PLACEHOLDER
+// using the plan's EIP-191 sketch; swap it here (and only here) on contract.
 // ---------------------------------------------------------------------------
 
 import type { TinyCloudWeb } from "@tinycloud/web-sdk";
@@ -39,9 +43,10 @@ function base64(obj: unknown): string {
   return btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(obj))));
 }
 
-// Build the per-request Authorization header. The signed payload binds the
-// request to a method + path + fresh timestamp so the service can reject
-// stale/replayed signatures (plan §2: reject timestamps older than ~5 min).
+// PLACEHOLDER auth header (EIP-191). Auth is locked to OpenKey — this is a
+// stand-in until M2's contract (docs/agents-api.md) defines the real header.
+// The signed payload binds the request to a method + path + fresh timestamp so
+// a verifier can reject stale/replayed signatures.
 async function authHeader(signer: Signer, method: string, path: string): Promise<string> {
   const payload = {
     domain: AUTH_DOMAIN,
