@@ -5,7 +5,7 @@ import {
   serializeDelegation,
 } from "@tinycloud/web-sdk";
 import { TINYCLOUD_HOST } from "./tinycloud";
-import { AGENTS_SPACE, SQL_ACTIONS, memoryPath } from "./config";
+import { SQL_ACTIONS } from "./config";
 
 // Decode a url-safe base64 string (handles `-`/`_` and missing padding).
 // Pure browser-safe JS — no node-only crypto / ethers.
@@ -84,36 +84,33 @@ async function ensureSpace(tcw: TinyCloudWeb, spaceName: string): Promise<void> 
   }
 }
 
-// Delegation scope for an agent. The service chooses `space` and `pathPrefix`
-// and returns them on the agent record; the client threads them verbatim. The
-// defaults are pre-contract stubs only (see config.ts).
+// Delegation scope for an agent, taken verbatim from its AgentView. The service
+// chooses these; the client does not derive them. `path` is the AgentView
+// `dbHandle` — the server validates the granted path against it exactly.
 export interface DelegationScope {
-  space?: string;
-  pathPrefix?: string;
+  space: string;
+  path: string;
 }
 
 // Mint an SQL delegation from the signed-in user to `delegateDID` (the agent
 // DID). Ported from tools/delegate-ui/src/delegate.ts, minus the download/DOM
 // bits — returns the serialized blob for the caller to submit to the API.
 //
-// Per the design change: the delegation is scoped to the user's canonical
-// "agents" space at the agent's memory path (default agent -> "default/"
-// prefix), not the "default" space at xyz.tinycloud.eliza/memory. The concrete
-// space/prefix come from the agent record; the config values are fallbacks.
+// The delegation is scoped to the agent's `space` at its `dbHandle` path (both
+// from the AgentView), not the old "default" space at xyz.tinycloud.eliza/memory.
 export async function mintDelegation(
   tcw: TinyCloudWeb,
   delegateDID: string,
-  scope: DelegationScope = {}
+  scope: DelegationScope
 ): Promise<MintedDelegation> {
-  const spaceName = scope.space ?? AGENTS_SPACE;
-  await ensureSpace(tcw, spaceName);
+  await ensureSpace(tcw, scope.space);
 
-  const space = tcw.space(spaceName);
+  const space = tcw.space(scope.space);
   const expiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
 
   const result = await space.delegations.create({
     delegateDID,
-    path: memoryPath(scope.pathPrefix),
+    path: scope.path,
     actions: SQL_ACTIONS,
     expiry,
   });

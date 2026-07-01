@@ -170,20 +170,22 @@ async function request<T>(
 }
 
 // --- Types (mirror the plan §2 endpoint table; reconcile with the committed
-// docs/agents-api.md when M2 publishes it). ---
+// docs/agents-api.md (final). ---
 
 export type DelegationStatus = "active" | "expired" | "stale" | "none";
 
+// Matches the AgentView in the contract.
 export interface Agent {
   agentId: string;
   agentDid: string;
   name: string;
   enabled: boolean;
   // Delegation scope for this agent, chosen by the service. Thread these
-  // verbatim into the mint — the client does not derive them. Optional only
-  // until the contract lands; the UI falls back to the config stubs.
-  space?: string;
-  pathPrefix?: string;
+  // verbatim into the mint — the client does not derive them. The server
+  // validates the granted path == dbHandle exactly, so use dbHandle as-is.
+  space: string;
+  pathPrefix: string;
+  dbHandle: string;
   delegationStatus?: DelegationStatus;
   createdAt?: string;
 }

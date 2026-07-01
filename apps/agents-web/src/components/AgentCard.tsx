@@ -36,7 +36,7 @@ export function AgentCard({
     try {
       const minted = await mintDelegation(tcw, agent.agentDid, {
         space: agent.space,
-        pathPrefix: agent.pathPrefix,
+        path: agent.dbHandle,
       });
       const res = await submitDelegation(signer, agent.agentId, minted.serialized);
       onChange({ ...agent, delegationStatus: res.status ?? "active" });
