@@ -56,3 +56,35 @@ SIWE nonce + bearer session, signed via the OpenKey EIP-1193 provider (all in
 The exact SIWE message fields come from `docs/agents-api.md` (M2). Only
 `buildSiweMessage` in `api.ts` needs reconciling when that contract lands;
 everything else (nonce fetch, verify, bearer cache, 401 re-auth) is stable.
+
+## Testing & verification status
+
+Two E2E harnesses live under `e2e/`:
+
+- `e2e/harness.ts` — API-level, an ephemeral-EOA signer swapped for OpenKey,
+  driven headlessly via a browser (`e2e.html`).
+- `e2e/specs/agents-wallet-flow.pw.ts` — Playwright, real UI, a mock EIP-6963
+  wallet clicking "or use an external wallet" in the OpenKey iframe. `bun run e2e`
+  (needs a local eliza-service on :3000 with `AGENTS_AUTH_DOMAIN=localhost:5174`).
+
+**Verified (against a local service + the real node, no passkey):** SIWE
+nonce→verify→bearer auth, agent create (DID returned), list, enable/disable gate
+(disabled → 403), and both tool/chat error paths (web_search without a Tavily key
+→ clean error; chat without a model → clean 409/close). The API E2E also caught
+and fixed a real client bug (`listAgents` must unwrap `{ agents: [...] }`).
+
+**Deferred to M4 pre-launch / live-node verification (documented residual):**
+
+- **Delegation-mint round-trip** — minting against the production node requires a
+  provisioned/quota'd account; a throwaway address is rejected (the node returns
+  403/500 on `/delegate`). This is the M4 "live-node proof #2" gate, not a client
+  bug — the client builds the correct delegation up to the node boundary.
+- **Manifest sign-in vs. the prod node** — `signIn()` reaches real "agents" space
+  creation, then the web-sdk manifest-registry write targets an `applications`
+  space that `autoCreateSpace` does not provision (`404 - space not found`).
+  Pending a decision on provisioning that space.
+- **OpenKey passkey UI leg** — the fully-automated passkey run needs a one-time
+  `openkey.so` signup to capture `.passkey.json` (see the `openkey-passkey-test`
+  skill); until then the Playwright mock-wallet flow is the autonomous stand-in.
+- **HTTPS/mkcert origin** for a passkey run, and **credentialed** web_search/chat
+  round-trips (real Tavily + RedPill keys via the deploy env).
