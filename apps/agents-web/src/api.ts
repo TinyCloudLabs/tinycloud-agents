@@ -181,6 +181,11 @@ export interface Agent {
   agentDid: string;
   name: string;
   enabled: boolean;
+  // Delegation scope for this agent, chosen by the service. Thread these
+  // verbatim into the mint — the client does not derive them. Optional only
+  // until the contract lands; the UI falls back to the config stubs.
+  space?: string;
+  pathPrefix?: string;
   delegationStatus?: DelegationStatus;
   createdAt?: string;
 }
