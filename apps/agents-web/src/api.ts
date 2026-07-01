@@ -3,16 +3,25 @@
 //
 // Loose coupling is a hard requirement: the service (M2) is still landing and
 // its contract may shift. Every path string and the `Authorization` header
-// format are confined to this file. UI code calls the typed functions below
-// and never sees a URL or a header.
+// construction are confined to this file. UI code calls the typed functions
+// below and never sees a URL or a header.
 //
 // Base URL is same-origin `/api` (Vite proxies it in dev; the Bun server
 // serves it in prod).
 //
-// AUTH: the locked decision is OpenKey (like the secrets site). The exact
-// header/verification mechanics come from M2's docs/agents-api.md — that
-// contract is authoritative. Until it lands, `authHeader` below is a PLACEHOLDER
-// using the plan's EIP-191 sketch; swap it here (and only here) on contract.
+// AUTH (finalized): SIWE nonce + bearer session, signed via the OpenKey
+// EIP-1193 provider.
+//   GET  /api/auth/nonce           -> { nonce }
+//   build SIWE message (domain agents.tinycloud.xyz + nonce)
+//   personal_sign via the OpenKey provider (same path tcw.signIn uses)
+//   POST /api/auth/verify {message, signature} -> { token }
+//   Authorization: Bearer <token> on all /api/agents* calls
+//   401 -> session expired, re-run the flow and retry once.
+//
+// The EXACT SIWE message fields/shapes come from M2's docs/agents-api.md —
+// that contract is authoritative. `buildSiweMessage` below is the one spot to
+// reconcile when it lands; everything else (nonce fetch, verify, bearer cache,
+// 401 re-auth) is contract-stable.
 // ---------------------------------------------------------------------------
 
 import type { TinyCloudWeb } from "@tinycloud/web-sdk";
@@ -21,9 +30,8 @@ const BASE = "/api";
 const AUTH_DOMAIN = "agents.tinycloud.xyz";
 
 // A signer is anything that can produce an EIP-191 personal_sign over a string.
-// TinyCloudWeb's ethers Web3Provider satisfies this; keeping the interface
-// narrow means the auth scheme can be swapped (SIWE session, OpenKey JWT)
-// without touching call sites.
+// TinyCloudWeb's ethers Web3Provider (backed by the OpenKey provider) satisfies
+// this; keeping the interface narrow keeps the auth wiring swappable.
 export interface Signer {
   address: string;
   signMessage(message: string): Promise<string>;
@@ -39,25 +47,62 @@ export function signerFromTcw(tcw: TinyCloudWeb): Signer {
   };
 }
 
-function base64(obj: unknown): string {
-  return btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(obj))));
+// Build the SIWE message to sign, given a server-issued nonce.
+//
+// PLACEHOLDER shape — reconcile with docs/agents-api.md when M2 lands. The
+// service builds and re-parses this message server-side to verify, so its
+// exact field set/formatting must match the contract exactly. Kept as EIP-4361
+// (SIWE) canonical text as a reasonable default.
+function buildSiweMessage(address: string, nonce: string): string {
+  const issuedAt = new Date().toISOString();
+  return [
+    `${AUTH_DOMAIN} wants you to sign in with your Ethereum account:`,
+    address,
+    ``,
+    `Sign in to TinyCloud Agents.`,
+    ``,
+    `URI: https://${AUTH_DOMAIN}`,
+    `Version: 1`,
+    `Chain ID: 1`,
+    `Nonce: ${nonce}`,
+    `Issued At: ${issuedAt}`,
+  ].join("\n");
 }
 
-// PLACEHOLDER auth header (EIP-191). Auth is locked to OpenKey — this is a
-// stand-in until M2's contract (docs/agents-api.md) defines the real header.
-// The signed payload binds the request to a method + path + fresh timestamp so
-// a verifier can reject stale/replayed signatures.
-async function authHeader(signer: Signer, method: string, path: string): Promise<string> {
-  const payload = {
-    domain: AUTH_DOMAIN,
-    address: signer.address,
-    method,
-    path,
-    timestamp: new Date().toISOString(),
-  };
-  const encoded = base64(payload);
-  const signature = await signer.signMessage(encoded);
-  return `TCW1 ${encoded}.${signature}`;
+// Per-session bearer token cache. Acquired lazily on the first authed request
+// and refreshed on 401. Confined to this module.
+let bearerToken: string | null = null;
+
+async function authenticate(signer: Signer): Promise<string> {
+  const nonceRes = await fetch(`${BASE}/auth/nonce`);
+  if (!nonceRes.ok) throw new ApiError(nonceRes.status, "failed to fetch auth nonce");
+  const { nonce } = (await nonceRes.json()) as { nonce: string };
+
+  const message = buildSiweMessage(signer.address, nonce);
+  const signature = await signer.signMessage(message);
+
+  const verifyRes = await fetch(`${BASE}/auth/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, signature }),
+  });
+  if (!verifyRes.ok) {
+    const detail = await verifyRes.json().catch(() => ({}));
+    throw new ApiError(verifyRes.status, detail?.message ?? "auth verify failed", detail?.error);
+  }
+  const { token } = (await verifyRes.json()) as { token: string };
+  bearerToken = token;
+  return token;
+}
+
+// Return a valid bearer token, authenticating if we don't have one cached.
+async function ensureToken(signer: Signer): Promise<string> {
+  return bearerToken ?? (await authenticate(signer));
+}
+
+// Clears the cached session (e.g. after a 401) so the next call re-authenticates.
+export function clearSession(): void {
+  bearerToken = null;
 }
 
 // Signals the UI should prompt the user to (re-)delegate before retrying.
@@ -75,22 +120,39 @@ export class ApiError extends Error {
   }
 }
 
+// Issue an authed request. On 401 (expired session) we clear the token,
+// re-authenticate once, and retry.
+async function authedFetch(
+  signer: Signer,
+  method: string,
+  path: string,
+  body?: unknown
+): Promise<Response> {
+  const send = async (token: string): Promise<Response> => {
+    const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    return fetch(BASE + path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  };
+
+  let res = await send(await ensureToken(signer));
+  if (res.status === 401) {
+    clearSession();
+    res = await send(await authenticate(signer));
+  }
+  return res;
+}
+
 async function request<T>(
   signer: Signer,
   method: string,
   path: string,
   body?: unknown
 ): Promise<T> {
-  const headers: Record<string, string> = {
-    Authorization: await authHeader(signer, method, path),
-  };
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-
-  const res = await fetch(BASE + path, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  const res = await authedFetch(signer, method, path, body);
 
   if (res.status === 409) {
     const detail = await res.json().catch(() => ({}));
@@ -165,14 +227,7 @@ export async function sendMessage(
   roomId?: string
 ): Promise<void> {
   const path = `/agents/${agentId}/messages`;
-  const res = await fetch(BASE + path, {
-    method: "POST",
-    headers: {
-      Authorization: await authHeader(signer, "POST", path),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ text, roomId }),
-  });
+  const res = await authedFetch(signer, "POST", path, { text, roomId });
 
   if (res.status === 409) {
     throw new DelegationRequiredError(agentId);

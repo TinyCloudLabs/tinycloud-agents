@@ -38,9 +38,20 @@ bun run build               # -> dist/ (served by the Bun server in prod)
 - `src/App.tsx`, `src/components/*` — sign-in gate, create/list, per-agent card
   (delegation badge, Delegate/Re-delegate, enable/disable), SSE chat, web_search.
 
-## Auth (pending reconciliation)
+## Auth
 
-`src/api.ts` currently signs each request with EIP-191 (`Authorization: TCW1
-<b64(payload)>.<sig>`) per the plan §2 stub. The committed service contract
-(`docs/agents-api.md`, from M2) is authoritative — when it lands, the auth
-construction is swapped in one place (`authHeader` / `signerFromTcw`).
+SIWE nonce + bearer session, signed via the OpenKey EIP-1193 provider (all in
+`src/api.ts`):
+
+1. `GET /api/auth/nonce` → `{ nonce }`
+2. Build the SIWE message (domain `agents.tinycloud.xyz` + nonce) and
+   `personal_sign` it via the OpenKey provider (the same path `tcw.signIn()`
+   uses).
+3. `POST /api/auth/verify { message, signature }` → `{ token }` (opaque bearer).
+4. `Authorization: Bearer <token>` on all `/api/agents*` calls. A 401 clears the
+   cached token and re-runs the flow once; a 409 `delegation_required` prompts
+   re-delegation.
+
+The exact SIWE message fields come from `docs/agents-api.md` (M2). Only
+`buildSiweMessage` in `api.ts` needs reconciling when that contract lands;
+everything else (nonce fetch, verify, bearer cache, 401 re-auth) is stable.
