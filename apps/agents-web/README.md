@@ -44,9 +44,10 @@ SIWE nonce + bearer session, signed via the OpenKey EIP-1193 provider (all in
 `src/api.ts`):
 
 1. `GET /api/auth/nonce` → `{ nonce }`
-2. Build the SIWE message (domain `agents.tinycloud.xyz` + nonce) and
-   `personal_sign` it via the OpenKey provider (the same path `tcw.signIn()`
-   uses).
+2. Build the SIWE message (domain `window.location.host` per EIP-4361 + nonce)
+   and `personal_sign` it via the OpenKey provider (the same path `tcw.signIn()`
+   uses). The server validates the domain against `AGENTS_AUTH_DOMAIN`
+   (`agents.tinycloud.xyz` in prod, `localhost:<port>` for local E2E).
 3. `POST /api/auth/verify { message, signature }` → `{ token }` (opaque bearer).
 4. `Authorization: Bearer <token>` on all `/api/agents*` calls. A 401 clears the
    cached token and re-runs the flow once; a 409 `delegation_required` prompts

@@ -13,7 +13,7 @@
 // (docs/agents-api.md).
 //   GET  /api/auth/nonce           -> { nonce }
 //   build a SIWE message (siwe SiweMessage.prepareMessage(): domain
-//     agents.tinycloud.xyz, address, chainId 1, nonce) and personal_sign it
+//     window.location.host, address, chainId 1, nonce) and personal_sign it
 //     via the OpenKey provider (same path tcw.signIn uses)
 //   POST /api/auth/verify {message, signature} -> { token, address, expiresAt }
 //   Authorization: Bearer <token> on all /api/agents* calls
@@ -24,7 +24,6 @@ import type { TinyCloudWeb } from "@tinycloud/web-sdk";
 import { SiweMessage } from "siwe";
 
 const BASE = "/api";
-const AUTH_DOMAIN = "agents.tinycloud.xyz";
 
 // A signer is anything that can produce an EIP-191 personal_sign over a string.
 // TinyCloudWeb's ethers Web3Provider (backed by the OpenKey provider) satisfies
@@ -46,14 +45,18 @@ export function signerFromTcw(tcw: TinyCloudWeb): Signer {
 
 // Build the SIWE message to sign, given a server-issued nonce. Uses the `siwe`
 // library's canonical serialization so it matches the server's SiweMessage
-// parse byte-for-byte (docs/agents-api.md: domain agents.tinycloud.xyz,
-// address, chainId 1, nonce).
+// parse byte-for-byte.
+//
+// Per EIP-4361 the `domain` MUST be the origin actually serving the page —
+// window.location.host — not a hardcoded value. The server validates it against
+// AGENTS_AUTH_DOMAIN (agents.tinycloud.xyz in prod, localhost:<port> for local
+// E2E), so hardcoding would break the domain binding on any non-prod origin.
 function buildSiweMessage(address: string, nonce: string): string {
   return new SiweMessage({
-    domain: AUTH_DOMAIN,
+    domain: window.location.host,
     address,
     statement: "Sign in to TinyCloud Agents.",
-    uri: `https://${AUTH_DOMAIN}`,
+    uri: window.location.origin,
     version: "1",
     chainId: 1,
     nonce,
