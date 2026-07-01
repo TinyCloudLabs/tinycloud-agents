@@ -61,6 +61,14 @@ export interface PostSessionsBody {
    * delegation route passes the agent record's space.
    */
   expectedSpace?: string;
+  /**
+   * KV prefix (the agent's pathPrefix, e.g. "default/") the delegation MUST grant a
+   * `tinycloud.kv` resource on (option D "operate broadly under the prefix"). When
+   * set, a required KV resource is added to the policy — absent → `missing_kv_resource`,
+   * wrong prefix → `wrong_kv_prefix` (both 400, fail-closed on the /api route). The
+   * legacy tinychat /sessions route omits it (no KV requirement, unchanged).
+   */
+  kvPrefix?: string;
 }
 
 export interface HandlerResult {
@@ -73,9 +81,9 @@ export async function handlePostSessions(
   host: SessionHandlerHost,
   store: SessionStore,
 ): Promise<HandlerResult> {
-  const { agentId, entityId, serializedDelegation, roomId, expectedSpace } = body;
+  const { agentId, entityId, serializedDelegation, roomId, expectedSpace, kvPrefix } = body;
   const dbHandle = body.dbHandle ?? MEMORY_DB_HANDLE;
-  const policy = defaultElizaMemoryPolicy(dbHandle);
+  const policy = defaultElizaMemoryPolicy(dbHandle, kvPrefix);
   // Per-agent delegation target: each agent validates against its own DID, not a
   // single service-wide DID.
   const agentDid = await host.agentDidFor(agentId);
@@ -117,8 +125,8 @@ export async function handlePostSessions(
 
   // 5. Record in C-local store so GET /sessions can re-evaluate liveness without
   //    touching entity-registry.ts (B's frozen keystone). Persist dbHandle +
-  //    expectedSpace so the GET re-evaluation applies the same path/space checks.
-  store.set(entityId, { agentId, serializedDelegation, roomId, dbHandle, expectedSpace });
+  //    expectedSpace + kvPrefix so the GET re-evaluation applies the same checks.
+  store.set(entityId, { agentId, serializedDelegation, roomId, dbHandle, expectedSpace, kvPrefix });
 
   // 6. Return liveness status
   const status = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: agentDid, expectedSpace });
@@ -142,7 +150,7 @@ export async function handleGetSessions(
     return { status: 404, body: { status: "none" } };
   }
 
-  const policy = defaultElizaMemoryPolicy(record.dbHandle ?? MEMORY_DB_HANDLE);
+  const policy = defaultElizaMemoryPolicy(record.dbHandle ?? MEMORY_DB_HANDLE, record.kvPrefix);
   // Resolve the delegation target for the agent this session was registered against.
   const agentDid = await host.agentDidFor(record.agentId);
 

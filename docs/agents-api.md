@@ -124,9 +124,9 @@ sign-in flow (nonce → sign → verify) to obtain a new token.
   agentDid: string;
   name: string;
   enabled: boolean;
-  space: string;       // TinyCloud space to mint the delegation in: tcw.space(space)
-  pathPrefix: string;  // per-agent prefix within the space, e.g. "default/"
-  dbHandle: string;    // delegation `path` to grant: `${pathPrefix}memory`
+  space: string;       // TinyCloud space the delegation grants in (e.g. "agents")
+  pathPrefix: string;  // KV-prefix grant path within the space, e.g. "default/"
+  dbHandle: string;    // SQL-exact grant path: `${pathPrefix}memory`
   createdAt: string;
 }
 ```
@@ -183,40 +183,59 @@ Register the user's TinyCloud delegation for this agent. The `entityId` is deriv
 ```json
 Body: { "serializedDelegation": string, "roomId"?: string }
 200  { "entityId": string, "status": "active" | "expired" | "stale" }
-400  { "error": "malformed" | "invalid_shape" | "wrong_space" | "<policy reason>", "message"?: string }
+400  { "error": "malformed" | "invalid_shape" | "wrong_space"
+           | "missing_sql_resource" | "wrong_db_handle"
+           | "missing_kv_resource" | "wrong_kv_prefix"
+           | "insufficient_actions" | "<policy reason>", "message"?: string }
 403  { "error": "agent_disabled" }
 404  { "error": "not_found" }
 ```
 
-The `serializedDelegation` is the blob produced by
-`tools/delegate-ui/src/delegate.ts` — mint with `@tinycloud/web-sdk@2.3.0`, but
-**parameterize the space and path from the AgentView** (do not use the old fixed
-`space("default")` / `xyz.tinycloud.eliza/memory`):
+#### Mint shape — MULTI-RESOURCE (option D)
 
-```ts
-tcw.space(view.space).delegations.create({
-  delegateDID: view.agentDid,   // MUST equal the AgentView.agentDid
-  path: view.dbHandle,          // e.g. "default/memory"
-  actions: SQL_ACTIONS,
-  expiry,
-});
-```
+The delegation is a **single multi-resource grant** covering three services, all in
+the agent's `space` (`view.space` = `"agents"`), minted from the AgentView verbatim:
 
-Then **rewrite the top-level `actions` from the JWT `att` claim** (web-sdk 2.3.0
-serializes `actions` lossily — see `actionsFromAuthJwt` in delegate.ts, carry it
-over verbatim).
+| service | path | actions | why |
+|---|---|---|---|
+| `tinycloud.kv` | `view.pathPrefix` (e.g. `"default/"`) | `get`,`put`,`list`,`delete` | KV is **hierarchical** — the prefix grant is the agent's broad "operate under my prefix" access |
+| `tinycloud.sql` | `view.dbHandle` (e.g. `"default/memory"`) — **EXACT** | `read`,`write`,`admin` | SQL is **exact db-name** at the node, NOT hierarchical — must be the exact handle, not the prefix |
+| `tinycloud.capabilities` | `""` | `read` | as before (optional) |
 
-The server validates, and rejects with `400` on any mismatch:
-- `delegateDID == view.agentDid` — else `<policy reason>` (`wrong_delegatee`).
-- granted `path == view.dbHandle` — else `wrong_db_handle`.
-- **granted space == `view.space`** (the `agents` space) — else `wrong_space`. This
-  is enforced **fail-closed**: a delegation minted against another space (even with a
-  matching path), OR one whose signed capability carries no verifiable per-resource
-  space (the flat/legacy serialization), is rejected `wrong_space`. Always mint with
-  `tcw.space(view.space)` so the signed grant carries the right space — a delegation
-  built without the multi-resource space (e.g. a hand-rolled flat blob) will be
-  rejected here. Show the user a "re-delegate in the agents space" message on
-  `wrong_space`.
+> Why not one `space().delegations.create({ path })`: that emits a SINGLE resource
+> and cannot express kv-prefix + sql-exact together. Mint the multi-resource grant
+> via the **abilities-map / manifest path** — either `createDelegation` with an
+> `abilities` map, or `TinyCloudNode.delegateTo(agentDid, permissions)` driven by a
+> manifest whose `PermissionEntry[]` declares these three resources. The abilities
+> map shape (short-service → path → full-URN actions):
+>
+> ```ts
+> {
+>   kv:  { [view.pathPrefix]:        ["tinycloud.kv/get","tinycloud.kv/put","tinycloud.kv/list","tinycloud.kv/delete"] },
+>   sql: { [view.dbHandle]:          ["tinycloud.sql/read","tinycloud.sql/write","tinycloud.sql/admin"] },
+>   capabilities: { "": ["tinycloud.capabilities/read"] },
+> }
+> ```
+>
+> `delegateDID` MUST equal `view.agentDid`. Keep the `actionsFromAuthJwt` web-sdk
+> 2.3.0 workaround if you post-process the serialized blob.
+
+#### Server validation (all `400` on mismatch, fail-closed on the /api route)
+
+- `delegateDID == view.agentDid` — else `wrong_delegatee`.
+- **SQL** resource present at EXACT `path == view.dbHandle` — else `missing_sql_resource`
+  / `wrong_db_handle`.
+- **KV** resource present at `path == view.pathPrefix` (a granted `"/"` whole-space is
+  accepted as a superset) — else `missing_kv_resource` / `wrong_kv_prefix`.
+- Every matched resource's **space == `view.space`** (`"agents"`) — else `wrong_space`.
+  Fail-closed: a grant with no verifiable per-resource space (the flat/legacy single-
+  resource serialization) is rejected. This is why you MUST mint the multi-resource
+  grant, not a hand-rolled flat blob.
+- Required actions covered on each resource — else `insufficient_actions`.
+
+Show the user a "re-delegate" message on any of these; `wrong_space` / `missing_kv_resource`
+specifically mean the delegation wasn't minted with the full agents-space multi-resource
+shape.
 
 Restart caveat: the registry and delegations are in-memory (v1). After a CVM
 redeploy, `/messages` and `/tools` return `409 delegation_required` until the user
@@ -282,7 +301,7 @@ Only tool today is `web_search` (pure-API; needs no delegation and no TEXT model
 1. `openkey.connect()` → address + EIP-1193 provider.
 2. `GET /api/auth/nonce` → build SIWE message → sign via provider → `POST /api/auth/verify` → store token.
 3. `POST /api/agents` (or `GET` to list). Show each agent's `agentDid` + copy button.
-4. Per agent: mint the delegation with `tcw.space(view.space).delegations.create({ delegateDID: view.agentDid, path: view.dbHandle, ... })` (ported delegate.ts) → `POST /api/agents/:id/delegation`.
+4. Per agent: mint the MULTI-RESOURCE delegation (kv-prefix `view.pathPrefix` + sql-exact `view.dbHandle` + capabilities, in `view.space`) via the abilities-map/manifest path, `delegateDID: view.agentDid` → `POST /api/agents/:id/delegation`. See the Delegation section for the exact shape.
 5. Toggle via `PATCH`. Chat via `POST /api/agents/:id/messages` (consume SSE). `web_search` via tools route.
 
 Keep all endpoint paths + the `Authorization` header construction in a single

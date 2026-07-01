@@ -212,20 +212,23 @@ describe("/api/agents lifecycle", () => {
     expect(created.pathPrefix).toBe("default/");
     expect(created.dbHandle).toBe("default/memory");
 
-    // A delegation whose delegateDID == the agent's DID, whose path == the agent's
-    // dbHandle, AND whose resource space == the agent's space passes the full
-    // deserialize -> shape -> policy (incl. fail-closed space assertion) chain.
-    // Multi-resource shape: resources[].space carries the space the server checks.
+    // Option D multi-resource delegation: SQL EXACT on dbHandle + KV PREFIX on
+    // pathPrefix + capabilities, all in the agent's space. Passes the full
+    // deserialize -> shape -> policy (SQL exact + KV prefix + fail-closed space) chain.
     const ownerAddr = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
     const spaceUri = `tinycloud:pkh:eip155:1:${ownerAddr}:${created.space}`;
-    const actions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"];
+    const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"];
+    const kvActions = ["tinycloud.kv/get", "tinycloud.kv/put", "tinycloud.kv/list", "tinycloud.kv/delete"];
     const serializedDelegation = JSON.stringify({
       cid: "bafy-api-deleg-test",
       delegateDID: AGENT_DID,
       spaceId: spaceUri,
       path: created.dbHandle,
-      actions,
-      resources: [{ service: "sql", space: spaceUri, path: created.dbHandle, actions }],
+      actions: sqlActions,
+      resources: [
+        { service: "sql", space: spaceUri, path: created.dbHandle, actions: sqlActions },
+        { service: "kv", space: spaceUri, path: created.pathPrefix, actions: kvActions },
+      ],
       expiry: new Date("2099-01-01T00:00:00.000Z").toISOString(),
       ownerAddress: ownerAddr,
       chainId: 1,
@@ -246,6 +249,101 @@ describe("/api/agents lifecycle", () => {
     const expectedEntityId = addressToEntityId(account.address, created.agentId);
     expect(body.entityId).toBe(expectedEntityId);
     expect(registered).toEqual([expectedEntityId]);
+  });
+
+  it("delegation: option D requires the KV prefix resource — SQL-only grant is 400 missing_kv_resource", async () => {
+    const { fetch } = makeFetch();
+    const token = await signIn(fetch);
+    const created = (await (
+      await fetch(
+        authed("/api/agents", token, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "d" }),
+        }),
+      )
+    ).json()) as { agentId: string; space: string; pathPrefix: string; dbHandle: string };
+
+    // Correct SQL-exact + correct space, but NO KV prefix resource -> fail-closed.
+    const ownerAddr = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
+    const spaceUri = `tinycloud:pkh:eip155:1:${ownerAddr}:${created.space}`;
+    const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"];
+    const serializedDelegation = JSON.stringify({
+      cid: "bafy-no-kv",
+      delegateDID: AGENT_DID,
+      spaceId: spaceUri,
+      path: created.dbHandle,
+      actions: sqlActions,
+      resources: [{ service: "sql", space: spaceUri, path: created.dbHandle, actions: sqlActions }],
+      expiry: new Date("2099-01-01T00:00:00.000Z").toISOString(),
+      ownerAddress: ownerAddr,
+      chainId: 1,
+      host: "https://node.tinycloud.xyz",
+    });
+
+    const res = await fetch(
+      authed(`/api/agents/${created.agentId}/delegation`, token, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ serializedDelegation }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("missing_kv_resource");
+  });
+
+  it("delegation: option D accepts a KV \"/\" grant as a superset of the prefix", async () => {
+    const registered: string[] = [];
+    const host: ElizaServiceHost = {
+      agentDid: AGENT_DID,
+      agentDidFor: async () => AGENT_DID,
+      storageFor: async () => ({ async registerDelegation(entityId: string) { registered.push(entityId); } }),
+      runtimeFor: async () => ({}) as IAgentRuntime,
+      preflight: async () => {},
+    };
+    const auth = new UserAuth({ domain: DOMAIN });
+    const agents = new AgentStore();
+    const fetch = createElizaServiceFetch({ host, sessions: new SessionStore(), api: { auth, agents } });
+    const token = await signIn(fetch);
+    const created = (await (
+      await fetch(
+        authed("/api/agents", token, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "d" }),
+        }),
+      )
+    ).json()) as { agentId: string; space: string; pathPrefix: string; dbHandle: string };
+
+    const ownerAddr = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
+    const spaceUri = `tinycloud:pkh:eip155:1:${ownerAddr}:${created.space}`;
+    const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"];
+    const kvActions = ["tinycloud.kv/get", "tinycloud.kv/put", "tinycloud.kv/list", "tinycloud.kv/delete"];
+    const serializedDelegation = JSON.stringify({
+      cid: "bafy-kv-slash",
+      delegateDID: AGENT_DID,
+      spaceId: spaceUri,
+      path: created.dbHandle,
+      actions: sqlActions,
+      resources: [
+        { service: "sql", space: spaceUri, path: created.dbHandle, actions: sqlActions },
+        { service: "kv", space: spaceUri, path: "/", actions: kvActions },
+      ],
+      expiry: new Date("2099-01-01T00:00:00.000Z").toISOString(),
+      ownerAddress: ownerAddr,
+      chainId: 1,
+      host: "https://node.tinycloud.xyz",
+    });
+
+    const res = await fetch(
+      authed(`/api/agents/${created.agentId}/delegation`, token, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ serializedDelegation }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { status: string }).status).toBe("active");
   });
 
   it("delegation: a fixture whose delegateDID does NOT match the agentDid is rejected", async () => {

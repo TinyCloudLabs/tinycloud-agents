@@ -91,6 +91,14 @@ export interface DelegationPolicy {
   resources: PolicyResource[];
 }
 
+/** Full KV actions granted on the agent's prefix in the agents-space (option D). */
+const KV_PREFIX_ACTIONS = [
+  "tinycloud.kv/get",
+  "tinycloud.kv/put",
+  "tinycloud.kv/list",
+  "tinycloud.kv/delete",
+];
+
 /**
  * Default Eliza-memory delegation policy.
  *
@@ -103,32 +111,49 @@ export interface DelegationPolicy {
  *
  * Required SQL actions include `admin` because Phase 5 runs `ensureSchema()` (DDL)
  * on boot. A future steady-state mode can pass `["tinycloud.sql/read","tinycloud.sql/write"]`.
+ *
+ * OPTION D (agents-space, multi-resource): when `kvPrefix` is provided, a required
+ * `tinycloud.kv` resource at `path=kvPrefix` is added — the agent's "operate broadly
+ * under the prefix" grant. KV is hierarchical at the node, so a prefix grant is
+ * valid there (unlike SQL, which stays exact-match on dbHandle). When `kvPrefix` is
+ * omitted the policy is unchanged (legacy tinychat /sessions path).
  */
 export function defaultElizaMemoryPolicy(
   dbHandle: string = DEFAULT_DB_HANDLE,
+  kvPrefix?: string,
 ): DelegationPolicy {
-  return {
-    resources: [
-      {
-        serviceLong: "tinycloud.sql",
-        serviceShort: "sql",
-        path: dbHandle,
-        requiredActions: [
-          "tinycloud.sql/read",
-          "tinycloud.sql/write",
-          "tinycloud.sql/admin",
-        ],
-        required: true,
-      },
-      {
-        serviceLong: "tinycloud.capabilities",
-        serviceShort: "capabilities",
-        path: "",
-        requiredActions: ["tinycloud.capabilities/read"],
-        required: false,
-      },
-    ],
-  };
+  const resources: PolicyResource[] = [
+    {
+      serviceLong: "tinycloud.sql",
+      serviceShort: "sql",
+      path: dbHandle,
+      requiredActions: [
+        "tinycloud.sql/read",
+        "tinycloud.sql/write",
+        "tinycloud.sql/admin",
+      ],
+      required: true,
+    },
+    {
+      serviceLong: "tinycloud.capabilities",
+      serviceShort: "capabilities",
+      path: "",
+      requiredActions: ["tinycloud.capabilities/read"],
+      required: false,
+    },
+  ];
+
+  if (kvPrefix !== undefined) {
+    resources.push({
+      serviceLong: "tinycloud.kv",
+      serviceShort: "kv",
+      path: kvPrefix,
+      requiredActions: KV_PREFIX_ACTIONS,
+      required: true,
+    });
+  }
+
+  return { resources };
 }
 
 /**
@@ -214,13 +239,15 @@ export function validateDelegationPolicy(
     // it. undefined for the flat/legacy shape (no per-resource space).
     let grantedSpaceUri: string | undefined;
 
+    const isKv = policyResource.serviceShort === "kv";
+
     if (delegation.resources !== undefined) {
       // Multi-resource shape: prefer resources[] — search for a matching service entry
       const found = delegation.resources.find(r => serviceMatches(r.service, policyResource));
       if (!found) {
         throw new DelegationPolicyError(
           `delegation missing required resource: service=${policyResource.serviceLong} path=${policyResource.path}`,
-          "MISSING_SQL_RESOURCE",
+          isKv ? "MISSING_KV_RESOURCE" : "MISSING_SQL_RESOURCE",
           { requiredService: policyResource.serviceLong, requiredPath: policyResource.path },
         );
       }
@@ -228,13 +255,33 @@ export function validateDelegationPolicy(
       grantedActions = found.actions;
       grantedSpaceUri = found.space;
     } else {
-      // Flat (legacy single-resource) shape: synthesize from the flat path + actions fields
+      // Flat (legacy single-resource) shape: synthesize from the flat path + actions fields.
+      // KV resources only exist in the multi-resource shape, so a required KV resource
+      // is unreachable here (a flat delegation cannot carry it) — reject fail-closed.
+      if (isKv) {
+        throw new DelegationPolicyError(
+          `delegation missing required KV prefix resource (flat/legacy shape carries no KV grant)`,
+          "MISSING_KV_RESOURCE",
+          { requiredService: policyResource.serviceLong, requiredPath: policyResource.path },
+        );
+      }
       grantedPath = delegation.path;
       grantedActions = delegation.actions;
     }
 
-    // (5) DB handle (resource path) match
-    if (grantedPath !== policyResource.path) {
+    // (5) Resource-path match.
+    //  - KV is HIERARCHICAL at the node: accept the exact prefix OR a "/" grant
+    //    (whole-space superset of the prefix, documented). WRONG_KV_PREFIX otherwise.
+    //  - SQL (and others) are EXACT db-name match: granted path must equal dbHandle.
+    if (isKv) {
+      if (grantedPath !== policyResource.path && grantedPath !== "/") {
+        throw new DelegationPolicyError(
+          `delegation KV prefix mismatch: expected ${policyResource.path} (or "/"), got ${grantedPath}`,
+          "WRONG_KV_PREFIX",
+          { expected: policyResource.path, actual: grantedPath },
+        );
+      }
+    } else if (grantedPath !== policyResource.path) {
       throw new DelegationPolicyError(
         `delegation SQL resource path mismatch: expected ${policyResource.path}, got ${grantedPath}`,
         "WRONG_DB_HANDLE",

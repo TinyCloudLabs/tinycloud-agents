@@ -797,6 +797,70 @@ describe("validateDelegationPolicy", () => {
       expect(msg).not.toContain("delegationheader");
     }
   });
+
+  // --- Option D: KV prefix resource ---
+  const KV_PREFIX = "default/";
+  const dPolicy = defaultElizaMemoryPolicy(DB_HANDLE, KV_PREFIX);
+  const kvActions = ["tinycloud.kv/get", "tinycloud.kv/put", "tinycloud.kv/list", "tinycloud.kv/delete"];
+  const sqlRes = () => ({ service: "sql", space: `tinycloud:pkh:eip155:1:${OWNER_ADDRESS}:agents`, path: DB_HANDLE, actions: ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"] });
+  const kvRes = (path: string) => ({ service: "kv", space: `tinycloud:pkh:eip155:1:${OWNER_ADDRESS}:agents`, path, actions: kvActions });
+  const dDelegation = (resources: unknown[]) => makeMultiResource({ resources });
+
+  test("D policy: SQL exact + KV prefix both present -> passes", () => {
+    expect(() =>
+      validateDelegationPolicy(dDelegation([sqlRes(), kvRes(KV_PREFIX)]), { agentDID: AGENT_DID, policy: dPolicy }),
+    ).not.toThrow();
+  });
+
+  test("D policy: KV resource absent -> MISSING_KV_RESOURCE", () => {
+    try {
+      validateDelegationPolicy(dDelegation([sqlRes()]), { agentDID: AGENT_DID, policy: dPolicy });
+      expect(true).toBe(false);
+    } catch (e) {
+      expect((e as DelegationPolicyError).reason).toBe("MISSING_KV_RESOURCE");
+    }
+  });
+
+  test("D policy: KV granted at a different prefix -> WRONG_KV_PREFIX", () => {
+    try {
+      validateDelegationPolicy(dDelegation([sqlRes(), kvRes("other/")]), { agentDID: AGENT_DID, policy: dPolicy });
+      expect(true).toBe(false);
+    } catch (e) {
+      expect((e as DelegationPolicyError).reason).toBe("WRONG_KV_PREFIX");
+    }
+  });
+
+  test("D policy: KV granted at \"/\" (whole-space superset) -> passes", () => {
+    expect(() =>
+      validateDelegationPolicy(dDelegation([sqlRes(), kvRes("/")]), { agentDID: AGENT_DID, policy: dPolicy }),
+    ).not.toThrow();
+  });
+
+  test("D policy: KV present but missing a required kv action -> INSUFFICIENT_ACTIONS", () => {
+    const partialKv = { ...kvRes(KV_PREFIX), actions: ["tinycloud.kv/get"] };
+    try {
+      validateDelegationPolicy(dDelegation([sqlRes(), partialKv]), { agentDID: AGENT_DID, policy: dPolicy });
+      expect(true).toBe(false);
+    } catch (e) {
+      expect((e as DelegationPolicyError).reason).toBe("INSUFFICIENT_ACTIONS");
+    }
+  });
+
+  test("D policy: flat/legacy delegation (no resources[]) -> MISSING_KV_RESOURCE (fail-closed)", () => {
+    try {
+      validateDelegationPolicy(makeFlat(), { agentDID: AGENT_DID, policy: dPolicy });
+      expect(true).toBe(false);
+    } catch (e) {
+      expect((e as DelegationPolicyError).reason).toBe("MISSING_KV_RESOURCE");
+    }
+  });
+
+  test("default policy (no kvPrefix): no KV requirement — SQL-only multi-resource passes", () => {
+    // Legacy path: defaultElizaMemoryPolicy(dbHandle) with no kvPrefix adds no KV resource.
+    expect(() =>
+      validateDelegationPolicy(dDelegation([sqlRes()]), { agentDID: AGENT_DID, policy }),
+    ).not.toThrow();
+  });
 });
 
 // ---------------------------------------------------------------------------

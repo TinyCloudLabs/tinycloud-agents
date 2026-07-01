@@ -128,11 +128,11 @@ export async function handleAgentDelegation(
   const roomId = typeof body.roomId === "string" ? body.roomId : undefined;
 
   const entityId = addressToEntityId(ownerAddress, agentId);
-  // Validate the grant against THIS agent's per-agent path AND space (space
-  // "agents", path "<pathPrefix>memory") rather than the legacy single handle.
-  // expectedSpace makes the space assertion fail-closed for the /api route: a
-  // delegation minted against another space (or with no verifiable space) is
-  // rejected as `wrong_space` (400) even if its path matches.
+  // Option D multi-resource validation for THIS agent (fail-closed on the /api route):
+  //  - SQL EXACT on dbHandle "<pathPrefix>memory" (node authorizes exact db names only)
+  //  - KV PREFIX on pathPrefix "default/" (KV is hierarchical → "operate broadly")
+  //  - space == record.space ("agents") on all matched resources
+  // Absent KV resource → missing_kv_resource; wrong space → wrong_space; all 400.
   const dbHandle = dbHandleForRecord(record);
   return handlePostSessions(
     {
@@ -142,6 +142,7 @@ export async function handleAgentDelegation(
       roomId,
       dbHandle,
       expectedSpace: record.space,
+      kvPrefix: record.pathPrefix,
     },
     host,
     sessions,

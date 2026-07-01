@@ -20,6 +20,8 @@ export interface SessionRecord {
   dbHandle?: string;
   /** Space name the delegation was validated against (fail-closed space assertion). */
   expectedSpace?: string;
+  /** KV prefix the delegation was validated against (option D KV prefix grant). */
+  kvPrefix?: string;
 }
 
 export class SessionStore {
