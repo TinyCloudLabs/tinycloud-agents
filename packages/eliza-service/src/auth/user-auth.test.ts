@@ -12,7 +12,10 @@ const DOMAIN = "agents.tinycloud.xyz";
 const PK = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const account = privateKeyToAccount(PK);
 
-async function signedMessage(nonce: string, opts: { domain?: string; address?: string } = {}) {
+async function signedMessage(
+  nonce: string,
+  opts: { domain?: string; address?: string; expirationTime?: string } = {},
+) {
   const siwe = new SiweMessage({
     domain: opts.domain ?? DOMAIN,
     address: opts.address ?? account.address,
@@ -20,6 +23,7 @@ async function signedMessage(nonce: string, opts: { domain?: string; address?: s
     version: "1",
     chainId: 1,
     nonce,
+    ...(opts.expirationTime ? { expirationTime: opts.expirationTime } : {}),
   });
   const message = siwe.prepareMessage();
   const signature = await account.signMessage({ message });
@@ -109,6 +113,26 @@ describe("UserAuth — domain binding", () => {
     const { message, signature } = await signedMessage(nonce, { domain: "evil.example.com" });
     const result = await auth.verifySiwe({ message, signature });
     expect(result.ok).toBe(false);
+  });
+});
+
+describe("UserAuth — expirationTime enforcement", () => {
+  it("rejects a message whose expirationTime has already passed", async () => {
+    const auth = new UserAuth({ domain: DOMAIN });
+    const nonce = auth.issueNonce();
+    const expired = new Date(Date.now() - 60_000).toISOString();
+    const { message, signature } = await signedMessage(nonce, { expirationTime: expired });
+    const result = await auth.verifySiwe({ message, signature });
+    expect(result).toEqual({ ok: false, error: "invalid_signature" });
+  });
+
+  it("accepts a message with a future expirationTime", async () => {
+    const auth = new UserAuth({ domain: DOMAIN });
+    const nonce = auth.issueNonce();
+    const future = new Date(Date.now() + 60 * 60_000).toISOString();
+    const { message, signature } = await signedMessage(nonce, { expirationTime: future });
+    const result = await auth.verifySiwe({ message, signature });
+    expect(result.ok).toBe(true);
   });
 });
 

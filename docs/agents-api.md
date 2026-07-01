@@ -21,66 +21,93 @@ verifying a SIWE signature, then issues a short-lived opaque bearer session.
 
 ### `GET /api/auth/nonce`
 
-No auth. Returns a single-use nonce (TTL 5 min).
+No auth. Returns a single-use nonce (TTL 5 min). Exact response body — the ONLY key
+is `nonce`:
 
 ```json
 200 { "nonce": "eToR9QhpwDZ0NXsoM" }
 ```
 
+The nonce is an opaque alphanumeric string from `siwe.generateNonce()` (≥ 8 chars).
+Treat it as opaque — embed it verbatim in the SIWE message's `nonce` field.
+
 ### `POST /api/auth/verify`
 
-No auth. Body:
+No auth. The client builds the **full EIP-4361 message string** (`prepareMessage()`)
+and POSTs it **verbatim** alongside the signature — the server re-parses the exact
+bytes, so send the string unchanged (no re-serialization, no trimming, preserve
+newlines). Exact request body — both keys required, both strings:
 
 ```json
-{ "message": "<SIWE message string, prepareMessage()>", "signature": "0x..." }
+{ "message": "<full EIP-4361 message string from prepareMessage()>", "signature": "0x<hex>" }
 ```
 
-The client builds the SIWE message with the `siwe` package and these **exact
-fields**, then signs `prepareMessage()` via the OpenKey EIP-1193 provider
-(`personal_sign` — the same path `tcw.signIn()` uses):
+Build the message with the `siwe` package and these fields, then sign the prepared
+string via the OpenKey EIP-1193 provider (`personal_sign` — the same path
+`tcw.signIn()` uses):
 
 ```ts
 import { SiweMessage } from "siwe";
 
 const msg = new SiweMessage({
-  domain:  "agents.tinycloud.xyz",   // MUST match the server's AGENTS_AUTH_DOMAIN
-  address,                            // the OpenKey wallet address (EIP-55 checksummed)
-  uri:     "https://agents.tinycloud.xyz",
-  version: "1",
-  chainId: 1,
-  nonce,                              // the nonce from GET /api/auth/nonce
-  // statement, issuedAt, etc. are optional and not validated by the server;
-  // the server binds ONLY domain + nonce (+ signature recovery).
+  domain:  "agents.tinycloud.xyz",   // REQUIRED. MUST equal the server's AGENTS_AUTH_DOMAIN.
+  address,                            // REQUIRED. OpenKey wallet address, EIP-55 checksummed.
+  uri:     "https://agents.tinycloud.xyz",  // REQUIRED by EIP-4361 (any valid URI; not value-checked by the server).
+  version: "1",                      // REQUIRED by EIP-4361.
+  chainId: 1,                        // REQUIRED by EIP-4361. Signed into the message; not cross-checked server-side.
+  nonce,                             // REQUIRED. The exact string from GET /api/auth/nonce.
+  // Optional: statement, issuedAt, expirationTime, notBefore, requestId, resources.
+  // expirationTime, if present, IS enforced (see "What the server validates").
 });
 const message = msg.prepareMessage();
 const signature = await provider.request({ method: "personal_sign", params: [message, address] });
-// POST { message, signature } to /api/auth/verify
+// POST { message, signature } to /api/auth/verify — message sent verbatim.
 ```
 
-The server runs `SiweMessage.verify({ signature, domain, nonce })` — binding the
-configured domain and the issued (single-use) nonce — and recovers the address.
+#### What the server validates
+
+The server runs `SiweMessage.verify({ signature, domain, nonce })` (siwe v3). That call:
+
+1. **domain** — the message's `domain` field MUST equal the server's configured
+   domain (`AGENTS_AUTH_DOMAIN`, default `agents.tinycloud.xyz`). Mismatch → reject.
+2. **nonce** — the message's `nonce` MUST equal the server-issued nonce, which must
+   still be live (issued, unconsumed, within its 5-min TTL). The server checks the
+   nonce against its own store BEFORE calling verify, and `verify` also binds it.
+3. **address / signature** — the signature MUST recover to the `address` in the
+   message (EIP-4361 / EIP-191 personal_sign recovery). Mismatch → reject.
+4. **expirationTime** — if the message includes `expirationTime`, `verify` enforces
+   it: an already-expired message is rejected (`Expired message.`). Omit it if you
+   don't want message-level expiry; the nonce's 5-min TTL already bounds the window.
+5. **chainId / version / uri / issuedAt** — parsed and part of the signed payload,
+   but NOT cross-checked against an expected value by the server (only their presence
+   / EIP-4361 well-formedness matters). The recovered identity is `address`.
+
 On success:
 
 ```json
 200 { "token": "<64-hex>", "address": "0x<lowercased>", "expiresAt": 1730000000000 }
 ```
 
-- `token` is opaque, 32 random bytes hex-encoded. Send it as `Authorization: Bearer <token>`.
-- `expiresAt` is epoch ms; session TTL is 24h. After a redeploy the in-memory session
-  store is empty, so the user simply signs in again (same as the registry — v1 is in-memory).
+- `token` — opaque, 32 random bytes hex-encoded (64 hex chars). Do not parse it; send
+  it back as `Authorization: Bearer <token>`.
+- `address` — the recovered owner address, lowercased.
+- `expiresAt` — epoch **milliseconds**; session TTL is 24h.
 
-Failures — all `401`:
-- `invalid_message` — the message isn't a parseable SIWE message.
-- `invalid_nonce` — the nonce was never issued, already consumed (single-use), or expired
-  (5-min TTL). Fetch a fresh nonce and re-sign. Hard failure — no fallback.
-- `invalid_signature` — signature doesn't recover to the claimed address, or the domain
-  doesn't match. The nonce is NOT consumed on this path, so a genuine retry with a correct
-  signature over the same message still works until the nonce's 5-min TTL lapses.
+Failures — all `401 { "error": <code> }`:
+- `invalid_message` — the message isn't a parseable SIWE/EIP-4361 message.
+- `invalid_nonce` — the nonce was never issued, already consumed (single-use), or
+  expired (5-min TTL). Fetch a fresh nonce and re-sign. Hard failure — no fallback.
+- `invalid_signature` — signature doesn't recover to the message's address, the
+  domain doesn't match, or an `expirationTime` in the message has passed. The nonce is
+  NOT consumed on this path, so a corrected retry over the same message works until the
+  nonce's 5-min TTL lapses.
 
 ### Authenticated requests
 
-All routes below require `Authorization: Bearer <token>`. Missing/expired/unknown
-token → `401 { "error": "unauthorized" }`.
+All `/api/agents*` routes require `Authorization: Bearer <token>`. The token is
+**opaque** — there is **no refresh endpoint**. Missing / unknown / expired token →
+`401 { "error": "unauthorized" }`. On any such 401 the client re-runs the full
+sign-in flow (nonce → sign → verify) to obtain a new token.
 
 ## Agents
 
