@@ -27,7 +27,8 @@ declare const Bun: {
 };
 
 export type ElizaServiceHost = SessionHandlerHost
-  & Pick<MessageHandlerHost, "runtimeFor" | "preflight">;
+  & Pick<MessageHandlerHost, "runtimeFor" | "preflight">
+  & { readonly agentDid: string };
 
 export interface ElizaServiceOptions {
   host: ElizaServiceHost;

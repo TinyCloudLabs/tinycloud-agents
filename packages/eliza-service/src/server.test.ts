@@ -37,6 +37,7 @@ function makeHost(storage = new FakeStorage()): { host: ElizaServiceHost; storag
     storage,
     host: {
       agentDid: TEST_AGENT_DID,
+      agentDidFor: async () => TEST_AGENT_DID,
       storageFor: async () => storage,
       runtimeFor: async () => {
         throw new Error("runtimeFor should not be called by these server tests");
@@ -72,6 +73,7 @@ function makeMessageHost(opts: {
     seen,
     host: {
       agentDid: TEST_AGENT_DID,
+      agentDidFor: async () => TEST_AGENT_DID,
       storageFor: async () => new FakeStorage(),
       runtimeFor: async () => runtime,
       preflight: async () => {
@@ -105,6 +107,7 @@ function makeToolHost(action: { name: string; result?: unknown }): ElizaServiceH
 
   return {
     agentDid: TEST_AGENT_DID,
+    agentDidFor: async () => TEST_AGENT_DID,
     storageFor: async () => new FakeStorage(),
     runtimeFor: async () => runtime,
     preflight: async () => {},

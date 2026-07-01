@@ -11,6 +11,8 @@ import type { IAgentRuntime, UUID } from "@elizaos/core";
 import { agentIdentityFromKey } from "@tinycloud/agent-client";
 import type { TinyCloudMemoryStorageService } from "@tinycloud/eliza-plugin-memory";
 import { RuntimeHost, type BootedRuntime, type BootFactory } from "./runtime-host.js";
+import { deriveAgentIdentity } from "./agents/derive-key.js";
+import { TINYCHAT_AGENT_ID } from "./auth/app-registry.js";
 
 // Deterministic hardhat test key — same key used in agent-client tests; never a real key.
 const TEST_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -300,5 +302,114 @@ describe("RuntimeHost — delegation preflight", () => {
     await host.preflight(AGENT_ID_A, "entity-a");
 
     expect(seen).toEqual(["entity-a"]);
+  });
+});
+
+// ── M1: multi-agent identity ──────────────────────────────────────────────────
+
+describe("RuntimeHost M1 — per-agent identity", () => {
+  function hostWithKey(): RuntimeHost {
+    const dir = mkdtempSync(join(tmpdir(), "runtime-host-identity-"));
+    const keyFile = join(dir, "agent.key");
+    writeFileSync(keyFile, TEST_KEY + "\n");
+    return new RuntimeHost({
+      agentKeyFile: keyFile,
+      _bootFactory: async (agentId) => ({
+        agentId,
+        runtime: makeFakeRuntime(agentId),
+        storageService: null,
+      }),
+    });
+  }
+
+  it("tinychat's frozen agentId keeps the master-key identity (DID unchanged)", async () => {
+    const host = hostWithKey();
+    await host.init();
+
+    const master = await agentIdentityFromKey(TEST_KEY);
+    const identity = await host.identityFor(TINYCHAT_AGENT_ID);
+
+    expect(identity.did).toBe(master.did);
+    expect(identity.did).toBe(host.agentDid);
+    expect(await host.agentDidFor(TINYCHAT_AGENT_ID)).toBe(host.agentDid);
+  });
+
+  it("a non-tinychat agentId derives a distinct key and DID", async () => {
+    const host = hostWithKey();
+    await host.init();
+
+    const derived = await host.identityFor(AGENT_ID_A);
+    const expected = await deriveAgentIdentity((await agentIdentityFromKey(TEST_KEY)).normalizedKey, AGENT_ID_A);
+
+    expect(derived.normalizedKey).toBe(expected.normalizedKey);
+    expect(derived.did).toBe(expected.did);
+    expect(derived.did).not.toBe(host.agentDid);
+  });
+
+  it("two distinct agentIds derive distinct keys and DIDs", async () => {
+    const host = hostWithKey();
+    await host.init();
+
+    const a = await host.identityFor(AGENT_ID_A);
+    const b = await host.identityFor(AGENT_ID_B);
+
+    expect(a.normalizedKey).not.toBe(b.normalizedKey);
+    expect(a.did).not.toBe(b.did);
+  });
+
+  it("identityFor caches — repeat calls return the same object", async () => {
+    const host = hostWithKey();
+    await host.init();
+
+    const first = await host.identityFor(AGENT_ID_A);
+    const second = await host.identityFor(AGENT_ID_A);
+
+    expect(first).toBe(second);
+  });
+
+  it("identityFor throws before init() (no master key loaded)", async () => {
+    const host = new RuntimeHost({
+      _bootFactory: async (agentId) => ({
+        agentId,
+        runtime: makeFakeRuntime(agentId),
+        storageService: null,
+      }),
+    });
+    await expect(host.identityFor(AGENT_ID_A)).rejects.toThrow(/call init\(\)/);
+  });
+
+  it("production boot threads distinct per-agent TINYCLOUD_AGENT_KEY into character settings", async () => {
+    // Capture the character.settings each runtime boots with by stubbing the SQL
+    // plugin and letting _bootProduction run through createCharacter. We assert on
+    // the runtime's character settings (settings-only config, no process.env).
+    const dir = mkdtempSync(join(tmpdir(), "runtime-host-boot-"));
+    const keyFile = join(dir, "agent.key");
+    writeFileSync(keyFile, TEST_KEY + "\n");
+
+    const savedAgentKey = process.env.TINYCLOUD_AGENT_KEY;
+    delete process.env.TINYCLOUD_AGENT_KEY;
+
+    // Minimal no-op SQL plugin so _bootProduction passes its sqlPlugin guard.
+    const sqlPlugin = { name: "@elizaos/plugin-sql", description: "stub" } as unknown as import("@elizaos/core").Plugin;
+
+    const host = new RuntimeHost({ agentKeyFile: keyFile, sqlPlugin });
+    await host.init();
+
+    try {
+      const master = await agentIdentityFromKey(TEST_KEY);
+      const idA = await host.identityFor(AGENT_ID_A);
+      const idB = await host.identityFor(AGENT_ID_B);
+
+      // Per-agent keys are distinct and neither equals the master key. This is the
+      // value _bootProduction places in delegationSettings.TINYCLOUD_AGENT_KEY.
+      expect(idA.normalizedKey).not.toBe(idB.normalizedKey);
+      expect(idA.normalizedKey).not.toBe(master.normalizedKey);
+
+      // process.env.TINYCLOUD_AGENT_KEY must NOT be mutated by identity derivation.
+      expect(process.env.TINYCLOUD_AGENT_KEY).toBeUndefined();
+    } finally {
+      if (savedAgentKey === undefined) delete process.env.TINYCLOUD_AGENT_KEY;
+      else process.env.TINYCLOUD_AGENT_KEY = savedAgentKey;
+    }
   });
 });

@@ -20,11 +20,13 @@ import {
   createCharacter,
 } from "@elizaos/core";
 import type { IAgentRuntime, ModelTypeName, UUID } from "@elizaos/core";
-import { agentIdentityFromFile } from "@tinycloud/agent-client";
+import { agentIdentityFromFile, type AgentIdentity } from "@tinycloud/agent-client";
 import tinycloudMemoryPlugin, {
   TinyCloudMemoryStorageService,
 } from "@tinycloud/eliza-plugin-memory";
 import { webSearchPlugin } from "./actions/web-search.js";
+import { deriveAgentIdentity } from "./agents/derive-key.js";
+import { TINYCHAT_AGENT_ID } from "./auth/app-registry.js";
 
 const DEFAULT_AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" as UUID;
 const DEFAULT_HOST = "https://node.tinycloud.xyz";
@@ -126,6 +128,10 @@ export class RuntimeHost {
 
   private _agentDid = "";
   private _normalizedKey = "";
+  /** Per-agentId identity cache (DID + derived key). Master-key agentId maps to the master identity. */
+  private readonly _identities = new Map<string, AgentIdentity>();
+  /** Deduplicates concurrent first-derive calls per agentId. */
+  private readonly _identityPending = new Map<string, Promise<AgentIdentity>>();
 
   readonly config: RuntimeHostConfig;
 
@@ -150,6 +156,9 @@ export class RuntimeHost {
     const identity = await agentIdentityFromFile(keyFile);
     this._agentDid = identity.did;
     this._normalizedKey = identity.normalizedKey;
+    // Back-compat: tinychat's frozen agentId keeps the master-key identity (DID unchanged).
+    // Every other agentId derives a distinct per-agent key via identityFor().
+    this._identities.set(TINYCHAT_AGENT_ID, identity);
   }
 
   /**
@@ -159,6 +168,43 @@ export class RuntimeHost {
    */
   get agentDid(): string {
     return this._agentDid;
+  }
+
+  /**
+   * Resolve (deriving + caching once) the {@link AgentIdentity} for agentId.
+   *
+   * The tinychat master-key agentId is seeded in init() and returns the master
+   * identity unchanged (DID stable for back-compat). Every other agentId derives
+   * a distinct per-agent key via HMAC(masterKey, "tinycloud-agent:v1:"+agentId).
+   * Requires init() to have run so the master key is loaded.
+   */
+  async identityFor(agentId: string): Promise<AgentIdentity> {
+    const cached = this._identities.get(agentId);
+    if (cached) return cached;
+
+    const pending = this._identityPending.get(agentId);
+    if (pending) return pending;
+
+    if (!this._normalizedKey) {
+      throw new Error("RuntimeHost.identityFor: call init() before deriving agent identities");
+    }
+
+    const promise = deriveAgentIdentity(this._normalizedKey, agentId).then((identity) => {
+      this._identities.set(agentId, identity);
+      this._identityPending.delete(agentId);
+      return identity;
+    });
+    this._identityPending.set(agentId, promise);
+    return promise;
+  }
+
+  /**
+   * Convenience: the DID to advertise as the delegation target for agentId.
+   * Threaded into the sessions handlers so each agent validates delegations against
+   * its own DID rather than the single service DID.
+   */
+  async agentDidFor(agentId: string): Promise<string> {
+    return (await this.identityFor(agentId)).did;
   }
 
   /**
@@ -312,25 +358,19 @@ export class RuntimeHost {
       );
     }
 
-    // Boot the storage service in DELEGATION + MULTI-TENANT mode (mirrors
-    // live-delegated-scenarios.ts bootDelegatedRuntime() env/settings shape, but
-    // with NO boot delegation: per-user delegations arrive at runtime via
-    // storageService.registerDelegation()). The agent key (inline) is threaded
-    // into the EntityClientRegistry so registerDelegation can mint per-user
-    // clients. Multi-tenant shared mode has no dedicated agent memory-space key,
-    // so TINYCLOUD_PRIVATE_KEY must NOT be set here.
-    delete process.env.TINYCLOUD_PRIVATE_KEY;
-    process.env.TINYCLOUD_AUTH_MODE = "delegation";
-    process.env.TINYCLOUD_MULTI_TENANT = "1";
-    process.env.TINYCLOUD_AGENT_KEY = this._normalizedKey;
-    delete process.env.TINYCLOUD_AGENT_KEY_FILE;
-    process.env.TINYCLOUD_HOST = host;
+    // Resolve the PER-AGENT key for this agentId. The EntityClientRegistry reads
+    // TINYCLOUD_AGENT_KEY from character.settings via resolveMemoryClientConfig, so
+    // config flows entirely through delegationSettings below — NO process.env
+    // mutation (a global write would race/cross-contaminate two agents booting on
+    // different keys). Multi-tenant shared mode has no dedicated agent memory-space
+    // key, so TINYCLOUD_PRIVATE_KEY is left unset.
+    const { normalizedKey: agentKey } = await this.identityFor(agentId);
 
     const delegationSettings: Record<string, string> = {
       ALLOW_NO_DATABASE: "true",
       TINYCLOUD_AUTH_MODE: "delegation",
       TINYCLOUD_MULTI_TENANT: "1",
-      TINYCLOUD_AGENT_KEY: this._normalizedKey,
+      TINYCLOUD_AGENT_KEY: agentKey,
       TINYCLOUD_HOST: host,
       // TEST-ONLY: live-gate threshold overrides (no-op in prod where _extraSettings
       // is unset). Must be in character.settings before initialize() so MemoryService

@@ -64,7 +64,7 @@ function makeHost(agentDid = TEST_AGENT_DID, storage?: FakeStorage): {
 } {
   const s = storage ?? new FakeStorage();
   const host: SessionHandlerHost = {
-    agentDid,
+    agentDidFor: async () => agentDid,
     storageFor: async () => s,
   };
   return { host, storage: s };

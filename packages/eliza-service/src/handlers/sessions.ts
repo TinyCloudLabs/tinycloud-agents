@@ -33,7 +33,8 @@ import type { SessionStore } from "../session-store.js";
  * RuntimeHost satisfies this interface; tests inject a fake.
  */
 export interface SessionHandlerHost {
-  readonly agentDid: string;
+  /** The DID this service advertises as the delegation target for agentId. */
+  agentDidFor(agentId: string): Promise<string>;
   storageFor(agentId: string): Promise<{
     registerDelegation(entityId: string, serialized: string, roomId?: string): Promise<void>;
   }>;
@@ -59,6 +60,9 @@ export async function handlePostSessions(
 ): Promise<HandlerResult> {
   const { agentId, entityId, serializedDelegation, roomId } = body;
   const policy = defaultElizaMemoryPolicy();
+  // Per-agent delegation target: each agent validates against its own DID, not a
+  // single service-wide DID.
+  const agentDid = await host.agentDidFor(agentId);
 
   // 1. Deserialize
   let deleg;
@@ -70,7 +74,7 @@ export async function handlePostSessions(
 
   // 2. Shape validation (shallow: ownerAddress, delegateDID, expiry, SQL presence)
   try {
-    validateDelegationShape(deleg, { agentDid: host.agentDid, dbHandle: MEMORY_DB_HANDLE });
+    validateDelegationShape(deleg, { agentDid, dbHandle: MEMORY_DB_HANDLE });
   } catch (e) {
     if (e instanceof DelegationShapeError) {
       return { status: 400, body: { error: "invalid_shape", message: e.message } };
@@ -80,7 +84,7 @@ export async function handlePostSessions(
 
   // 3. Policy validation — delegateDID==agentDID + expiry + resource path + actions
   try {
-    validateDelegationPolicy(deleg, { agentDID: host.agentDid, policy });
+    validateDelegationPolicy(deleg, { agentDID: agentDid, policy });
   } catch (e) {
     if (e instanceof DelegationPolicyError) {
       return {
@@ -100,7 +104,7 @@ export async function handlePostSessions(
   store.set(entityId, { agentId, serializedDelegation, roomId });
 
   // 6. Return liveness status
-  const status = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: host.agentDid });
+  const status = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: agentDid });
   return { status: 200, body: { entityId, status } };
 }
 
@@ -122,11 +126,13 @@ export async function handleGetSessions(
   }
 
   const policy = defaultElizaMemoryPolicy();
+  // Resolve the delegation target for the agent this session was registered against.
+  const agentDid = await host.agentDidFor(record.agentId);
 
   let delegStatus: "active" | "expired" | "stale" | "none";
   try {
     // evaluateDelegationStatus rethrows non-EXPIRED DelegationPolicyErrors (plan §1 correction #2)
-    delegStatus = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: host.agentDid });
+    delegStatus = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: agentDid });
   } catch (e) {
     if (e instanceof DelegationPolicyError) {
       return {
