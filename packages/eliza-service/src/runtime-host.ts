@@ -26,6 +26,11 @@ import tinycloudMemoryPlugin, {
 } from "@tinycloud/eliza-plugin-memory";
 import { webSearchPlugin } from "./actions/web-search.js";
 import { deriveAgentIdentity } from "./agents/derive-key.js";
+import {
+  createTextModelHandler,
+  resolveTextModelConfig,
+  type TextModelConfig,
+} from "./agents/text-model.js";
 import { TINYCHAT_AGENT_ID } from "./auth/app-registry.js";
 
 const DEFAULT_AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" as UUID;
@@ -74,6 +79,14 @@ export interface RuntimeHostConfig {
    * Used by bootStubRuntime(). Takes lower precedence than _bootFactory.
    */
   stubMode?: boolean;
+  /**
+   * Optional OpenAI-compatible TEXT model config. When set, _bootProduction
+   * registers a "TEXT_LARGE" model on each runtime after initialize() so
+   * POST /messages can generate real responses. When null/undefined, no TEXT
+   * model is registered (tools still work). main() resolves this from env via
+   * resolveTextModelConfig(); tests leave it unset.
+   */
+  textModel?: TextModelConfig | null;
   /**
    * Override the per-agentId boot factory (unit tests only).
    * When set, every _bootOnce call uses this factory for every agentId instead of
@@ -412,6 +425,19 @@ export class RuntimeHost {
           }).registerModel(modelType, handler, "tinycloud-eliza-service-test");
         }
       }
+    }
+
+    // Production TEXT model: register the env-configured OpenAI-compatible handler
+    // so /messages can generate real responses. Skipped when textModel is unset
+    // (tools still work; no silent fallback — a broken model surfaces its error).
+    if (this.config.textModel) {
+      (runtime as unknown as {
+        registerModel(t: string, h: TestModelHandler, provider: string): void;
+      }).registerModel(
+        "TEXT_LARGE",
+        createTextModelHandler(this.config.textModel),
+        "tinycloud-eliza-service",
+      );
     }
 
     // Resolve the storage service the same way live-eliza-scenarios.ts does (line 122).

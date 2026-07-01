@@ -1,5 +1,6 @@
 import type { Plugin } from "@elizaos/core";
 import { RuntimeHost } from "./runtime-host.js";
+import { resolveTextModelConfig } from "./agents/text-model.js";
 import { SessionStore } from "./session-store.js";
 import { startElizaService } from "./server.js";
 
@@ -14,6 +15,7 @@ export async function main(): Promise<void> {
     agentKeyFile: process.env.TINYCLOUD_AGENT_KEY_FILE,
     host: process.env.TINYCLOUD_HOST,
     sqlPlugin,
+    textModel: resolveTextModelConfig(),
   });
   await runtimeHost.init();
 
