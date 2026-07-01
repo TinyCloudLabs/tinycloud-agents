@@ -128,11 +128,21 @@ export async function handleAgentDelegation(
   const roomId = typeof body.roomId === "string" ? body.roomId : undefined;
 
   const entityId = addressToEntityId(ownerAddress, agentId);
-  // Validate the grant against THIS agent's per-agent path (space "agents",
-  // path "<pathPrefix>memory") rather than the legacy single handle.
+  // Validate the grant against THIS agent's per-agent path AND space (space
+  // "agents", path "<pathPrefix>memory") rather than the legacy single handle.
+  // expectedSpace makes the space assertion fail-closed for the /api route: a
+  // delegation minted against another space (or with no verifiable space) is
+  // rejected as `wrong_space` (400) even if its path matches.
   const dbHandle = dbHandleForRecord(record);
   return handlePostSessions(
-    { agentId, entityId, serializedDelegation: body.serializedDelegation, roomId, dbHandle },
+    {
+      agentId,
+      entityId,
+      serializedDelegation: body.serializedDelegation,
+      roomId,
+      dbHandle,
+      expectedSpace: record.space,
+    },
     host,
     sessions,
   );

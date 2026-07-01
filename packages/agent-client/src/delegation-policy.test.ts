@@ -733,6 +733,70 @@ describe("validateDelegationPolicy", () => {
       }
     }
   });
+
+  // --- (5b) space assertion (opts.expectedSpace) ---
+  // parseSpaceUri requires a REAL EVM address to yield a space name, so these use a
+  // valid checksummed address rather than the "0xOwnerAddress" placeholder above.
+  const REAL_OWNER = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
+  const spaceUri = (name: string) => `tinycloud:pkh:eip155:1:${REAL_OWNER}:${name}`;
+  const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"];
+  const inSpace = (name: string) =>
+    makeMultiResource({
+      spaceId: spaceUri(name),
+      resources: [{ service: "sql", space: spaceUri(name), path: DB_HANDLE, actions: sqlActions }],
+    });
+
+  test("expectedSpace unset: space is not checked (any-space grant passes)", () => {
+    expect(() => validateDelegationPolicy(inSpace("default"), { agentDID: AGENT_DID, policy })).not.toThrow();
+  });
+
+  test("expectedSpace matches the grant's space: passes", () => {
+    expect(() =>
+      validateDelegationPolicy(inSpace("agents"), { agentDID: AGENT_DID, policy, expectedSpace: "agents" }),
+    ).not.toThrow();
+  });
+
+  test("expectedSpace differs from the grant's (parseable) space: WRONG_SPACE", () => {
+    try {
+      validateDelegationPolicy(inSpace("default"), { agentDID: AGENT_DID, policy, expectedSpace: "agents" });
+      expect(true).toBe(false);
+    } catch (e) {
+      expect(e).toBeInstanceOf(DelegationPolicyError);
+      expect((e as DelegationPolicyError).reason).toBe("WRONG_SPACE");
+    }
+  });
+
+  test("expectedSpace set but flat shape (no resources[]): fail-closed WRONG_SPACE", () => {
+    try {
+      validateDelegationPolicy(makeFlat(), { agentDID: AGENT_DID, policy, expectedSpace: "agents" });
+      expect(true).toBe(false);
+    } catch (e) {
+      expect(e).toBeInstanceOf(DelegationPolicyError);
+      expect((e as DelegationPolicyError).reason).toBe("WRONG_SPACE");
+    }
+  });
+
+  test("expectedSpace set but resource space unparseable: fail-closed WRONG_SPACE", () => {
+    const d = makeMultiResource({
+      resources: [{ service: "sql", space: "not-a-valid-space-uri", path: DB_HANDLE, actions: sqlActions }],
+    });
+    try {
+      validateDelegationPolicy(d, { agentDID: AGENT_DID, policy, expectedSpace: "agents" });
+      expect(true).toBe(false);
+    } catch (e) {
+      expect((e as DelegationPolicyError).reason).toBe("WRONG_SPACE");
+    }
+  });
+
+  test("WRONG_SPACE message and context carry no auth-bearing values", () => {
+    try {
+      validateDelegationPolicy(makeMultiResource(), { agentDID: AGENT_DID, policy, expectedSpace: "agents" });
+    } catch (e) {
+      const msg = (e as DelegationPolicyError).message.toLowerCase();
+      expect(msg).not.toContain("authorization");
+      expect(msg).not.toContain("delegationheader");
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

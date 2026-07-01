@@ -178,7 +178,7 @@ Register the user's TinyCloud delegation for this agent. The `entityId` is deriv
 ```json
 Body: { "serializedDelegation": string, "roomId"?: string }
 200  { "entityId": string, "status": "active" | "expired" | "stale" }
-400  { "error": "malformed" | "invalid_shape" | "<policy reason>", "message"?: string }
+400  { "error": "malformed" | "invalid_shape" | "wrong_space" | "<policy reason>", "message"?: string }
 403  { "error": "agent_disabled" }
 404  { "error": "not_found" }
 ```
@@ -199,8 +199,19 @@ tcw.space(view.space).delegations.create({
 
 Then **rewrite the top-level `actions` from the JWT `att` claim** (web-sdk 2.3.0
 serializes `actions` lossily — see `actionsFromAuthJwt` in delegate.ts, carry it
-over verbatim). The server validates `delegateDID == agentDid` and the granted
-`path == dbHandle`; a mismatch on either → 400.
+over verbatim).
+
+The server validates, and rejects with `400` on any mismatch:
+- `delegateDID == view.agentDid` — else `<policy reason>` (`wrong_delegatee`).
+- granted `path == view.dbHandle` — else `wrong_db_handle`.
+- **granted space == `view.space`** (the `agents` space) — else `wrong_space`. This
+  is enforced **fail-closed**: a delegation minted against another space (even with a
+  matching path), OR one whose signed capability carries no verifiable per-resource
+  space (the flat/legacy serialization), is rejected `wrong_space`. Always mint with
+  `tcw.space(view.space)` so the signed grant carries the right space — a delegation
+  built without the multi-resource space (e.g. a hand-rolled flat blob) will be
+  rejected here. Show the user a "re-delegate in the agents space" message on
+  `wrong_space`.
 
 Restart caveat: the registry and delegations are in-memory (v1). After a CVM
 redeploy, `/messages` and `/tools` return `409 delegation_required` until the user

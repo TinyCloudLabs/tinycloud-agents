@@ -66,6 +66,7 @@ export class DelegationPolicyError extends TinyCloudClientError {
       | "EXPIRED"
       | "MISSING_SQL_RESOURCE"
       | "WRONG_DB_HANDLE"
+      | "WRONG_SPACE"
       | "INSUFFICIENT_ACTIONS",
     public readonly context?: Record<string, unknown>,
     options?: { cause?: unknown },

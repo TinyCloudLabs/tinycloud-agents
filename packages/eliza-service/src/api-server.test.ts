@@ -171,16 +171,22 @@ describe("/api/agents lifecycle", () => {
     expect(created.pathPrefix).toBe("default/");
     expect(created.dbHandle).toBe("default/memory");
 
-    // A delegation whose delegateDID == the agent's DID and whose path == the
-    // agent's dbHandle passes the full deserialize -> shape -> policy chain.
+    // A delegation whose delegateDID == the agent's DID, whose path == the agent's
+    // dbHandle, AND whose resource space == the agent's space passes the full
+    // deserialize -> shape -> policy (incl. fail-closed space assertion) chain.
+    // Multi-resource shape: resources[].space carries the space the server checks.
+    const ownerAddr = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
+    const spaceUri = `tinycloud:pkh:eip155:1:${ownerAddr}:${created.space}`;
+    const actions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"];
     const serializedDelegation = JSON.stringify({
       cid: "bafy-api-deleg-test",
       delegateDID: AGENT_DID,
-      spaceId: `tinycloud:pkh:eip155:1:0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2:${created.space}`,
+      spaceId: spaceUri,
       path: created.dbHandle,
-      actions: ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"],
+      actions,
+      resources: [{ service: "sql", space: spaceUri, path: created.dbHandle, actions }],
       expiry: new Date("2099-01-01T00:00:00.000Z").toISOString(),
-      ownerAddress: "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2",
+      ownerAddress: ownerAddr,
       chainId: 1,
       host: "https://node.tinycloud.xyz",
     });
@@ -234,6 +240,87 @@ describe("/api/agents lifecycle", () => {
       }),
     );
     expect(res.status).toBe(400);
+  });
+
+  it("delegation: a grant minted against the WRONG space is rejected wrong_space (400)", async () => {
+    const { fetch } = makeFetch();
+    const token = await signIn(fetch);
+    const created = (await (
+      await fetch(
+        authed("/api/agents", token, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "d" }),
+        }),
+      )
+    ).json()) as { agentId: string; dbHandle: string };
+
+    // Correct delegateDID + correct path, but the resource space is "default" not
+    // "agents" — the fail-closed space assertion must reject it.
+    const ownerAddr = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
+    const wrongSpaceUri = `tinycloud:pkh:eip155:1:${ownerAddr}:default`;
+    const actions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"];
+    const serializedDelegation = JSON.stringify({
+      cid: "bafy-wrong-space",
+      delegateDID: AGENT_DID,
+      spaceId: wrongSpaceUri,
+      path: created.dbHandle,
+      actions,
+      resources: [{ service: "sql", space: wrongSpaceUri, path: created.dbHandle, actions }],
+      expiry: new Date("2099-01-01T00:00:00.000Z").toISOString(),
+      ownerAddress: ownerAddr,
+      chainId: 1,
+      host: "https://node.tinycloud.xyz",
+    });
+
+    const res = await fetch(
+      authed(`/api/agents/${created.agentId}/delegation`, token, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ serializedDelegation }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("wrong_space");
+  });
+
+  it("delegation: a flat-shape grant (no verifiable space) is rejected wrong_space (400, fail-closed)", async () => {
+    const { fetch } = makeFetch();
+    const token = await signIn(fetch);
+    const created = (await (
+      await fetch(
+        authed("/api/agents", token, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "d" }),
+        }),
+      )
+    ).json()) as { agentId: string; dbHandle: string };
+
+    // Flat shape: correct delegateDID + path, but NO resources[] -> no space to
+    // verify -> fail closed on the /api route.
+    const ownerAddr = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
+    const serializedDelegation = JSON.stringify({
+      cid: "bafy-flat-nospace",
+      delegateDID: AGENT_DID,
+      spaceId: `tinycloud:pkh:eip155:1:${ownerAddr}:agents`,
+      path: created.dbHandle,
+      actions: ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"],
+      expiry: new Date("2099-01-01T00:00:00.000Z").toISOString(),
+      ownerAddress: ownerAddr,
+      chainId: 1,
+      host: "https://node.tinycloud.xyz",
+    });
+
+    const res = await fetch(
+      authed(`/api/agents/${created.agentId}/delegation`, token, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ serializedDelegation }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("wrong_space");
   });
 
   it("returns 404 for another owner's agent (no ownership leak)", async () => {

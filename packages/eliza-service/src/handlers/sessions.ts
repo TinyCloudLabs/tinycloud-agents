@@ -53,6 +53,14 @@ export interface PostSessionsBody {
    * (e.g. "default/memory") so each agent validates against its own path.
    */
   dbHandle?: string;
+  /**
+   * Space name the delegation MUST be minted against (e.g. "agents"). When set,
+   * the policy validator rejects a grant carrying any other space — or, fail-closed,
+   * a grant with no verifiable space — as `wrong_space` (400). The legacy tinychat
+   * /sessions route omits it (space not checked, unchanged). The /api/agents
+   * delegation route passes the agent record's space.
+   */
+  expectedSpace?: string;
 }
 
 export interface HandlerResult {
@@ -65,7 +73,7 @@ export async function handlePostSessions(
   host: SessionHandlerHost,
   store: SessionStore,
 ): Promise<HandlerResult> {
-  const { agentId, entityId, serializedDelegation, roomId } = body;
+  const { agentId, entityId, serializedDelegation, roomId, expectedSpace } = body;
   const dbHandle = body.dbHandle ?? MEMORY_DB_HANDLE;
   const policy = defaultElizaMemoryPolicy(dbHandle);
   // Per-agent delegation target: each agent validates against its own DID, not a
@@ -90,9 +98,9 @@ export async function handlePostSessions(
     throw e;
   }
 
-  // 3. Policy validation — delegateDID==agentDID + expiry + resource path + actions
+  // 3. Policy validation — delegateDID==agentDID + expiry + resource path + space + actions
   try {
-    validateDelegationPolicy(deleg, { agentDID: agentDid, policy });
+    validateDelegationPolicy(deleg, { agentDID: agentDid, policy, expectedSpace });
   } catch (e) {
     if (e instanceof DelegationPolicyError) {
       return {
@@ -108,12 +116,12 @@ export async function handlePostSessions(
   await storage.registerDelegation(entityId, serializedDelegation, roomId);
 
   // 5. Record in C-local store so GET /sessions can re-evaluate liveness without
-  //    touching entity-registry.ts (B's frozen keystone). Persist dbHandle so the
-  //    GET re-evaluation uses the same per-agent path.
-  store.set(entityId, { agentId, serializedDelegation, roomId, dbHandle });
+  //    touching entity-registry.ts (B's frozen keystone). Persist dbHandle +
+  //    expectedSpace so the GET re-evaluation applies the same path/space checks.
+  store.set(entityId, { agentId, serializedDelegation, roomId, dbHandle, expectedSpace });
 
   // 6. Return liveness status
-  const status = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: agentDid });
+  const status = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: agentDid, expectedSpace });
   return { status: 200, body: { entityId, status } };
 }
 
@@ -141,7 +149,7 @@ export async function handleGetSessions(
   let delegStatus: "active" | "expired" | "stale" | "none";
   try {
     // evaluateDelegationStatus rethrows non-EXPIRED DelegationPolicyErrors (plan §1 correction #2)
-    delegStatus = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: agentDid });
+    delegStatus = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: agentDid, expectedSpace: record.expectedSpace });
   } catch (e) {
     if (e instanceof DelegationPolicyError) {
       return {

@@ -18,6 +18,8 @@ export interface SessionRecord {
   roomId?: string;
   /** SQL db handle the delegation was validated against (per-agent path). */
   dbHandle?: string;
+  /** Space name the delegation was validated against (fail-closed space assertion). */
+  expectedSpace?: string;
 }
 
 export class SessionStore {
