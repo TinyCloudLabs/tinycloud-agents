@@ -4,7 +4,24 @@ Working notes for M4 (static serving + Phala deploy). M4 is blocked on M3 (front
 `apps/agents-web` build output) until that lands. This file captures the hard gates
 and the frontend-independent groundwork so nothing is lost.
 
-## HARD GATE (team-lead, do not skip) — live delegated harness
+## M4 VERIFICATION CHECKLIST (team-lead — both live-node proofs are HARD GATES)
+
+Both items require a real TinyCloud node and CANNOT run in this sandbox. Both must
+be GREEN, then team-lead must give explicit approval, BEFORE any prod deploy:
+
+- [ ] **Live-node proof #1 (M1 harness):** `test:live:eliza:delegated` passes against
+      a real node with settings-only config (no `process.env.TINYCLOUD_*` mutation).
+      Proves the M1 env-mutation removal end to end.
+- [ ] **Live-node proof #2 (M2.1 real delegation round-trip):** mint a delegation in
+      the owner's `agents` space at path `default/memory`, register it via
+      `POST /api/agents/:id/delegation`, and confirm a real read/write round-trips
+      through `sql.db(dbHandle)` at the granted per-agent path.
+- [ ] `https://agents.tinycloud.xyz/health` returns ok.
+- [ ] tinychat regression: legacy `/sessions` + `/messages` with `ELIZA_SERVICE_SECRET`
+      still work (the master-key agentId path is unchanged).
+- [ ] team-lead explicit go/no-go on the prod deploy.
+
+### Detail — live delegated harness (proof #1)
 
 Before ANY prod deploy, the live delegated harness MUST pass against a real
 TinyCloud node with **settings-only** config (no `process.env.TINYCLOUD_*`
