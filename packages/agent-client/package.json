@@ -19,6 +19,6 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@tinycloud/node-sdk": "2.3.0"
+    "@tinycloud/node-sdk": "2.4.0"
   }
 }
