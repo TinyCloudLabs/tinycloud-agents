@@ -26,11 +26,30 @@ bun run build               # -> dist/ (served by the Bun server in prod)
 ## Layout
 
 - `src/openkey.ts` — OpenKey passkey connect (ported from `tools/delegate-ui`).
-- `src/tinycloud.ts` — `TinyCloudWeb.signIn()` against `node.tinycloud.xyz`.
-- `src/delegate.ts` — mint an SQL delegation to the agent DID. Carries the
-  `actionsFromAuthJwt` workaround: web-sdk 2.3.0 serializes the top-level
-  `actions` field lossily, so the true grant set is recovered from the signed
-  JWT `att` claim. Returns the serialized blob (no file download).
+- `src/manifest.ts` — the app manifest. It declares the app in the user's
+  account AND makes the default agent's caps **first-class**: `tinycloud.kv`
+  prefix `default/` + `tinycloud.sql` exact `default/memory.db` +
+  `tinycloud.capabilities` read, space `agents`. This is **load-bearing, not
+  cosmetic** (see `delegate.ts`).
+- `src/tinycloud.ts` — `TinyCloudWeb.signIn()` against `node.tinycloud.xyz`,
+  manifest passed at construction (secret-manager's proven single-signIn
+  pattern; a post-signIn `spaces.create` of a sibling space 401s).
+- `src/delegate.ts` — mint the option-D **multi-resource** delegation to the
+  agent DID (kv-prefix on `pathPrefix` + sql-exact on `dbHandle` +
+  capabilities), threading `space`/`pathPrefix`/`dbHandle` verbatim from the
+  AgentView. It **must** go through the session-key `delegateTo(did,
+  PermissionEntry[])` path: `delegateTo` with `forceWalletSign: true` accepts
+  **at most one** PermissionEntry (it throws on multi-entry), so a 3-resource
+  grant can only be minted via the derivable session-key UCAN path — which
+  requires the caps to be a subset of the session recap. That is *why* the
+  default agent's caps are baked into the manifest (`manifest.ts`): it makes the
+  default-agent mint derivable and silent (no prompt). A dynamically-named agent
+  (not in the static manifest) throws `PermissionNotInManifestError`; we then
+  escalate once via `tcw.requestPermissions(missing)` and retry the derivable
+  mint. Also carries the `actionsFromAuthJwt` workaround: web-sdk 2.3.0
+  serializes the top-level `actions` field lossily, so the flat mirror is
+  rewritten from the signed JWT `att` claim (the server reads `resources[]`, not
+  this field). Returns the serialized blob (no file download).
 - `src/api.ts` — THE loose-coupling seam. Every endpoint path and the
   `Authorization` header format live here and nowhere else. Base URL is
   same-origin `/api`. A 409 `delegation_required` is surfaced as a re-delegate
@@ -82,18 +101,32 @@ service boots cleanly with these). A full in-service chat SSE turn additionally
 needs a registered delegation, which is gated by the same live-node account
 requirement as the mint leg — so it lands with M4.
 
-**Deferred to M4 pre-launch / live-node verification (documented residual):**
+**Live E2E — BLOCKED at sign-in on a web-sdk 2.3.0 registry-write bug (both
+auth paths).** Neither the passkey nor the mock-wallet (eth-account) path gets
+past sign-in against the prod node, so the mint/chat/web_search/toggle legs are
+not yet proven end to end:
 
-- **Delegation-mint round-trip** — minting against the production node requires a
-  provisioned/quota'd account; a throwaway address is rejected (the node returns
-  403/500 on `/delegate`). This is the M4 "live-node proof #2" gate, not a client
-  bug — the client builds the correct delegation up to the node boundary.
-- **Manifest sign-in vs. the prod node** — `signIn()` reaches real "agents" space
-  creation, then the web-sdk manifest-registry write targets an `applications`
-  space that `autoCreateSpace` does not provision (`404 - space not found`).
-  Pending a decision on provisioning that space.
-- **OpenKey passkey UI leg** — the fully-automated passkey run needs a one-time
-  `openkey.so` signup to capture `.passkey.json` (see the `openkey-passkey-test`
-  skill); until then the Playwright mock-wallet flow is the autonomous stand-in.
-- **HTTPS/mkcert origin** for a passkey run, and **credentialed** web_search/chat
-  round-trips (real Tavily + RedPill keys via the deploy env).
+- **Manifest-registry write 404 (web-sdk 2.3.0)** — inside `tcw.signIn()`, after
+  the `agents` space is created, the SDK writes the manifest registry record and
+  throws `Failed to write manifest registry record applications/xyz.tinycloud.agents:
+  404 - space not found`. Traced to node-sdk 2.3.0's `writeManifestRegistryRecords`
+  doing a raw `accountKV.put` into the owner's `account` space that the node 404s.
+  This reproduces with BOTH the passkey account and the Hardhat mock EOA, so it is
+  NOT a provisioning/quota gate — it's the SDK's account-registry write path.
+  web-sdk **2.4.0** (which secret-manager runs successfully with the same Hardhat
+  key against the same prod node) reworks this path entirely
+  (`account.applications.register` + `ensureOwnedSpaceHostedById` + retry). The fix
+  is almost certainly the monorepo `@tinycloud/*` 2.3.0 → 2.4.0 bump; the mint
+  contract (`delegateTo`, the `DelegatedResource {service,space,path,actions}`
+  schema the server validates) is unchanged across the bump, so the option-D mint
+  needs no code change.
+- **OpenKey passkey UI leg** — the CDP virtual-authenticator run
+  (`.claude/skills/openkey-passkey-test/run-agents-e2e.ts`, HTTPS via mkcert +
+  `AGENTS_HTTPS_CERT`/`AGENTS_HTTPS_KEY`) drives the flow, but OpenKey's
+  `verify-authentication` returns `400 AUTHENTICATION_FAILED` because the assertion
+  is cross-origin (`origin: https://openkey.so`, `topOrigin: https://localhost:5174`).
+  Needs an OpenKey top-origin allowlist / credential re-registration from this
+  origin. The mock-wallet (eth-account) flow is the autonomous stand-in and is
+  blocked only by the same 2.3.0 registry 404 above.
+- **Credentialed** web_search / chat round-trips (real Tavily + RedPill keys) —
+  unblock once sign-in passes.
