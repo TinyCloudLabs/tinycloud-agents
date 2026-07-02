@@ -1,0 +1,6 @@
+# Local-only E2E harness artifacts — never commit
+*.pem
+*-key.pem
+.last-run.log
+test-results/
+playwright-report/
