@@ -25,6 +25,7 @@ import tinycloudMemoryPlugin, {
   TinyCloudMemoryStorageService,
 } from "@tinycloud/eliza-plugin-memory";
 import { webSearchPlugin } from "./actions/web-search.js";
+import { runArtifactSkillPlugin } from "./actions/run-artifact-skill.js";
 
 const DEFAULT_AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" as UUID;
 const DEFAULT_HOST = "https://node.tinycloud.xyz";
@@ -352,7 +353,7 @@ export class RuntimeHost {
     const runtime = new AgentRuntime({
       agentId,
       character,
-      plugins: [tinycloudMemoryPlugin, sqlPlugin, webSearchPlugin],
+      plugins: [tinycloudMemoryPlugin, sqlPlugin, webSearchPlugin, runArtifactSkillPlugin],
       adapter: new InMemoryDatabaseAdapter(),
       settings: delegationSettings,
       logLevel: "warn",

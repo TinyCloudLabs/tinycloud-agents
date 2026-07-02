@@ -1,10 +1,17 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import type { Content, IAgentRuntime, Memory, UUID } from "@elizaos/core";
 import { MEMORY_DB_HANDLE, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
+import {
+  RUN_ARTIFACT_SKILL,
+  type ArtifactSkillRuntimeInput,
+} from "@tinycloud/agent-client";
 import { SessionStore } from "./session-store.js";
 import { startElizaService, type ElizaServiceHost } from "./server.js";
+import { runArtifactSkillAction } from "./actions/run-artifact-skill.js";
+import { ARTIFACTORY_AGENT_ID } from "./auth/app-registry.js";
 
 const TEST_SERVICE_SECRET = "server-test-service-secret";
+const TEST_ARTIFACTORY_SERVICE_SECRET = "server-test-artifactory-secret";
 
 const TEST_AGENT_DID = "did:pkh:eip155:1:0x83cD9777d4128012F878376aCbd6a092DcdDE01c";
 const TEST_AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -115,9 +122,13 @@ describe("eliza-service HTTP server", () => {
   let server: ReturnType<typeof startElizaService> | undefined;
   let savedSecret: string | undefined;
 
+  let savedArtifactorySecret: string | undefined;
+
   beforeAll(() => {
     savedSecret = process.env.ELIZA_SERVICE_SECRET;
+    savedArtifactorySecret = process.env.ARTIFACTORY_SERVICE_SECRET;
     process.env.ELIZA_SERVICE_SECRET = TEST_SERVICE_SECRET;
+    process.env.ARTIFACTORY_SERVICE_SECRET = TEST_ARTIFACTORY_SERVICE_SECRET;
   });
 
   afterAll(() => {
@@ -125,6 +136,11 @@ describe("eliza-service HTTP server", () => {
       process.env.ELIZA_SERVICE_SECRET = savedSecret;
     } else {
       delete process.env.ELIZA_SERVICE_SECRET;
+    }
+    if (savedArtifactorySecret !== undefined) {
+      process.env.ARTIFACTORY_SERVICE_SECRET = savedArtifactorySecret;
+    } else {
+      delete process.env.ARTIFACTORY_SERVICE_SECRET;
     }
   });
 
@@ -311,6 +327,113 @@ describe("eliza-service HTTP server", () => {
       tool: "WEB_SEARCH",
       result: { text: "tool ran", data: { answer: "42" }, frames: [{ text: "tool ran" }] },
     });
+  });
+
+  it("POST /tools/RUN_ARTIFACT_SKILL with the artifactory bearer runs the stub and returns a contract-shaped output", async () => {
+    const runtime = {
+      agentId: ARTIFACTORY_AGENT_ID as UUID,
+      actions: [runArtifactSkillAction],
+    } as unknown as IAgentRuntime;
+    const host: ElizaServiceHost = {
+      agentDid: TEST_AGENT_DID,
+      storageFor: async () => new FakeStorage(),
+      runtimeFor: async (agentId) => {
+        // Server-trusted routing: only the artifactory agentId reaches this handler.
+        expect(agentId).toBe(ARTIFACTORY_AGENT_ID);
+        return runtime;
+      },
+      preflight: async () => {},
+    };
+    server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+
+    const input: ArtifactSkillRuntimeInput = {
+      runId: "server-tc69-1",
+      skillManifest: { packageId: "daily_digest" },
+      sourcePack: {
+        refs: [{ id: "src-1" }],
+        excerpts: [{ sourceRefId: "src-1", text: "hello world" }],
+        maxInputTokens: 8000,
+      },
+      settings: {},
+      runtimePolicy: {
+        runtimeClass: "stub",
+        providerClass: "none",
+        credentialMode: "none",
+        egressClass: "none",
+        allowedTools: [],
+        disallowedTools: ["tinycloud", "shell", "network"],
+        maxModelCalls: 0,
+        timeoutMs: 1000,
+        maxOutputBytes: 4096,
+      },
+    };
+
+    const res = await fetch(url(`/tools/${RUN_ARTIFACT_SKILL}`), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "Authorization": `Bearer ${TEST_ARTIFACTORY_SERVICE_SECRET}`,
+      },
+      body: JSON.stringify({ args: input }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      ok: boolean;
+      tool: string;
+      result: { data: { candidates: unknown[]; trace: { modelCalls: number } } };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.tool).toBe(RUN_ARTIFACT_SKILL);
+    expect(body.result.data.candidates).toEqual([]);
+    expect(body.result.data.trace.modelCalls).toBe(0);
+  });
+
+  it("POST /tools/RUN_ARTIFACT_SKILL without auth returns 401 (no bearer, no runtime boot)", async () => {
+    const host: ElizaServiceHost = {
+      agentDid: TEST_AGENT_DID,
+      storageFor: async () => new FakeStorage(),
+      runtimeFor: async () => {
+        throw new Error("runtimeFor must not run when auth fails");
+      },
+      preflight: async () => {},
+    };
+    server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+
+    const res = await fetch(url(`/tools/${RUN_ARTIFACT_SKILL}`), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ args: { runId: "no-auth" } }),
+    });
+
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "unauthorized" });
+  });
+
+  it("POST /tools/RUN_ARTIFACT_SKILL rejects a malformed payload with invalid_args", async () => {
+    const runtime = {
+      agentId: ARTIFACTORY_AGENT_ID as UUID,
+      actions: [runArtifactSkillAction],
+    } as unknown as IAgentRuntime;
+    const host: ElizaServiceHost = {
+      agentDid: TEST_AGENT_DID,
+      storageFor: async () => new FakeStorage(),
+      runtimeFor: async () => runtime,
+      preflight: async () => {},
+    };
+    server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+
+    const res = await fetch(url(`/tools/${RUN_ARTIFACT_SKILL}`), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "Authorization": `Bearer ${TEST_ARTIFACTORY_SERVICE_SECRET}`,
+      },
+      body: JSON.stringify({ args: { runId: 42 } }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "invalid_args" });
   });
 
   it("POST /tools/:name without auth returns 401", async () => {
