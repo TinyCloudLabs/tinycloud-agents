@@ -1,11 +1,11 @@
 import {
   type TinyCloudWeb,
-  type Delegation,
+  type PermissionEntry,
   type PortableDelegation,
+  PermissionNotInManifestError,
   serializeDelegation,
 } from "@tinycloud/web-sdk";
-import { TINYCLOUD_HOST } from "./tinycloud";
-import { SQL_ACTIONS } from "./config";
+import { KV_ACTIONS, SQL_ACTIONS, CAPABILITIES_ACTIONS } from "./config";
 import { submitDelegation, type Agent, type DelegationStatus, type Signer } from "./api";
 
 // Decode a url-safe base64 string (handles `-`/`_` and missing padding).
@@ -48,34 +48,20 @@ function actionsFromAuthJwt(authHeader: string): string[] | null {
   }
 }
 
-function toPortableDelegation(
-  delegation: Delegation,
-  ownerAddress: string,
-  chainId: number,
-  host: string
-): PortableDelegation {
-  // PortableDelegation omits isRevoked; destructure it out before spreading
-  const { isRevoked: _omitted, ...rest } = delegation;
-  return {
-    ...rest,
-    delegationHeader: {
-      Authorization: delegation.authHeader || `Bearer ${delegation.cid}`,
-    },
-    ownerAddress,
-    chainId,
-    host,
-  };
-}
-
 export interface MintedDelegation {
   // Serialized portable delegation JSON, ready to POST to the agents API.
   serialized: string;
   delegateDID: string;
   actions: string[];
+  // Whether the mint required a prompt. false = the derivable session-key path
+  // (caps ⊆ manifest recap, e.g. the default agent, silent); true = the
+  // requestPermissions escalation modal fired first (a dynamically-named agent
+  // whose caps aren't in the static manifest).
+  prompted: boolean;
 }
 
 // Ensure the given space exists before minting against it.
-// `space.delegations.create()` requires the space to already exist on the host.
+// The delegation grants within `scope.space`, which must exist on the host.
 async function ensureSpace(tcw: TinyCloudWeb, spaceName: string): Promise<void> {
   const exists = await tcw.spaces.exists(spaceName);
   if (exists.ok && exists.data) return;
@@ -86,19 +72,42 @@ async function ensureSpace(tcw: TinyCloudWeb, spaceName: string): Promise<void> 
 }
 
 // Delegation scope for an agent, taken verbatim from its AgentView. The service
-// chooses these; the client does not derive them. `path` is the AgentView
-// `dbHandle` — the server validates the granted path against it exactly.
+// chooses these; the client does not derive them. The server validates the
+// granted KV prefix == pathPrefix and the granted SQL path == dbHandle exactly.
 export interface DelegationScope {
   space: string;
-  path: string;
+  pathPrefix: string;
+  dbHandle: string;
 }
 
-// Mint an SQL delegation from the signed-in user to `delegateDID` (the agent
-// DID). Ported from tools/delegate-ui/src/delegate.ts, minus the download/DOM
-// bits — returns the serialized blob for the caller to submit to the API.
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Mint the option-D multi-resource delegation from the signed-in user to
+// `delegateDID` (the agent DID) and return the serialized blob for the caller
+// to submit to the API (docs/agents-api.md "Mint shape — MULTI-RESOURCE").
 //
-// The delegation is scoped to the agent's `space` at its `dbHandle` path (both
-// from the AgentView), not the old "default" space at xyz.tinycloud.eliza/memory.
+// ONE delegation covers three resources in the agent's space:
+//   - tinycloud.kv  PREFIX grant on scope.pathPrefix (KV is hierarchical)
+//   - tinycloud.sql EXACT  grant on scope.dbHandle    (SQL is exact db-name)
+//   - tinycloud.capabilities read
+//
+// This MUST go through the multi-resource `delegateTo(did, PermissionEntry[])`
+// SESSION-KEY UCAN path, not `space().delegations.create({ path })` — the latter
+// emits a SINGLE resource and cannot express kv-prefix + sql-exact together, and
+// the server fail-closes (missing_kv_resource / wrong_space) on the flat shape.
+// `skipPrefix: true` keeps the paths exactly as the AgentView gives them.
+//
+// IMPORTANT: the multi-resource grant can ONLY be minted via the session-key
+// path. delegateTo with `forceWalletSign: true` supports AT MOST ONE
+// PermissionEntry (it throws otherwise), so a 3-resource grant must be derivable
+// from the session recap. That is exactly why the agent's caps are declared in
+// the manifest (manifest.ts): for the DEFAULT agent they are a subset of the
+// recap, so delegateTo signs silently with the session key (no prompt).
+//
+// For an agent whose scope is NOT in the static manifest (a dynamically-named
+// one), delegateTo throws PermissionNotInManifestError. We then escalate via
+// requestPermissions(missing) — a one-time approval modal (the passkey tap) that
+// grants the caps to the current session — and retry the now-derivable mint.
 export async function mintDelegation(
   tcw: TinyCloudWeb,
   delegateDID: string,
@@ -106,44 +115,74 @@ export async function mintDelegation(
 ): Promise<MintedDelegation> {
   await ensureSpace(tcw, scope.space);
 
-  const space = tcw.space(scope.space);
-  const expiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  const permissions: PermissionEntry[] = [
+    {
+      service: "tinycloud.kv",
+      space: scope.space,
+      path: scope.pathPrefix,
+      actions: KV_ACTIONS,
+      skipPrefix: true,
+    },
+    {
+      service: "tinycloud.sql",
+      space: scope.space,
+      path: scope.dbHandle,
+      actions: SQL_ACTIONS,
+      skipPrefix: true,
+    },
+    {
+      service: "tinycloud.capabilities",
+      space: scope.space,
+      path: "",
+      actions: CAPABILITIES_ACTIONS,
+      skipPrefix: true,
+    },
+  ];
 
-  const result = await space.delegations.create({
-    delegateDID,
-    path: scope.path,
-    actions: SQL_ACTIONS,
-    expiry,
-  });
-
-  if (!result.ok) {
-    throw new Error(result.error.message);
+  let delegation: PortableDelegation;
+  let prompted: boolean;
+  try {
+    // Derivable path: silent when caps ⊆ manifest recap (the default agent).
+    const res = await tcw.delegateTo(delegateDID, permissions, {
+      expiry: THIRTY_DAYS_MS,
+    });
+    delegation = res.delegation;
+    prompted = res.prompted;
+  } catch (err) {
+    if (!(err instanceof PermissionNotInManifestError)) throw err;
+    // Not in the static manifest (dynamically-named agent): escalate to grant
+    // the missing caps to the session, then retry the derivable mint.
+    const grant = await tcw.requestPermissions(err.missing);
+    if (!grant.approved) {
+      throw new Error("delegation permission request was declined");
+    }
+    const res = await tcw.delegateTo(delegateDID, permissions, {
+      expiry: THIRTY_DAYS_MS,
+    });
+    delegation = res.delegation;
+    prompted = true; // the escalation modal was shown
   }
 
-  const delegation = result.data;
-  const ownerAddress = tcw.address() ?? "";
-  const chainId = tcw.chainId() ?? 1;
-  const portableDelegation = toPortableDelegation(
-    delegation,
-    ownerAddress,
-    chainId,
-    TINYCLOUD_HOST
-  );
-
-  // Complete the lossy top-level `actions` summary so it faithfully reflects
-  // the grants actually signed into delegationHeader.Authorization. Prefer
-  // deriving from the JWT; fall back to the requested SQL_ACTIONS. Only the
-  // unsigned `actions` field is touched — the signature is untouched.
-  const serialized = serializeDelegation(portableDelegation);
+  // delegateTo returns a PortableDelegation with a populated `resources[]`
+  // (per-resource service/space/path/actions) — exactly what the server's
+  // multi-resource validator reads. Serialize it as-is.
+  //
+  // The top-level `actions` summary is a lossy single-resource mirror (web-sdk
+  // 2.3.0); the server reads `resources[]`, not this field, but we still
+  // rewrite it from the signed JWT `att` claim so the flat mirror is faithful.
+  // Only the UNSIGNED `actions` field is touched — the signature is untouched.
+  const serialized = serializeDelegation(delegation);
   const parsed = JSON.parse(serialized);
   const authHeader = parsed?.delegationHeader?.Authorization ?? "";
-  const completedActions = actionsFromAuthJwt(authHeader) ?? SQL_ACTIONS;
+  const allActions = [...KV_ACTIONS, ...SQL_ACTIONS, ...CAPABILITIES_ACTIONS];
+  const completedActions = actionsFromAuthJwt(authHeader) ?? allActions;
   parsed.actions = completedActions;
 
   return {
     serialized: JSON.stringify(parsed),
     delegateDID: delegation.delegateDID,
     actions: completedActions,
+    prompted,
   };
 }
 
@@ -157,7 +196,8 @@ export async function delegateAgent(
 ): Promise<DelegationStatus> {
   const minted = await mintDelegation(tcw, agent.agentDid, {
     space: agent.space,
-    path: agent.dbHandle,
+    pathPrefix: agent.pathPrefix,
+    dbHandle: agent.dbHandle,
   });
   const res = await submitDelegation(signer, agent.agentId, minted.serialized);
   return res.status;

@@ -6,10 +6,23 @@
 // Only the SQL action set is fixed client-side.
 // ---------------------------------------------------------------------------
 
-// SQL policy the Eliza memory agent requires.
+// Option D multi-resource delegation grant (docs/agents-api.md "Mint shape").
+// One delegation covers three services in the agent's space:
+//   - tinycloud.kv  PREFIX on pathPrefix (KV is hierarchical → "operate broadly")
+//   - tinycloud.sql EXACT on dbHandle    (SQL is exact db-name at the node)
+//   - tinycloud.capabilities read        (optional, as before)
+// Full-URN form; the web-sdk passes already-expanded URNs through unchanged.
+export const KV_ACTIONS = [
+  "tinycloud.kv/get",
+  "tinycloud.kv/put",
+  "tinycloud.kv/list",
+  "tinycloud.kv/delete",
+];
+
 export const SQL_ACTIONS = [
   "tinycloud.sql/read",
   "tinycloud.sql/write",
   "tinycloud.sql/admin",
-  "tinycloud.capabilities/read",
 ];
+
+export const CAPABILITIES_ACTIONS = ["tinycloud.capabilities/read"];

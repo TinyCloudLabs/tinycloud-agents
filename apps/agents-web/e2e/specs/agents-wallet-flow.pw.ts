@@ -112,18 +112,28 @@ test("sign in with mock wallet -> default agent auto-provisions", async ({ page 
   await expect(page.getByText(TEST_WALLET_NAME)).toBeVisible();
   await page.getByText(TEST_WALLET_NAME).click();
 
-  // autoCreateSpace prompts a space-creation modal only on the FIRST sign-in for
-  // a fresh space (the mock wallet signs it). On later runs the space already
-  // exists and no modal appears — so this is best-effort with a short wait.
+  // A single signIn() runs the manifest flow (see tinycloud.ts): the SDK
+  // provisions the "agents" space (autoCreateSpace) and the "applications"
+  // manifest-registry space as needed, each raising a "create tinycloud space"
+  // modal the mock wallet must sign. A fresh account fires one per missing
+  // space; a returning account fires none. Approve any that appear while we
+  // wait for the signed-in DID.
   const createSpace = page.getByRole("button", { name: /create tinycloud space/i });
-  if (await createSpace.isVisible({ timeout: 8_000 }).catch(() => false)) {
-    await createSpace.click();
-    await expect(createSpace).toBeHidden({ timeout: 60_000 });
+  const authDid = page.getByTestId("auth-did");
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    if (await authDid.isVisible().catch(() => false)) break;
+    if (await createSpace.isVisible().catch(() => false)) {
+      await createSpace.click().catch(() => {});
+      await createSpace.waitFor({ state: "hidden", timeout: 60_000 }).catch(() => {});
+      continue;
+    }
+    await page.waitForTimeout(1000);
   }
 
   // Signed in: the owner DID is shown, and the sign-in bootstrap auto-provisions
   // the default agent (idempotent create). The agent card must appear.
-  await expect(page.getByTestId("auth-did")).toContainText(`did:pkh:eip155:1:${TEST_ADDRESS}`);
+  await expect(authDid).toContainText(`did:pkh:eip155:1:${TEST_ADDRESS}`, { timeout: 30_000 });
   const card = page.getByTestId("agent-card").first();
   await expect(card).toBeVisible({ timeout: 60_000 });
   await expect(card.getByTestId("agent-did")).toContainText("did:pkh:");

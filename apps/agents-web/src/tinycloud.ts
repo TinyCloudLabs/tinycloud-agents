@@ -13,9 +13,16 @@ export interface Session {
 }
 
 // OpenKey passkey -> EIP-1193 provider -> TinyCloudWeb(spacePrefix/autoCreate/
-// manifest) -> signIn(). Modeled on secret-manager's vault-client.initTinyCloud.
-// `autoCreateSpace: true` provisions the "agents" space during signIn (no manual
-// ensureAgentsSpace), and the manifest grants the app's own session access to it.
+// manifest) -> signIn(). Modeled on secret-manager's vault-client.initTinyCloud
+// (the proven pattern): the manifest is passed at CONSTRUCTION so the single
+// signIn() runs the full manifest flow — the SDK's own wallet-signed
+// space-creation handler provisions the "agents" space (autoCreateSpace) AND the
+// "applications" manifest-registry space as needed, all under one sign-in.
+//
+// (An earlier attempt did a manual tcw.spaces.create("applications") after an
+// initial agents-scoped signIn; that 401s because the established session recap
+// is scoped to "agents" and can't authorize creating a sibling space. Letting
+// the manifest flow create it during signIn is the correct path.)
 export async function signIn(): Promise<Session> {
   const { provider, address } = await connectWallet();
 
