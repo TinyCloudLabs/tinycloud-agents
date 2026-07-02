@@ -37,7 +37,7 @@ export interface AgentView {
   space: string;
   /** Per-agent path prefix within the space (e.g. "default/"). */
   pathPrefix: string;
-  /** Delegation `path` to grant: `${pathPrefix}memory`. delegateDID must be agentDid. */
+  /** Delegation `path` to grant: `${pathPrefix}memory.db`. delegateDID must be agentDid. */
   dbHandle: string;
   createdAt: string;
 }

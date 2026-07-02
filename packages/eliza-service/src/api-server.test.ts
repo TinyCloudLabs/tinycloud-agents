@@ -207,10 +207,10 @@ describe("/api/agents lifecycle", () => {
     ).json()) as { agentId: string; space: string; pathPrefix: string; dbHandle: string };
 
     // The default (index 0) agent uses space "agents", pathPrefix "default/",
-    // dbHandle "default/memory".
+    // dbHandle "default/memory.db".
     expect(created.space).toBe("agents");
     expect(created.pathPrefix).toBe("default/");
-    expect(created.dbHandle).toBe("default/memory");
+    expect(created.dbHandle).toBe("default/memory.db");
 
     // Option D multi-resource delegation: SQL EXACT on dbHandle + KV PREFIX on
     // pathPrefix + capabilities, all in the agent's space. Passes the full

@@ -6,7 +6,7 @@
 //   space      = AGENTS_SPACE ("agents")
 //   pathPrefix = "default/"           for the owner's default (index 0) agent
 //              = "<slug(name)>/"       for every other agent
-//   dbHandle   = `${pathPrefix}memory` (e.g. "default/memory", "research-bot/memory")
+//   dbHandle   = `${pathPrefix}memory.db` (e.g. "default/memory.db", "research-bot/memory.db")
 //
 // The delegation is minted client-side with tcw.space(space).delegations.create({
 // path: dbHandle, ... }); the server validates against the SAME dbHandle and boots
@@ -21,7 +21,7 @@ export const AGENTS_SPACE = "agents";
 export const DEFAULT_AGENT_PATH_PREFIX = "default/";
 
 /** Trailing path segment naming the memory database within an agent's prefix. */
-export const MEMORY_PATH_SEGMENT = "memory";
+export const MEMORY_PATH_SEGMENT = "memory.db";
 
 /**
  * Slugify an agent name into a path-safe prefix segment: lowercase, non-alnum runs

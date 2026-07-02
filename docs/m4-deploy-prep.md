@@ -13,7 +13,7 @@ be GREEN, then team-lead must give explicit approval, BEFORE any prod deploy:
       a real node with settings-only config (no `process.env.TINYCLOUD_*` mutation).
       Proves the M1 env-mutation removal end to end.
 - [ ] **Live-node proof #2 (M2.1 real delegation round-trip):** mint a delegation in
-      the owner's `agents` space at path `default/memory`, register it via
+      the owner's `agents` space at path `default/memory.db`, register it via
       `POST /api/agents/:id/delegation`, and confirm a real read/write round-trips
       through `sql.db(dbHandle)` at the granted per-agent path.
 - [ ] `https://agents.tinycloud.xyz/health` returns ok.
@@ -40,8 +40,8 @@ sandbox (no node access). Treat a green run of the delegated harness as the
 gate that confirms it.
 
 Additionally, with the M2.1 agents-space scheme, the live check should exercise a
-per-agent `dbHandle` (e.g. `default/memory`) end to end: mint a delegation in the
-owner's `agents` space at path `default/memory`, register it via
+per-agent `dbHandle` (e.g. `default/memory.db`) end to end: mint a delegation in the
+owner's `agents` space at path `default/memory.db`, register it via
 `POST /api/agents/:id/delegation`, and confirm a real read/write round-trips —
 because `sql.db(dbHandle)` must match the granted path (see docs/agents-api.md and
 the delegation-space findings below).

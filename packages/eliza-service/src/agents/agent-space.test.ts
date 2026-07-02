@@ -40,8 +40,8 @@ describe("pathPrefixFor", () => {
 });
 
 describe("dbHandleFor", () => {
-  it("appends 'memory' to the prefix", () => {
-    expect(dbHandleFor("default/")).toBe("default/memory");
-    expect(dbHandleFor("research-bot/")).toBe("research-bot/memory");
+  it("appends 'memory.db' to the prefix", () => {
+    expect(dbHandleFor("default/")).toBe("default/memory.db");
+    expect(dbHandleFor("research-bot/")).toBe("research-bot/memory.db");
   });
 });

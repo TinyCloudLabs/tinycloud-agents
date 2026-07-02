@@ -50,7 +50,7 @@ export interface PostSessionsBody {
    * SQL db handle (== delegation `path`) to validate the grant against. The
    * legacy tinychat /sessions route omits it → falls back to MEMORY_DB_HANDLE.
    * The /api/agents delegation route passes the per-agent dbHandle
-   * (e.g. "default/memory") so each agent validates against its own path.
+   * (e.g. "default/memory.db") so each agent validates against its own path.
    */
   dbHandle?: string;
   /**

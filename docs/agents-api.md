@@ -126,7 +126,7 @@ sign-in flow (nonce → sign → verify) to obtain a new token.
   enabled: boolean;
   space: string;       // TinyCloud space the delegation grants in (e.g. "agents")
   pathPrefix: string;  // KV-prefix grant path within the space, e.g. "default/"
-  dbHandle: string;    // SQL-exact grant path: `${pathPrefix}memory`
+  dbHandle: string;    // SQL-exact grant path: `${pathPrefix}memory.db`
   createdAt: string;
 }
 ```
@@ -137,7 +137,7 @@ sign-in flow (nonce → sign → verify) to obtain a new token.
 - Memory-space scheme: every agent's memory lives in the owner's `space` (currently
   `"agents"` for all) under a per-agent `pathPrefix` — `"default/"` for the owner's
   first (index 0) agent, a slugified name (e.g. `"research-bot/"`) for the rest — so
-  multiple agents don't collide. The delegation grants `dbHandle` = `${pathPrefix}memory`;
+  multiple agents don't collide. The delegation grants `dbHandle` = `${pathPrefix}memory.db`;
   the server validates against exactly that path and boots the agent runtime with
   `TINYCLOUD_DB_HANDLE = dbHandle` so writes land where the grant allows. **Mint the
   delegation using `space`, `dbHandle`, and `agentDid` straight from the AgentView — do
@@ -199,7 +199,7 @@ the agent's `space` (`view.space` = `"agents"`), minted from the AgentView verba
 | service | path | actions | why |
 |---|---|---|---|
 | `tinycloud.kv` | `view.pathPrefix` (e.g. `"default/"`) | `get`,`put`,`list`,`delete` | KV is **hierarchical** — the prefix grant is the agent's broad "operate under my prefix" access |
-| `tinycloud.sql` | `view.dbHandle` (e.g. `"default/memory"`) — **EXACT** | `read`,`write`,`admin` | SQL is **exact db-name** at the node, NOT hierarchical — must be the exact handle, not the prefix |
+| `tinycloud.sql` | `view.dbHandle` (e.g. `"default/memory.db"`) — **EXACT** | `read`,`write`,`admin` | SQL is **exact db-name** at the node, NOT hierarchical — must be the exact handle, not the prefix |
 | `tinycloud.capabilities` | `""` | `read` | as before (optional) |
 
 > Why not one `space().delegations.create({ path })`: that emits a SINGLE resource
