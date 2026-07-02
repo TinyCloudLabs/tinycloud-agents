@@ -60,17 +60,6 @@ export interface MintedDelegation {
   prompted: boolean;
 }
 
-// Ensure the given space exists before minting against it.
-// The delegation grants within `scope.space`, which must exist on the host.
-async function ensureSpace(tcw: TinyCloudWeb, spaceName: string): Promise<void> {
-  const exists = await tcw.spaces.exists(spaceName);
-  if (exists.ok && exists.data) return;
-  const created = await tcw.spaces.create(spaceName);
-  if (!created.ok) {
-    throw new Error(`failed to create "${spaceName}" space: ${created.error.message}`);
-  }
-}
-
 // Delegation scope for an agent, taken verbatim from its AgentView. The service
 // chooses these; the client does not derive them. The server validates the
 // granted KV prefix == pathPrefix and the granted SQL path == dbHandle exactly.
@@ -113,8 +102,11 @@ export async function mintDelegation(
   delegateDID: string,
   scope: DelegationScope
 ): Promise<MintedDelegation> {
-  await ensureSpace(tcw, scope.space);
-
+  // No space-creation here: scope.space ("agents") is already provisioned at
+  // sign-in by autoCreateSpace. Re-creating it via the session key 401s
+  // ("agents/space/agents ... tinycloud.space/create" — the owner's primary
+  // space can't be re-created by the session key), so the mint just grants
+  // within the existing space.
   const permissions: PermissionEntry[] = [
     {
       service: "tinycloud.kv",
