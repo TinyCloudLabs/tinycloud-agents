@@ -5,7 +5,7 @@
 // behavior assertions so the two auth modes stay byte-identical at the seam.
 
 import { expect, test } from "bun:test";
-import { DelegatedTransport, type DelegatedSqlAccess } from "./delegated-transport.ts";
+import { DelegatedTransport, delegatedNodeConfig, type DelegatedSqlAccess } from "./delegated-transport.ts";
 import type { IDatabaseHandle } from "@tinycloud/node-sdk";
 import type { PortableDelegation } from "@tinycloud/node-sdk";
 import { deserializeDelegation } from "@tinycloud/node-sdk";
@@ -720,4 +720,20 @@ test("after invalidate(), SQL methods return NOT_ACTIVATED until next signIn()",
   if (!after.ok) {
     expect(after.error.code).toBe("NOT_ACTIVATED");
   }
+});
+
+// ---------------------------------------------------------------------------
+// Delegated activation must NOT bootstrap an account (node-sdk 2.4.0)
+// ---------------------------------------------------------------------------
+
+test("delegated activation disables account bootstrap (autoBootstrapAccount: false)", () => {
+  // The agent activating a USER's delegation is not an account owner. node-sdk
+  // 2.4.0's signIn() runs a first-account bootstrap that needs a multi-permission
+  // SQL schema write the delegated runtime can't execute; the delegated wallet
+  // session must opt out of it. This is the node config defaultActivate feeds to
+  // `new TinyCloudNode(...)`.
+  const cfg = delegatedNodeConfig(makeResolvedConfig({ host: "https://node.example" }), AGENT_KEY);
+  expect(cfg.autoBootstrapAccount).toBe(false);
+  expect(cfg.privateKey).toBe(AGENT_KEY);
+  expect(cfg.host).toBe("https://node.example");
 });

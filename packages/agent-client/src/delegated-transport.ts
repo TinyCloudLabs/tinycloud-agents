@@ -13,7 +13,7 @@
 // HARD CONTRACT: zero host-framework (Eliza) imports — see ./index.ts.
 
 import { readFileSync } from "node:fs";
-import type { IDatabaseHandle, PortableDelegation } from "@tinycloud/node-sdk";
+import type { IDatabaseHandle, PortableDelegation, TinyCloudNodeConfig } from "@tinycloud/node-sdk";
 import { TinyCloudNode } from "@tinycloud/node-sdk";
 import { agentIdentityFromFile, agentIdentityFromKey, type AgentIdentity } from "./agent-identity";
 import type { ResolvedDelegationConfig } from "./config";
@@ -92,6 +92,17 @@ const NOT_ACTIVATED_RESULT: { ok: false; error: TransportError } = {
 };
 
 /**
+ * Node config for the delegated-activation wallet session. The agent activating
+ * a USER's delegation is not an account owner and must NOT run node-sdk 2.4.0's
+ * first-account bootstrap (which tries a multi-permission SQL schema write the
+ * delegated runtime cannot execute — "SQL operation requires multiple permissions").
+ * `autoBootstrapAccount: false` is the SDK-supported skip (TinyCloudNodeConfig).
+ */
+export function delegatedNodeConfig(config: ResolvedDelegationConfig, normalizedKey: string): TinyCloudNodeConfig {
+  return { privateKey: normalizedKey, host: config.host, autoBootstrapAccount: false };
+}
+
+/**
  * Default activator: wallet-mode TinyCloudNode construction + useDelegation.
  *
  * Builds a fresh TinyCloudNode from the stored agent key (inline or file) and
@@ -111,12 +122,12 @@ export const defaultActivate: DelegatedActivateFn = async (
   // (review #8). signIn() guarantees identity.normalizedKey is present here.
   const normalizedKey = identity.normalizedKey;
   // Wallet mode: construct node with the agent's privateKey and sign in as the
-  // agent's own PKH identity (did:pkh:eip155:1:{address}). node-sdk 2.3.0's
-  // useDelegation requires an established wallet session (auth.tinyCloudSession);
-  // without a prior signIn() it throws "Not signed in. Call signIn() first."
-  // signIn() establishes that session; useDelegation then builds the delegated
+  // agent's own PKH identity (did:pkh:eip155:1:{address}). useDelegation
+  // requires an established wallet session (auth.tinyCloudSession); without a
+  // prior signIn() it throws "Not signed in. Call signIn() first." signIn()
+  // establishes that session; useDelegation then builds the delegated
   // sub-session (user → agent) scoped to the delegation's SQL abilities.
-  const node = new TinyCloudNode({ privateKey: normalizedKey, host: config.host });
+  const node = new TinyCloudNode(delegatedNodeConfig(config, normalizedKey));
   await node.signIn();
   const access = await node.useDelegation(delegation);
   return access as unknown as DelegatedSqlAccess;
