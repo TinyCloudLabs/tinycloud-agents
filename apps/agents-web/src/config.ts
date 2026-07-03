@@ -23,6 +23,9 @@ export const SQL_ACTIONS = [
   "tinycloud.sql/read",
   "tinycloud.sql/write",
   "tinycloud.sql/admin",
+  // node-sdk 2.4.0 gates schema DDL (ensureSchema) behind its own action URN;
+  // admin does NOT imply it. Without this the node 401s the agent's first boot.
+  "tinycloud.sql/schema",
 ];
 
 export const CAPABILITIES_ACTIONS = ["tinycloud.capabilities/read"];

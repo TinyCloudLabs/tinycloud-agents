@@ -22,6 +22,10 @@ export default defineConfig({
   server: {
     port: 5174,
     strictPort: true,
+    // Bind IPv4 loopback and allow the portless-served dev origin
+    // (https://agents.localhost -> 127.0.0.1:5174).
+    host: "127.0.0.1",
+    allowedHosts: ["agents.localhost"],
     https,
     proxy: {
       "/api": {
