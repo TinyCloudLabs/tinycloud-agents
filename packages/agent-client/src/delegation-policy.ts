@@ -131,6 +131,10 @@ export function defaultElizaMemoryPolicy(
         "tinycloud.sql/read",
         "tinycloud.sql/write",
         "tinycloud.sql/admin",
+        // node-sdk 2.4.0 gates ensureSchema() DDL behind tinycloud.sql/schema —
+        // admin does NOT imply it. Required only on the agents-space (kvPrefix)
+        // policy so legacy tinychat delegations keep validating unchanged.
+        ...(kvPrefix !== undefined ? ["tinycloud.sql/schema"] : []),
       ],
       required: true,
     },

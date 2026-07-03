@@ -217,7 +217,7 @@ describe("/api/agents lifecycle", () => {
     // deserialize -> shape -> policy (SQL exact + KV prefix + fail-closed space) chain.
     const ownerAddr = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
     const spaceUri = `tinycloud:pkh:eip155:1:${ownerAddr}:${created.space}`;
-    const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"];
+    const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin", "tinycloud.sql/schema"];
     const kvActions = ["tinycloud.kv/get", "tinycloud.kv/put", "tinycloud.kv/list", "tinycloud.kv/delete"];
     const serializedDelegation = JSON.stringify({
       cid: "bafy-api-deleg-test",
@@ -267,7 +267,7 @@ describe("/api/agents lifecycle", () => {
     // Correct SQL-exact + correct space, but NO KV prefix resource -> fail-closed.
     const ownerAddr = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
     const spaceUri = `tinycloud:pkh:eip155:1:${ownerAddr}:${created.space}`;
-    const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"];
+    const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin", "tinycloud.sql/schema"];
     const serializedDelegation = JSON.stringify({
       cid: "bafy-no-kv",
       delegateDID: AGENT_DID,
@@ -317,7 +317,7 @@ describe("/api/agents lifecycle", () => {
 
     const ownerAddr = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
     const spaceUri = `tinycloud:pkh:eip155:1:${ownerAddr}:${created.space}`;
-    const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"];
+    const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin", "tinycloud.sql/schema"];
     const kvActions = ["tinycloud.kv/get", "tinycloud.kv/put", "tinycloud.kv/list", "tinycloud.kv/delete"];
     const serializedDelegation = JSON.stringify({
       cid: "bafy-kv-slash",

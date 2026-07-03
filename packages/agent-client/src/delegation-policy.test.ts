@@ -739,7 +739,7 @@ describe("validateDelegationPolicy", () => {
   // valid checksummed address rather than the "0xOwnerAddress" placeholder above.
   const REAL_OWNER = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
   const spaceUri = (name: string) => `tinycloud:pkh:eip155:1:${REAL_OWNER}:${name}`;
-  const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"];
+  const sqlActions = ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin", "tinycloud.sql/schema"];
   const inSpace = (name: string) =>
     makeMultiResource({
       spaceId: spaceUri(name),
@@ -802,7 +802,7 @@ describe("validateDelegationPolicy", () => {
   const KV_PREFIX = "default/";
   const dPolicy = defaultElizaMemoryPolicy(DB_HANDLE, KV_PREFIX);
   const kvActions = ["tinycloud.kv/get", "tinycloud.kv/put", "tinycloud.kv/list", "tinycloud.kv/delete"];
-  const sqlRes = () => ({ service: "sql", space: `tinycloud:pkh:eip155:1:${OWNER_ADDRESS}:agents`, path: DB_HANDLE, actions: ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"] });
+  const sqlRes = () => ({ service: "sql", space: `tinycloud:pkh:eip155:1:${OWNER_ADDRESS}:agents`, path: DB_HANDLE, actions: ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin", "tinycloud.sql/schema"] });
   const kvRes = (path: string) => ({ service: "kv", space: `tinycloud:pkh:eip155:1:${OWNER_ADDRESS}:agents`, path, actions: kvActions });
   const dDelegation = (resources: unknown[]) => makeMultiResource({ resources });
 
@@ -848,7 +848,19 @@ describe("validateDelegationPolicy", () => {
 
   test("D policy: flat/legacy delegation (no resources[]) -> MISSING_KV_RESOURCE (fail-closed)", () => {
     try {
-      validateDelegationPolicy(makeFlat(), { agentDID: AGENT_DID, policy: dPolicy });
+      // Grant all required SQL actions (incl. schema) so the failure isolates the
+      // missing-resources[] shape, not action insufficiency.
+      validateDelegationPolicy(
+        makeFlat({
+          actions: [
+            "tinycloud.sql/read",
+            "tinycloud.sql/write",
+            "tinycloud.sql/admin",
+            "tinycloud.sql/schema",
+          ],
+        }),
+        { agentDID: AGENT_DID, policy: dPolicy },
+      );
       expect(true).toBe(false);
     } catch (e) {
       expect((e as DelegationPolicyError).reason).toBe("MISSING_KV_RESOURCE");
