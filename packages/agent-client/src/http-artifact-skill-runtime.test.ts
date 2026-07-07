@@ -269,6 +269,48 @@ describe("createHttpArtifactSkillRuntime — adapter behavior", () => {
     await expect(runtime.run(makeContractRuntimeInput())).rejects.toThrow(/malformed ArtifactSkillRuntimeOutput/);
   });
 
+  it("rejects malformed nested stageTrace entries", async () => {
+    const malformed = stubOutput();
+    (malformed.trace as { stageTrace: unknown }).stageTrace = [
+      { stageId: 42, declaredCapabilities: "not-an-array" },
+    ];
+    const h = track(
+      spawn(async () =>
+        new Response(
+          JSON.stringify({ ok: true, tool: RUN_ARTIFACT_SKILL, result: { data: malformed } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    const runtime = createHttpArtifactSkillRuntime({
+      baseUrl: h.baseUrl,
+      serviceSecret: BEARER,
+    });
+
+    await expect(runtime.run(makeContractRuntimeInput())).rejects.toThrow(/malformed ArtifactSkillRuntimeOutput/);
+  });
+
+  it("rejects malformed nested droppedCandidates entries", async () => {
+    const malformed = stubOutput();
+    (malformed.trace as { droppedCandidates: unknown }).droppedCandidates = [
+      { reason: 7, localCandidateId: { nested: "object" } },
+    ];
+    const h = track(
+      spawn(async () =>
+        new Response(
+          JSON.stringify({ ok: true, tool: RUN_ARTIFACT_SKILL, result: { data: malformed } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    const runtime = createHttpArtifactSkillRuntime({
+      baseUrl: h.baseUrl,
+      serviceSecret: BEARER,
+    });
+
+    await expect(runtime.run(makeContractRuntimeInput())).rejects.toThrow(/malformed ArtifactSkillRuntimeOutput/);
+  });
+
   it("throws a redacted error when the server returns non-JSON", async () => {
     const h = track(
       spawn(async () =>

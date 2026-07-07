@@ -42,6 +42,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function isTraceToolCall(value: unknown): boolean {
+  return isRecord(value) && typeof value.name === "string" && typeof value.purpose === "string";
+}
+
+function isStageTraceEntry(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (typeof value.stageId !== "string") return false;
+  if (!isStringArray(value.declaredCapabilities)) return false;
+  if (!isStringArray(value.grantedCapabilities)) return false;
+  if (typeof value.authorityUsed !== "boolean") return false;
+  if (!isStringArray(value.deniedReasons)) return false;
+  return true;
+}
+
+function isDroppedCandidateEntry(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (typeof value.reason !== "string") return false;
+  if (value.title !== undefined && typeof value.title !== "string") return false;
+  if (value.localCandidateId !== undefined && typeof value.localCandidateId !== "string") return false;
+  return true;
+}
+
 function isArtifactSkillRuntimeOutput(value: unknown): value is ArtifactSkillRuntimeOutput {
   if (!isRecord(value)) return false;
   if (!Array.isArray(value.candidates)) return false;
@@ -49,9 +75,14 @@ function isArtifactSkillRuntimeOutput(value: unknown): value is ArtifactSkillRun
   const trace = value.trace;
   if (typeof trace.procedureVersion !== "string") return false;
   if (typeof trace.modelCalls !== "number") return false;
-  if (!Array.isArray(trace.toolCalls)) return false;
-  if (!Array.isArray(trace.stageTrace)) return false;
-  if (!Array.isArray(trace.droppedCandidates)) return false;
+  if (!Array.isArray(trace.toolCalls) || !trace.toolCalls.every(isTraceToolCall)) return false;
+  if (!Array.isArray(trace.stageTrace) || !trace.stageTrace.every(isStageTraceEntry)) return false;
+  if (
+    !Array.isArray(trace.droppedCandidates)
+    || !trace.droppedCandidates.every(isDroppedCandidateEntry)
+  ) {
+    return false;
+  }
   return true;
 }
 
