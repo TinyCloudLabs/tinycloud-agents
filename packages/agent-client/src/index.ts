@@ -84,6 +84,20 @@ export type { EnsureSchema } from "./schema";
 export { createAgentClient } from "./client";
 export type { AgentClient, AgentClientDeps } from "./client";
 
+export {
+  RUN_ARTIFACT_SKILL,
+  assertArtifactSkillRuntimeInput,
+  createStubArtifactSkillRuntime,
+  redactArtifactSkillRuntimeError,
+} from "./artifact-skill-runtime";
+export type {
+  ArtifactSkillRuntime,
+  ArtifactSkillRuntimeInput,
+  ArtifactSkillRuntimeOutput,
+  ArtifactSkillRuntimePolicy,
+  ArtifactSkillRuntimeTool,
+} from "./artifact-skill-runtime";
+
 export { normalizeAgentKey, agentIdentityFromKey, agentIdentityFromFile } from "./agent-identity";
 export type { AgentIdentity } from "./agent-identity";
 
