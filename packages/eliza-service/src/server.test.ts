@@ -389,6 +389,32 @@ describe("eliza-service HTTP server", () => {
     expect(body.result.data.trace.modelCalls).toBe(0);
   });
 
+  it("POST /tools/RUN_ARTIFACT_SKILL with the tinychat bearer returns 404 and never boots a runtime", async () => {
+    const host: ElizaServiceHost = {
+      agentDid: TEST_AGENT_DID,
+      storageFor: async () => new FakeStorage(),
+      runtimeFor: async () => {
+        throw new Error("runtimeFor must not run for an app-gated tool");
+      },
+      preflight: async () => {},
+    };
+    server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+
+    // ELIZA_SERVICE_SECRET is the tinychat app credential — it must not be able
+    // to reach the Artifactory-only RUN_ARTIFACT_SKILL dispatch.
+    const res = await fetch(url(`/tools/${RUN_ARTIFACT_SKILL}`), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "Authorization": `Bearer ${TEST_SERVICE_SECRET}`,
+      },
+      body: JSON.stringify({ args: { runId: "tinychat-cross-app" } }),
+    });
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "tool_not_found", tool: RUN_ARTIFACT_SKILL });
+  });
+
   it("POST /tools/RUN_ARTIFACT_SKILL without auth returns 401 (no bearer, no runtime boot)", async () => {
     const host: ElizaServiceHost = {
       agentDid: TEST_AGENT_DID,

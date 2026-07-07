@@ -6,7 +6,7 @@ import {
   type PostSessionsBody,
   type SessionHandlerHost,
 } from "./handlers/sessions.js";
-import { handlePostTool, type PostToolBody } from "./handlers/tools.js";
+import { handlePostTool, isToolAllowedForApp, type PostToolBody } from "./handlers/tools.js";
 import type { SessionStore } from "./session-store.js";
 import { checkServiceAuth } from "./auth/service-auth.js";
 import { defaultRateLimiter } from "./rate-limit.js";
@@ -123,6 +123,13 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
         const toolName = decodeURIComponent(url.pathname.slice("/tools/".length));
         if (!toolName || toolName.includes("/")) {
           return json(404, { error: "tool_not_found" });
+        }
+
+        // App-identity gate: app-restricted tools (RUN_ARTIFACT_SKILL) must be
+        // rejected before any body parsing or runtime boot. Same 404 shape as an
+        // unknown tool so restricted tools are not disclosed to other apps.
+        if (!isToolAllowedForApp(toolName, auth.resolved.appId)) {
+          return json(404, { error: "tool_not_found", tool: toolName });
         }
 
         const parsed = await readJsonObject(request);
