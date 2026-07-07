@@ -18,7 +18,24 @@
 //   anything else                      -> 502 { error: "tool_failed" }
 
 import type { Action, Content, HandlerCallback, IAgentRuntime, Memory, UUID } from "@elizaos/core";
+import { RUN_ARTIFACT_SKILL } from "@tinycloud/agent-client";
 import { mapDelegationError } from "../errors.js";
+import { ARTIFACTORY_APP_ID } from "../auth/app-registry.js";
+
+// App-identity gate. RUN_ARTIFACT_SKILL is registered on every production
+// runtime (runtime-host boots one plugin set per agent), so tool dispatch must
+// be restricted by the CALLING app's credential, not by action presence: only
+// the Artifactory app-registry entry may invoke it. Gated tools answer 404 with
+// the same shape as unknown tools so their existence is not disclosed to other
+// apps.
+const TOOL_APP_ALLOWLIST = new Map<string, ReadonlySet<string>>([
+  [RUN_ARTIFACT_SKILL.toLowerCase(), new Set([ARTIFACTORY_APP_ID])],
+]);
+
+export function isToolAllowedForApp(toolName: string, appId: string): boolean {
+  const allowedApps = TOOL_APP_ALLOWLIST.get(toolName.toLowerCase());
+  return allowedApps === undefined || allowedApps.has(appId);
+}
 
 /** Minimal host interface consumed by the tools handler; RuntimeHost satisfies it. */
 export interface ToolHandlerHost {
