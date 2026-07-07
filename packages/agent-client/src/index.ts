@@ -98,6 +98,9 @@ export type {
   ArtifactSkillRuntimeTool,
 } from "./artifact-skill-runtime";
 
+export { createHttpArtifactSkillRuntime } from "./http-artifact-skill-runtime";
+export type { HttpArtifactSkillRuntimeOptions } from "./http-artifact-skill-runtime";
+
 export { normalizeAgentKey, agentIdentityFromKey, agentIdentityFromFile } from "./agent-identity";
 export type { AgentIdentity } from "./agent-identity";
 
