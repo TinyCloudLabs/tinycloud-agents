@@ -7,6 +7,7 @@
     "packages/*"
   ],
   "scripts": {
+    "prepare": "bun run build",
     "build": "bun --bun run --filter '*' build",
     "typecheck": "bun --bun run --filter '*' typecheck",
     "test": "bun --bun run --filter '*' test",
