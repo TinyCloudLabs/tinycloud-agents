@@ -1,3 +1,4 @@
+import { CAPABILITIES, SQL } from "@tinycloud/bootstrap";
 import {
   TinyCloudWeb,
   type Delegation,
@@ -6,10 +7,10 @@ import {
 } from "@tinycloud/web-sdk";
 
 const SQL_ACTIONS = [
-  "tinycloud.sql/read",
-  "tinycloud.sql/write",
-  "tinycloud.sql/admin",
-  "tinycloud.capabilities/read",
+  SQL.READ,
+  SQL.WRITE,
+  SQL.ADMIN,
+  CAPABILITIES.READ,
 ];
 
 function escapeHtml(s: string): string {
