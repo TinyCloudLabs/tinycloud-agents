@@ -6,7 +6,8 @@
       "name": "delegate-ui",
       "dependencies": {
         "@openkey/sdk": "^0.8.4",
-        "@tinycloud/web-sdk": "2.3.0",
+        "@tinycloud/bootstrap": "2.5.0",
+        "@tinycloud/web-sdk": "2.6.0",
       },
       "devDependencies": {
         "@types/node": "^20.0.0",
@@ -142,7 +143,7 @@
 
     "@noble/ciphers": ["@noble/ciphers@1.3.0", "", {}, "sha512-2I0gnIVPtfnMw9ee9h1dJG7tp81+8Ob3OJb3Mv37rx5L40/b0i7djjCVvGOVqc9AEIQyvyu1i6ypKdFw8R8gQw=="],
 
-    "@noble/curves": ["@noble/curves@1.9.7", "", { "dependencies": { "@noble/hashes": "1.8.0" } }, "sha512-gbKGcRUYIjA3/zCCNaWDciTMFI0dCkvou3TL8Zmy5Nc7sJ47a0jtOeZoTaMxkuqRo9cRhjOdZJXegxYE5FN/xw=="],
+    "@noble/curves": ["@noble/curves@1.9.1", "", { "dependencies": { "@noble/hashes": "1.8.0" } }, "sha512-k11yZxZg+t+gWvBbIswW0yoJlu8cHOC7dhunwOzoWH/mXGBiYyR4YY6hAEK/3EUs4UpB8la1RfdRpeGsFHkWsA=="],
 
     "@noble/hashes": ["@noble/hashes@1.8.0", "", {}, "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A=="],
 
@@ -216,15 +217,17 @@
 
     "@stablelib/wipe": ["@stablelib/wipe@1.0.1", "", {}, "sha512-WfqfX/eXGiAd3RJe4VU2snh/ZPwtSjLG4ynQ/vYzvghTh7dHFcI1wl+nrkWG6lGhukOxOsUHfv8dUXr58D0ayg=="],
 
-    "@tinycloud/node-sdk": ["@tinycloud/node-sdk@2.3.0", "", { "dependencies": { "@tinycloud/node-sdk-wasm": "1.7.4", "@tinycloud/sdk-core": "2.3.0", "siwe": "^3.0.0" } }, "sha512-k6u4h+DGQRjNNSLDLqk28ONQq6Hl3QfXhriUpXUmmlZAEK3fkKM1Osb7QCpUmxM29VRH9I8Lp//l0GnMymw3aw=="],
+    "@tinycloud/bootstrap": ["@tinycloud/bootstrap@2.5.0", "", { "dependencies": { "viem": "^2.21.53" } }, "sha512-9srdjMeUgIuKjZAN7h+6wg9k7ItMzBDK4FHIyWELSAmA/TbbP040bP9x/aV7eFV/10cho0e4NGrJ9SD4lZl4vA=="],
+
+    "@tinycloud/node-sdk": ["@tinycloud/node-sdk@2.6.0", "", { "dependencies": { "@tinycloud/node-sdk-wasm": "1.7.4", "@tinycloud/sdk-core": "2.6.0", "siwe": "^3.0.0" } }, "sha512-naz8LHou1xvT50gMJgKSUzdyfY4A7yWBvn4c8UrrmYaRxSZaK2uB636B1oDljUInGirmBRP/LhkTHD66vBaLnA=="],
 
     "@tinycloud/node-sdk-wasm": ["@tinycloud/node-sdk-wasm@1.7.4", "", {}, "sha512-hOzqatgIGbvfOUslXeXVOP1QvcH+iipfDDseBKpnc2Db7bxzGAc06aQXyZSujkftsvgezS2eVBx9gai37BageQ=="],
 
-    "@tinycloud/sdk-core": ["@tinycloud/sdk-core@2.3.0", "", { "dependencies": { "@multiformats/multiaddr": "^13.0.1", "@multiformats/multiaddr-to-uri": "^12.0.0", "@multiformats/uri-to-multiaddr": "^10.0.0", "@noble/curves": "^1.9.7", "@tinycloud/sdk-services": "2.3.0", "ms": "^2.1.3", "multiformats": "^13.4.1", "siwe": "^3.0.0", "viem": "^2.21.53", "zod": "^3.22.0", "zod-to-json-schema": "^3.22.0" } }, "sha512-JZK8Co5+fgPpUIGWtno3jows6Y5DZCXmcpZfBV3YiUE6ZTet1TX2qP/xfOViYU6a/b370t86M5g+kqKLqMDu7g=="],
+    "@tinycloud/sdk-core": ["@tinycloud/sdk-core@2.6.0", "", { "dependencies": { "@multiformats/multiaddr": "^13.0.1", "@multiformats/multiaddr-to-uri": "^12.0.0", "@multiformats/uri-to-multiaddr": "^10.0.0", "@noble/curves": "^1.9.7", "@tinycloud/bootstrap": "2.5.0", "@tinycloud/sdk-services": "2.6.0", "ms": "^2.1.3", "multiformats": "^13.4.1", "siwe": "^3.0.0", "viem": "^2.21.53", "zod": "^3.22.0", "zod-to-json-schema": "^3.22.0" } }, "sha512-uWe0h3Q4XGwFewNgtLYxWCv6b55ouzieHERqs1gw5b0W4VmgsFm2IftG9tzfTcYwhu1sx1z41lWdL5MyAJSu6g=="],
 
-    "@tinycloud/sdk-services": ["@tinycloud/sdk-services@2.3.0", "", { "dependencies": { "zod": "^3.23.0" } }, "sha512-ptwKxrihxD/Tz3SvrnfsXQZYvAIVsMa+SeZmL6fBluGMquyQWJy6MXVN6MnlViMoEjGTpDkLxz58/7wkvpWzcw=="],
+    "@tinycloud/sdk-services": ["@tinycloud/sdk-services@2.6.0", "", { "dependencies": { "@tinycloud/bootstrap": "2.5.0", "zod": "^3.23.0" } }, "sha512-D+HCAOUJ1imeMfLaZLqr3I3cc2I3cco09Q0+TQo86ZpHMDaEojWLwmdX0t4LVFNQydwbo9o/8ZH9USaLZVPrMQ=="],
 
-    "@tinycloud/web-sdk": ["@tinycloud/web-sdk@2.3.0", "", { "dependencies": { "@metamask/detect-provider": "^1.2.0", "@multiformats/multiaddr": "^13.0.1", "@multiformats/multiaddr-to-uri": "^12.0.0", "@tinycloud/node-sdk": "2.3.0", "@tinycloud/sdk-core": "2.3.0", "@tinycloud/web-sdk-wasm": "1.7.4", "axios": "^1.7.9", "ethers": "^5.7.2", "lodash.merge": "^4.6.2", "siwe": "^3.0.0", "viem": "^2.45.0", "zod": "^3.22.0" } }, "sha512-TSwbTbEuhJ0oHcdQswQUS1Frya8PfUId2enDWaE1Nlo1VytmgAdCoLS2yGgggmagdYPEmCm/D7fbtuh1UlE9Qg=="],
+    "@tinycloud/web-sdk": ["@tinycloud/web-sdk@2.6.0", "", { "dependencies": { "@metamask/detect-provider": "^1.2.0", "@multiformats/multiaddr": "^13.0.1", "@multiformats/multiaddr-to-uri": "^12.0.0", "@tinycloud/node-sdk": "2.6.0", "@tinycloud/sdk-core": "2.6.0", "@tinycloud/web-sdk-wasm": "1.7.4", "axios": "^1.7.9", "ethers": "^5.7.2", "lodash.merge": "^4.6.2", "siwe": "^3.0.0", "viem": "^2.45.0", "zod": "^3.22.0" } }, "sha512-eJkC8JMqjOWKJIEEZqZ2HHaOzV4VN3FsPx58i5PPa6w79gGdVeflHoB3owexdjr2EHGbi9zraBuWHqXni5FU/w=="],
 
     "@tinycloud/web-sdk-wasm": ["@tinycloud/web-sdk-wasm@1.7.4", "", {}, "sha512-eb02Zgo78wvdZtzO+3A/I64dqhFIILoD0T51li41duNcW0nUSjsn51oIBxIFEjmCe0RqU8W1NqJ3Pcn3e6eBBw=="],
 
@@ -386,12 +389,12 @@
 
     "@ethersproject/providers/ws": ["ws@8.18.0", "", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha512-8VbfWfHLbbwu3+N6OKsOMpBdT4kXPDDB9cJk2bJ6mh9ucxdlnNvH1e+roYkKmN9Nxw2yjz7VzeO9oOz2zJ04Pw=="],
 
+    "@scure/bip32/@noble/curves": ["@noble/curves@1.9.7", "", { "dependencies": { "@noble/hashes": "1.8.0" } }, "sha512-gbKGcRUYIjA3/zCCNaWDciTMFI0dCkvou3TL8Zmy5Nc7sJ47a0jtOeZoTaMxkuqRo9cRhjOdZJXegxYE5FN/xw=="],
+
+    "@tinycloud/sdk-core/@noble/curves": ["@noble/curves@1.9.7", "", { "dependencies": { "@noble/hashes": "1.8.0" } }, "sha512-gbKGcRUYIjA3/zCCNaWDciTMFI0dCkvou3TL8Zmy5Nc7sJ47a0jtOeZoTaMxkuqRo9cRhjOdZJXegxYE5FN/xw=="],
+
     "@tinycloud/sdk-core/multiformats": ["multiformats@13.4.2", "", {}, "sha512-eh6eHCrRi1+POZ3dA+Dq1C6jhP1GNtr9CRINMb67OKzqW9I5DUuZM/3jLPlzhgpGeiNUlEGEbkCYChXMCc/8DQ=="],
 
     "elliptic/bn.js": ["bn.js@4.12.3", "", {}, "sha512-fGTi3gxV/23FTYdAoUtLYp6qySe2KE3teyZitipKNRuVYcBkoP/bB3guXN/XVKUe9mxCHXnc9C4ocyz8OmgN0g=="],
-
-    "ox/@noble/curves": ["@noble/curves@1.9.1", "", { "dependencies": { "@noble/hashes": "1.8.0" } }, "sha512-k11yZxZg+t+gWvBbIswW0yoJlu8cHOC7dhunwOzoWH/mXGBiYyR4YY6hAEK/3EUs4UpB8la1RfdRpeGsFHkWsA=="],
-
-    "viem/@noble/curves": ["@noble/curves@1.9.1", "", { "dependencies": { "@noble/hashes": "1.8.0" } }, "sha512-k11yZxZg+t+gWvBbIswW0yoJlu8cHOC7dhunwOzoWH/mXGBiYyR4YY6hAEK/3EUs4UpB8la1RfdRpeGsFHkWsA=="],
   }
 }

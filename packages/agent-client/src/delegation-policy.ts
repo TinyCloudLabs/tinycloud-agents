@@ -9,6 +9,7 @@
 // token, any auth-bearing header value, or agentKey — nor the serialized blob.
 
 import { createHash } from "node:crypto";
+import { CAPABILITIES, SQL } from "@tinycloud/bootstrap";
 import { deserializeDelegation, expandActionShortNames, principalDidEquals } from "@tinycloud/node-sdk";
 import type { PortableDelegation } from "@tinycloud/node-sdk";
 import { DEFAULT_DB_HANDLE } from "./config";
@@ -114,9 +115,9 @@ export function defaultElizaMemoryPolicy(
         serviceShort: "sql",
         path: dbHandle,
         requiredActions: [
-          "tinycloud.sql/read",
-          "tinycloud.sql/write",
-          "tinycloud.sql/admin",
+          SQL.READ,
+          SQL.WRITE,
+          SQL.ADMIN,
         ],
         required: true,
       },
@@ -124,7 +125,7 @@ export function defaultElizaMemoryPolicy(
         serviceLong: "tinycloud.capabilities",
         serviceShort: "capabilities",
         path: "",
-        requiredActions: ["tinycloud.capabilities/read"],
+        requiredActions: [CAPABILITIES.READ],
         required: false,
       },
     ],

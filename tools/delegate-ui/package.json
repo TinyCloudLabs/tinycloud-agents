@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "@openkey/sdk": "^0.8.4",
-    "@tinycloud/web-sdk": "2.3.0"
+    "@tinycloud/bootstrap": "2.5.0",
+    "@tinycloud/web-sdk": "2.6.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
