@@ -130,6 +130,63 @@ describe("createHttpArtifactSkillRuntime — adapter behavior", () => {
     expect(h.observed.body).toEqual({ args: input as unknown as Record<string, unknown> });
   });
 
+  it("redacts secret refs and inline credential material from the service response", async () => {
+    const h = track(
+      spawn(async () =>
+        new Response(
+          JSON.stringify({
+            ok: true,
+            tool: RUN_ARTIFACT_SKILL,
+            result: {
+              data: {
+                ...stubOutput(),
+                candidates: [
+                  {
+                    title: "vault/secrets/scoped/feed/OPENAI_API_KEY",
+                    body: { text: "OPENAI_API_KEY=sk-test" },
+                  },
+                ],
+                trace: {
+                  ...stubOutput().trace,
+                  toolCalls: [{ name: "demo", purpose: "secretRef=vault/secrets/scoped/feed/OPENAI_API_KEY" }],
+                  stageTrace: [
+                    {
+                      stageId: "stub",
+                      declaredCapabilities: [],
+                      grantedCapabilities: [],
+                      authorityUsed: false,
+                      deniedReasons: ["Bearer sk-live-abc123"],
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+    const runtime = createHttpArtifactSkillRuntime({ baseUrl: h.baseUrl, serviceSecret: BEARER });
+    const input = makeContractRuntimeInput({
+      secretEnv: [
+        {
+          name: "OPENAI_API_KEY",
+          secretRef: "vault/secrets/scoped/feed/OPENAI_API_KEY",
+          injection: "env",
+          stageId: "stub",
+          source: "worker_injected",
+        },
+      ],
+    });
+
+    const output = await runtime.run(input);
+
+    expect(JSON.stringify(output)).not.toContain("vault/secrets/scoped/feed/OPENAI_API_KEY");
+    expect(JSON.stringify(output)).not.toContain("sk-test");
+    expect(JSON.stringify(output)).not.toContain("sk-live-abc123");
+    expect(output.candidates[0]?.title).toContain("[REDACTED]");
+  });
+
   it("tolerates a trailing slash on baseUrl", async () => {
     const h = track(
       spawn(async (req) => {

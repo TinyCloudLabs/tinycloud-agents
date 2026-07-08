@@ -16,7 +16,7 @@
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test --preload ../../test/no-spend-setup.ts"
   },
   "dependencies": {
     "@tinycloud/bootstrap": "2.5.0",

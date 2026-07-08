@@ -125,13 +125,14 @@ describe("runArtifactSkillAction", () => {
   it("redacts bearer tokens and provider credentials from error messages", () => {
     const redacted = redactArtifactSkillRuntimeError(
       new Error(
-        "leak Bearer sk-live-abc123 OPENAI_API_KEY=sk-openai-xyz api_key=plain-secret",
+        "leak Bearer sk-live-abc123 missing OPENAI_API_KEY OPENAI_API_KEY=sk-openai-xyz api_key=plain-secret",
       ),
     );
 
     expect(redacted).not.toContain("sk-live-abc123");
     expect(redacted).not.toContain("sk-openai-xyz");
     expect(redacted).not.toContain("plain-secret");
+    expect(redacted).not.toContain("OPENAI_API_KEY");
     expect(redacted).toContain("[REDACTED]");
   });
 });

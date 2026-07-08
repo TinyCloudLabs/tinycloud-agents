@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test --preload ../../test/no-spend-setup.ts"
   },
   "dependencies": {
     "@tinycloud/eliza-plugin-memory": "workspace:*",

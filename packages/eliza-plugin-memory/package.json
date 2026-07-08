@@ -31,7 +31,7 @@
   "scripts": {
     "build": "tsc -p .",
     "typecheck": "tsc --noEmit",
-    "test": "bun test && bun test scripts/consent-harness.test.ts && bun test scripts/fixtures/make-delegation-fixtures.test.ts && bun test scripts/live-delegated-negative.test.ts",
+    "test": "bun test --preload ../../test/no-spend-setup.ts && bun test --preload ../../test/no-spend-setup.ts scripts/consent-harness.test.ts && bun test --preload ../../test/no-spend-setup.ts scripts/fixtures/make-delegation-fixtures.test.ts && bun test --preload ../../test/no-spend-setup.ts scripts/live-delegated-negative.test.ts",
     "test:live:eliza": "bun --bun scripts/live-eliza-scenarios.ts",
     "test:live:eliza:delegated": "bun --bun scripts/live-delegated-scenarios.ts",
     "consent:harness": "bun --bun scripts/consent-harness.ts"
