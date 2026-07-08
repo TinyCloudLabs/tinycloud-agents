@@ -28,6 +28,7 @@ export type ArtifactSkillRuntimeInput = {
   runtimePolicy: ArtifactSkillRuntimePolicy;
   secretEnv?: {
     name: string;
+    secretRef?: string;
     injection: "env";
     stageId: string;
     source: "worker_injected";
@@ -71,7 +72,47 @@ export function assertArtifactSkillRuntimeInput(input: ArtifactSkillRuntimeInput
     if (secret.source !== "worker_injected" || secret.injection !== "env") {
       throw new Error("runtime secrets must be worker-injected env material only");
     }
+    if (typeof secret.secretRef !== "string" || !secret.secretRef.trim()) {
+      throw new Error("runtime secrets must include exact secret refs");
+    }
   }
+}
+
+const SECRET_PATH_PATTERN = /(?:vault\/)?secrets\/[A-Za-z0-9._/-]+/gi;
+const KEY_VALUE_PATTERN = /\b[A-Za-z0-9_]*(?:api[_-]?key|secret|token|password)=[^\s&]+/gi;
+const SECRET_NAME_PATTERN = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*(?:_API_KEY|_API_TOKEN|_TOKEN|_SECRET|_PASSWORD|_KEY)\b/g;
+
+export function redactArtifactSkillRuntimeText(text: string, sensitiveValues: readonly string[] = []): string {
+  let redacted = text;
+  for (const value of sensitiveValues) {
+    if (!value) continue;
+    redacted = redacted.replace(new RegExp(`\\b${escapeRegExp(value)}=([^\\s&]+)`, "g"), "[REDACTED]");
+    redacted = redacted.split(value).join("[REDACTED]");
+  }
+  return redacted
+    .replace(SECRET_PATH_PATTERN, "[REDACTED]")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [REDACTED]")
+    .replace(KEY_VALUE_PATTERN, "[REDACTED]")
+    .replace(SECRET_NAME_PATTERN, "[REDACTED]");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function redactArtifactSkillRuntimeOutput<T>(value: T, sensitiveValues: readonly string[] = []): T {
+  if (typeof value === "string") {
+    return redactArtifactSkillRuntimeText(value, sensitiveValues) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactArtifactSkillRuntimeOutput(entry, sensitiveValues)) as T;
+  }
+  if (!value || typeof value !== "object") return value;
+  const redacted: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    redacted[key] = redactArtifactSkillRuntimeOutput(entry, sensitiveValues);
+  }
+  return redacted as T;
 }
 
 export function createStubArtifactSkillRuntime(): ArtifactSkillRuntime {
@@ -103,8 +144,5 @@ export function createStubArtifactSkillRuntime(): ArtifactSkillRuntime {
 
 export function redactArtifactSkillRuntimeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  return message
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [REDACTED]")
-    .replace(/(api[_-]?key|secret|token)=([^\s&]+)/gi, "$1=[REDACTED]")
-    .replace(/(OPENAI_API_KEY|REDPILL_API_KEY|PHALA_CLOUD_API_KEY)=([^\s&]+)/g, "$1=[REDACTED]");
+  return redactArtifactSkillRuntimeText(message, []);
 }

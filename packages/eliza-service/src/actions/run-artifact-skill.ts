@@ -11,7 +11,8 @@
 // contract-shaped output. TC-73 will wire real provider/credential paths.
 //
 // Errors thrown here are surfaced via handlePostTool → ToolError; message text
-// is passed through redactArtifactSkillRuntimeError so no Bearer/api_key/env
+// is passed through redactArtifactSkillRuntimeError and runtime output is
+// passed through redactArtifactSkillRuntimeOutput so no Bearer/api_key/env
 // secret material can leak into the response body.
 
 import type { Action, Plugin } from "@elizaos/core";
@@ -19,6 +20,7 @@ import {
   RUN_ARTIFACT_SKILL,
   assertArtifactSkillRuntimeInput,
   createStubArtifactSkillRuntime,
+  redactArtifactSkillRuntimeOutput,
   redactArtifactSkillRuntimeError,
   type ArtifactSkillRuntimeInput,
 } from "@tinycloud/agent-client";
@@ -79,7 +81,10 @@ export const runArtifactSkillAction: Action = {
 
     const runtime = createStubArtifactSkillRuntime();
     try {
-      const output = await runtime.run(args);
+      const sensitiveValues = args.secretEnv
+        ?.flatMap((secret) => [secret.secretRef, secret.name])
+        .filter((value): value is string => typeof value === "string" && value.length > 0) ?? [];
+      const output = redactArtifactSkillRuntimeOutput(await runtime.run(args), sensitiveValues);
       return {
         success: true,
         text: "",

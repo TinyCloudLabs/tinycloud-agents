@@ -88,7 +88,9 @@ export {
   RUN_ARTIFACT_SKILL,
   assertArtifactSkillRuntimeInput,
   createStubArtifactSkillRuntime,
+  redactArtifactSkillRuntimeOutput,
   redactArtifactSkillRuntimeError,
+  redactArtifactSkillRuntimeText,
 } from "./artifact-skill-runtime";
 export type {
   ArtifactSkillRuntime,

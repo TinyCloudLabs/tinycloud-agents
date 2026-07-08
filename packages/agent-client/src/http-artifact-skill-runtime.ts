@@ -19,6 +19,7 @@
 import {
   RUN_ARTIFACT_SKILL,
   assertArtifactSkillRuntimeInput,
+  redactArtifactSkillRuntimeOutput,
   redactArtifactSkillRuntimeError,
   type ArtifactSkillRuntime,
   type ArtifactSkillRuntimeInput,
@@ -173,7 +174,10 @@ export function createHttpArtifactSkillRuntime(
         );
       }
 
-      return data;
+      const sensitiveValues = input.secretEnv
+        ?.flatMap((secret) => [secret.secretRef, secret.name])
+        .filter((value): value is string => typeof value === "string" && value.length > 0) ?? [];
+      return redactArtifactSkillRuntimeOutput(data, sensitiveValues);
     },
   };
 }

@@ -3,6 +3,7 @@ import {
   RUN_ARTIFACT_SKILL,
   assertArtifactSkillRuntimeInput,
   createStubArtifactSkillRuntime,
+  redactArtifactSkillRuntimeOutput,
   redactArtifactSkillRuntimeError,
   type ArtifactSkillRuntimeInput,
 } from "./artifact-skill-runtime.ts";
@@ -77,6 +78,7 @@ test("runtime input only accepts worker-injected env secrets", () => {
         secretEnv: [
           {
             name: "OPENAI_API_KEY",
+            secretRef: "vault/secrets/scoped/feed/OPENAI_API_KEY",
             injection: "env",
             stageId: "generate",
             source: "worker_injected",
@@ -87,10 +89,64 @@ test("runtime input only accepts worker-injected env secrets", () => {
   ).not.toThrow();
 });
 
+test("runtime input rejects worker-injected env secrets without exact secret refs", () => {
+  expect(() =>
+    assertArtifactSkillRuntimeInput(
+      input({
+        secretEnv: [
+          {
+            name: "OPENAI_API_KEY",
+            injection: "env",
+            stageId: "generate",
+            source: "worker_injected",
+          },
+        ],
+      }),
+    ),
+  ).toThrow(/exact secret refs/);
+});
+
+test("runtime output redaction removes secret paths and inline secret material", () => {
+  const output = redactArtifactSkillRuntimeOutput(
+    {
+      trace: {
+        procedureVersion: "test.v1",
+        modelCalls: 1,
+        toolCalls: [
+          { name: "demo", purpose: "secretRef=vault/secrets/scoped/feed/OPENAI_API_KEY missing OPENAI_API_KEY" },
+        ],
+        stageTrace: [
+          {
+            stageId: "stub",
+            declaredCapabilities: [],
+            grantedCapabilities: [],
+            authorityUsed: false,
+            deniedReasons: ["Bearer sk-live-abc123", "missing OPENAI_API_KEY", "api_key=plain-secret"],
+          },
+        ],
+        droppedCandidates: [{ reason: "vault/secrets/scoped/feed/OPENAI_API_KEY" }],
+      },
+      candidates: [
+        {
+          title: "uses vault/secrets/scoped/feed/OPENAI_API_KEY",
+          body: { text: "OPENAI_API_KEY=sk-test" },
+        },
+      ],
+    },
+    ["vault/secrets/scoped/feed/OPENAI_API_KEY"],
+  );
+
+  expect(JSON.stringify(output)).not.toContain("vault/secrets/scoped/feed/OPENAI_API_KEY");
+  expect(JSON.stringify(output)).not.toContain("OPENAI_API_KEY");
+  expect(JSON.stringify(output)).not.toContain("sk-live-abc123");
+  expect(JSON.stringify(output)).not.toContain("plain-secret");
+  expect(JSON.stringify(output)).not.toContain("sk-test");
+});
+
 test("runtime error redaction removes provider credentials and bearer material", () => {
   const message = redactArtifactSkillRuntimeError(
     new Error(
-      "failed Bearer abc.def.ghi OPENAI_API_KEY=sk-test REDPILL_API_KEY=rp-test api_key=plain",
+      "failed Bearer abc.def.ghi missing OPENAI_API_KEY OPENAI_API_KEY=sk-test REDPILL_API_KEY=rp-test api_key=plain",
     ),
   );
 
@@ -98,5 +154,6 @@ test("runtime error redaction removes provider credentials and bearer material",
   expect(message).not.toContain("sk-test");
   expect(message).not.toContain("rp-test");
   expect(message).not.toContain("plain");
+  expect(message).not.toContain("OPENAI_API_KEY");
   expect(message).toContain("[REDACTED]");
 });
