@@ -117,7 +117,7 @@ export function createHttpArtifactSkillRuntime(
           body: JSON.stringify({ args: input }),
           signal: controller.signal,
         });
-      } catch (err) {
+      } catch {
         if (controller.signal.aborted) {
           throw new Error(
             redactArtifactSkillRuntimeError(
@@ -127,7 +127,7 @@ export function createHttpArtifactSkillRuntime(
         }
         throw new Error(
           redactArtifactSkillRuntimeError(
-            `run_artifact_skill request failed: ${err instanceof Error ? err.message : String(err)}`,
+            "run_artifact_skill request failed",
           ),
         );
       } finally {
@@ -137,22 +137,18 @@ export function createHttpArtifactSkillRuntime(
       let parsed: unknown;
       try {
         parsed = await response.json();
-      } catch (err) {
+      } catch {
         throw new Error(
           redactArtifactSkillRuntimeError(
-            `run_artifact_skill returned non-JSON response (status ${response.status}): ${
-              err instanceof Error ? err.message : String(err)
-            }`,
+            `run_artifact_skill returned non-JSON response (status ${response.status})`,
           ),
         );
       }
 
       if (!response.ok) {
-        const code =
-          isRecord(parsed) && typeof parsed.error === "string" ? parsed.error : "unknown";
         throw new Error(
           redactArtifactSkillRuntimeError(
-            `run_artifact_skill failed with status ${response.status}: ${code}`,
+            `run_artifact_skill failed with status ${response.status}`,
           ),
         );
       }

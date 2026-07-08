@@ -242,10 +242,16 @@ describe("createHttpArtifactSkillRuntime — adapter behavior", () => {
   it("throws a redacted error on 502 tool_failed responses", async () => {
     const h = track(
       spawn(async () =>
-        new Response(JSON.stringify({ error: "tool_failed" }), {
-          status: 502,
-          headers: { "content-type": "application/json" },
-        }),
+        new Response(
+          JSON.stringify({
+            error: "tool_failed secretRef=vault/secrets/scoped/feed/OPENAI_API_KEY OPENAI_API_KEY=sk-oai-abc",
+            body: { text: "PLANTED_BODY_MARKER_123" },
+          }),
+          {
+            status: 502,
+            headers: { "content-type": "application/json" },
+          },
+        ),
       ),
     );
     const runtime = createHttpArtifactSkillRuntime({
@@ -262,8 +268,11 @@ describe("createHttpArtifactSkillRuntime — adapter behavior", () => {
     expect(caught).toBeInstanceOf(Error);
     const message = (caught as Error).message;
     expect(message).toMatch(/502/);
-    expect(message).toMatch(/tool_failed/);
     expect(message).not.toContain(BAD_BEARER_SNIPPET);
+    expect(message).not.toContain("tool_failed");
+    expect(message).not.toContain("vault/secrets/scoped/feed/OPENAI_API_KEY");
+    expect(message).not.toContain("OPENAI_API_KEY");
+    expect(message).not.toContain("PLANTED_BODY_MARKER_123");
   });
 
   it("throws a redacted error on 401 unauthorized responses (without leaking the bearer)", async () => {

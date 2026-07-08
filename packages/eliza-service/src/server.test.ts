@@ -283,6 +283,50 @@ describe("eliza-service HTTP server", () => {
     expect(await res.json()).toEqual({ error: "unauthorized" });
   });
 
+  it("POST /messages unexpected errors are logged without leaking secret-shaped bodies", async () => {
+    const { host } = makeMessageHost({
+      preflightError: new Error(
+        "preflight failed secretRef=vault/secrets/scoped/feed/OPENAI_API_KEY "
+          + "OPENAI_API_KEY=sk-openai-xyz Bearer sk-live-abc123 "
+          + "body=PLANTED_BODY_MARKER_456",
+      ),
+    });
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map((value) => String(value)).join(" "));
+    };
+
+    try {
+      server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+      const res = await fetch(url("/messages"), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "Authorization": `Bearer ${TEST_SERVICE_SECRET}`,
+        },
+        body: JSON.stringify({
+          agentId: TEST_AGENT_ID,
+          entityId: TEST_ENTITY_ID,
+          roomId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          text: "hello",
+        }),
+      });
+
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ error: "internal_error" });
+    } finally {
+      console.error = originalError;
+    }
+
+    const logText = errors.join("\n");
+    expect(logText).toContain("[eliza-service] unhandled request error");
+    expect(logText).not.toContain("vault/secrets/scoped/feed/OPENAI_API_KEY");
+    expect(logText).not.toContain("OPENAI_API_KEY=sk-openai-xyz");
+    expect(logText).not.toContain("sk-live-abc123");
+    expect(logText).not.toContain("PLANTED_BODY_MARKER_456");
+  });
+
   it("GET /sessions/:entityId without auth returns 401", async () => {
     const { host } = makeHost();
     server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
