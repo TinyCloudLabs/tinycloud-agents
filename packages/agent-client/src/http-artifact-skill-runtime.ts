@@ -99,6 +99,16 @@ export function createHttpArtifactSkillRuntime(
     async run(input: ArtifactSkillRuntimeInput): Promise<ArtifactSkillRuntimeOutput> {
       assertArtifactSkillRuntimeInput(input);
 
+      // Compute sensitive-value scrub list ONCE up front so every thrown Error
+      // in this function — timeout, network failure, non-2xx, malformed
+      // envelope, malformed output — routes through the same redaction pass.
+      // These are the operator-supplied secretRef / env-var names for this
+      // run; they may not match the built-in redaction patterns (custom vault
+      // prefixes, lowercase names, etc.) so we scrub them explicitly.
+      const sensitiveValues = input.secretEnv
+        ?.flatMap((secret) => [secret.secretRef, secret.name])
+        .filter((value): value is string => typeof value === "string" && value.length > 0) ?? [];
+
       const controller = new AbortController();
       const timeoutMs = input.runtimePolicy.timeoutMs;
       const timer =
@@ -122,12 +132,14 @@ export function createHttpArtifactSkillRuntime(
           throw new Error(
             redactArtifactSkillRuntimeError(
               `run_artifact_skill request timed out after ${timeoutMs}ms`,
+              sensitiveValues,
             ),
           );
         }
         throw new Error(
           redactArtifactSkillRuntimeError(
             "run_artifact_skill request failed",
+            sensitiveValues,
           ),
         );
       } finally {
@@ -141,6 +153,7 @@ export function createHttpArtifactSkillRuntime(
         throw new Error(
           redactArtifactSkillRuntimeError(
             `run_artifact_skill returned non-JSON response (status ${response.status})`,
+            sensitiveValues,
           ),
         );
       }
@@ -149,6 +162,7 @@ export function createHttpArtifactSkillRuntime(
         throw new Error(
           redactArtifactSkillRuntimeError(
             `run_artifact_skill failed with status ${response.status}`,
+            sensitiveValues,
           ),
         );
       }
@@ -157,6 +171,7 @@ export function createHttpArtifactSkillRuntime(
         throw new Error(
           redactArtifactSkillRuntimeError(
             "run_artifact_skill returned malformed envelope",
+            sensitiveValues,
           ),
         );
       }
@@ -166,13 +181,11 @@ export function createHttpArtifactSkillRuntime(
         throw new Error(
           redactArtifactSkillRuntimeError(
             "run_artifact_skill returned malformed ArtifactSkillRuntimeOutput",
+            sensitiveValues,
           ),
         );
       }
 
-      const sensitiveValues = input.secretEnv
-        ?.flatMap((secret) => [secret.secretRef, secret.name])
-        .filter((value): value is string => typeof value === "string" && value.length > 0) ?? [];
       return redactArtifactSkillRuntimeOutput(data, sensitiveValues);
     },
   };

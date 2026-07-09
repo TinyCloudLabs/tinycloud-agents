@@ -142,7 +142,10 @@ export function createStubArtifactSkillRuntime(): ArtifactSkillRuntime {
   };
 }
 
-export function redactArtifactSkillRuntimeError(error: unknown): string {
+export function redactArtifactSkillRuntimeError(
+  error: unknown,
+  sensitiveValues: readonly string[] = [],
+): string {
   const message = error instanceof Error ? error.message : String(error);
-  return redactArtifactSkillRuntimeText(message, []);
+  return redactArtifactSkillRuntimeText(message, sensitiveValues);
 }

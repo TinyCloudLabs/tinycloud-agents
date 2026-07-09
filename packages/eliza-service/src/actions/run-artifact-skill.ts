@@ -69,11 +69,22 @@ export const runArtifactSkillAction: Action = {
       );
     }
 
+    // Compute the sensitive-value scrub list ONCE up front so every downstream
+    // error path — assertion failure, runtime.run() failure, output redaction —
+    // uses the same operator-supplied secretRef / env-var name allowlist. These
+    // may not match the built-in redactor patterns (custom vault prefixes,
+    // lowercase names, etc.) so we scrub them explicitly on top of pattern
+    // matches. Derived before the assertion so an assertion that ever grows to
+    // embed input values will still be scrubbed on the way out.
+    const sensitiveValues = args.secretEnv
+      ?.flatMap((secret) => [secret.secretRef, secret.name])
+      .filter((value): value is string => typeof value === "string" && value.length > 0) ?? [];
+
     try {
       assertArtifactSkillRuntimeInput(args);
     } catch (err) {
       throw new ToolError(
-        redactArtifactSkillRuntimeError(err),
+        redactArtifactSkillRuntimeError(err, sensitiveValues),
         400,
         "invalid_args",
       );
@@ -81,9 +92,6 @@ export const runArtifactSkillAction: Action = {
 
     const runtime = createStubArtifactSkillRuntime();
     try {
-      const sensitiveValues = args.secretEnv
-        ?.flatMap((secret) => [secret.secretRef, secret.name])
-        .filter((value): value is string => typeof value === "string" && value.length > 0) ?? [];
       const output = redactArtifactSkillRuntimeOutput(await runtime.run(args), sensitiveValues);
       return {
         success: true,
@@ -92,7 +100,7 @@ export const runArtifactSkillAction: Action = {
       };
     } catch (err) {
       throw new ToolError(
-        redactArtifactSkillRuntimeError(err),
+        redactArtifactSkillRuntimeError(err, sensitiveValues),
         502,
         "artifact_skill_failed",
       );

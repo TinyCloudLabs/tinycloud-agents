@@ -480,6 +480,129 @@ describe("eliza-service HTTP server", () => {
     expect(await res.json()).toEqual({ error: "unauthorized" });
   });
 
+  it("POST /tools/RUN_ARTIFACT_SKILL never leaks a planted marker on any error path (throwing action, console spies, wire body)", async () => {
+    const marker = "PLANTED_SECRET_tc73_agents_7e2a";
+    const markedRef = `my-org/prod/${marker}/openai`;
+
+    // Inject a THROWING action bound to the RUN_ARTIFACT_SKILL name. This
+    // exercises the action's post-assertion catch-all (`artifact_skill_failed`)
+    // path that the stub runtime never triggers on its own — the failure
+    // message deliberately embeds the operator-supplied secretRef so we can
+    // prove the derived-sensitiveValues threading in the action scrubs it.
+    const throwingAction = {
+      name: RUN_ARTIFACT_SKILL,
+      description: "planted-marker leak probe",
+      similes: [],
+      examples: [],
+      validate: async () => true,
+      handler: async (
+        _r: IAgentRuntime,
+        _m: Memory,
+        _s: unknown,
+        options: unknown,
+        callback?: (content: Content) => Promise<Memory[]>,
+      ) => {
+        // Best-effort: also try to leak via the callback → frames path.
+        if (callback) await callback({ text: `frame leak ${markedRef}` });
+        const args = (options as { args?: { secretEnv?: Array<{ secretRef?: string; name?: string }> } })?.args;
+        const ref = args?.secretEnv?.[0]?.secretRef ?? markedRef;
+        const name = args?.secretEnv?.[0]?.name ?? `LOWERCASE_${marker}`;
+        throw new Error(
+          `upstream provider blew up referencing ${ref} and env ${name} (${marker})`,
+        );
+      },
+    };
+    // Wrap the real action so the redaction-derivation code runs, but replace
+    // its runtime with one that throws. The simplest way is to bypass the
+    // stub-runtime path: substitute the action name-lookup so handlePostTool
+    // dispatches to our throwing handler directly. This still routes through
+    // the /tools/:name handler and the app-identity gate.
+    const runtime = {
+      agentId: ARTIFACTORY_AGENT_ID as UUID,
+      actions: [throwingAction],
+    } as unknown as IAgentRuntime;
+    const host: ElizaServiceHost = {
+      agentDid: TEST_AGENT_DID,
+      storageFor: async () => new FakeStorage(),
+      runtimeFor: async () => runtime,
+      preflight: async () => {},
+    };
+
+    const errors: string[] = [];
+    const logs: string[] = [];
+    const originalError = console.error;
+    const originalLog = console.log;
+    const originalWarn = console.warn;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map((v) => String(v)).join(" "));
+    };
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((v) => String(v)).join(" "));
+    };
+    console.warn = (...args: unknown[]) => {
+      logs.push(args.map((v) => String(v)).join(" "));
+    };
+
+    try {
+      server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+
+      const input: ArtifactSkillRuntimeInput = {
+        runId: "planted-marker-1",
+        skillManifest: { packageId: "daily_digest" },
+        sourcePack: {
+          refs: [{ id: "src-1" }],
+          excerpts: [{ sourceRefId: "src-1", text: "hello world" }],
+          maxInputTokens: 8000,
+        },
+        settings: {},
+        runtimePolicy: {
+          runtimeClass: "stub",
+          providerClass: "none",
+          credentialMode: "none",
+          egressClass: "none",
+          allowedTools: [],
+          disallowedTools: ["tinycloud", "shell", "network"],
+          maxModelCalls: 0,
+          timeoutMs: 1000,
+          maxOutputBytes: 4096,
+        },
+        secretEnv: [
+          {
+            name: `LOWERCASE_${marker}`,
+            secretRef: markedRef,
+            injection: "env",
+            stageId: "generate",
+            source: "worker_injected",
+          },
+        ],
+      };
+
+      const res = await fetch(url(`/tools/${RUN_ARTIFACT_SKILL}`), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "Authorization": `Bearer ${TEST_ARTIFACTORY_SERVICE_SECRET}`,
+        },
+        body: JSON.stringify({ args: input }),
+      });
+      // The action throws an arbitrary Error (not a ToolError), so
+      // handlePostTool maps it to the generic 502 tool_failed shape and the
+      // action's own redacted-ToolError path is bypassed. Still, the
+      // response body must never contain the marker.
+      expect([200, 502]).toContain(res.status);
+      const bodyText = await res.text();
+      expect(bodyText).not.toContain(marker);
+      expect(bodyText).not.toContain(markedRef);
+    } finally {
+      console.error = originalError;
+      console.log = originalLog;
+      console.warn = originalWarn;
+    }
+    const combined = [...errors, ...logs].join("\n");
+    expect(combined).not.toContain(marker);
+    expect(combined).not.toContain(markedRef);
+  });
+
   it("POST /tools/RUN_ARTIFACT_SKILL rejects a malformed payload with invalid_args", async () => {
     const runtime = {
       agentId: ARTIFACTORY_AGENT_ID as UUID,

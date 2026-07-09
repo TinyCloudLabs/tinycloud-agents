@@ -157,3 +157,29 @@ test("runtime error redaction removes provider credentials and bearer material",
   expect(message).not.toContain("OPENAI_API_KEY");
   expect(message).toContain("[REDACTED]");
 });
+
+// Planted-marker: a "vault-shaped" secretRef that does NOT match the built-in
+// SECRET_PATH_PATTERN / SECRET_NAME_PATTERN / KEY_VALUE_PATTERN patterns (custom
+// prefix, lowercase, no =value suffix) is a real leak class that only the
+// sensitiveValues allowlist can catch. Regression guard for the runtime
+// callers threading `input.secretEnv` into `redactArtifactSkillRuntimeError`.
+test("runtime error redaction scrubs sensitiveValues that miss the built-in patterns", () => {
+  const marker = "PLANTED_SECRET_tc73_agents_7e2a";
+  const message = redactArtifactSkillRuntimeError(
+    new Error(`upstream referenced my-org/prod/${marker}/openai in stage generate`),
+    [`my-org/prod/${marker}/openai`, marker],
+  );
+  expect(message).not.toContain(marker);
+  expect(message).not.toContain("my-org/prod");
+  expect(message).toContain("[REDACTED]");
+});
+
+test("runtime error redaction tolerates non-Error thrown values while still scrubbing", () => {
+  const marker = "PLANTED_SECRET_tc73_agents_7e2a";
+  const message = redactArtifactSkillRuntimeError(
+    `raw-throw ${marker} api_key=leaked`,
+    [marker],
+  );
+  expect(message).not.toContain(marker);
+  expect(message).not.toContain("leaked");
+});
