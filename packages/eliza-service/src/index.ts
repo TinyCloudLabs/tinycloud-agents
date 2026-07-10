@@ -79,8 +79,8 @@ function readPort(value: string | undefined): number {
 }
 
 if ((import.meta as ImportMeta & { main?: boolean }).main) {
-  void main().catch((err) => {
-    console.error(err instanceof Error ? err.message : String(err));
+  void main().catch(() => {
+    console.error("@tinycloud/eliza-service fatal startup error");
     process.exit(1);
   });
 }

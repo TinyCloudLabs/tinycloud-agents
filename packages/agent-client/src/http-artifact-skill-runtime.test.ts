@@ -242,10 +242,16 @@ describe("createHttpArtifactSkillRuntime — adapter behavior", () => {
   it("throws a redacted error on 502 tool_failed responses", async () => {
     const h = track(
       spawn(async () =>
-        new Response(JSON.stringify({ error: "tool_failed" }), {
-          status: 502,
-          headers: { "content-type": "application/json" },
-        }),
+        new Response(
+          JSON.stringify({
+            error: "tool_failed secretRef=vault/secrets/scoped/feed/OPENAI_API_KEY OPENAI_API_KEY=sk-oai-abc",
+            body: { text: "PLANTED_BODY_MARKER_123" },
+          }),
+          {
+            status: 502,
+            headers: { "content-type": "application/json" },
+          },
+        ),
       ),
     );
     const runtime = createHttpArtifactSkillRuntime({
@@ -262,8 +268,11 @@ describe("createHttpArtifactSkillRuntime — adapter behavior", () => {
     expect(caught).toBeInstanceOf(Error);
     const message = (caught as Error).message;
     expect(message).toMatch(/502/);
-    expect(message).toMatch(/tool_failed/);
     expect(message).not.toContain(BAD_BEARER_SNIPPET);
+    expect(message).not.toContain("tool_failed");
+    expect(message).not.toContain("vault/secrets/scoped/feed/OPENAI_API_KEY");
+    expect(message).not.toContain("OPENAI_API_KEY");
+    expect(message).not.toContain("PLANTED_BODY_MARKER_123");
   });
 
   it("throws a redacted error on 401 unauthorized responses (without leaking the bearer)", async () => {
@@ -437,5 +446,210 @@ describe("createHttpArtifactSkillRuntime — adapter behavior", () => {
     const message = (caught as Error).message;
     expect(message).not.toContain("sk-live-secret-token");
     expect(message).not.toContain("sk-oai-abc");
+  });
+
+  // Planted-marker regression: operator-supplied secretRef material (custom
+  // vault prefix, lowercase name) is threaded through `input.secretEnv` into
+  // every error path AND the 200 output redactor. The marker must NEVER appear
+  // in thrown Errors, in the returned ArtifactSkillRuntimeOutput, or on any
+  // console.* method the adapter might touch.
+  describe("planted-marker redaction (input.secretEnv → error paths + output)", () => {
+    const MARKER = "PLANTED_SECRET_tc73_agents_7e2a";
+    const MARKED_REF = `my-org/prod/${MARKER}/openai`;
+
+    function markedInput() {
+      return makeContractRuntimeInput({
+        secretEnv: [
+          {
+            // secret.name is the *env var* the runtime expects. In real use this
+            // is often an all-caps identifier; here we use the bare marker so
+            // any raw appearance of the marker anywhere in the redactor's input
+            // is caught by the sensitiveValues allowlist (proving the wiring
+            // covers bare-token forms, not just KEY=value or vault/ path forms).
+            name: MARKER,
+            secretRef: MARKED_REF,
+            injection: "env",
+            stageId: "stub",
+            source: "worker_injected",
+          },
+        ],
+      });
+    }
+
+    async function withConsoleSpy<T>(fn: () => Promise<T>): Promise<{ result: T; logText: string }> {
+      const captured: string[] = [];
+      const originalError = console.error;
+      const originalLog = console.log;
+      const originalWarn = console.warn;
+      const originalInfo = console.info;
+      const push = (...args: unknown[]) => {
+        captured.push(args.map((value) => (value instanceof Error ? value.message : String(value))).join(" "));
+      };
+      console.error = push;
+      console.log = push;
+      console.warn = push;
+      console.info = push;
+      try {
+        const result = await fn();
+        return { result, logText: captured.join("\n") };
+      } finally {
+        console.error = originalError;
+        console.log = originalLog;
+        console.warn = originalWarn;
+        console.info = originalInfo;
+      }
+    }
+
+    it("scrubs the marker from a 502 non-2xx error path (body embeds the marker)", async () => {
+      const h = track(
+        spawn(async () =>
+          new Response(
+            JSON.stringify({
+              error: `upstream ${MARKED_REF} LOWERCASE_${MARKER} api_key=${MARKER}`,
+            }),
+            { status: 502, headers: { "content-type": "application/json" } },
+          ),
+        ),
+      );
+      const runtime = createHttpArtifactSkillRuntime({ baseUrl: h.baseUrl, serviceSecret: BEARER });
+
+      const { logText } = await withConsoleSpy(async () => {
+        let caught: unknown;
+        try {
+          await runtime.run(markedInput());
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        const message = (caught as Error).message;
+        expect(message).toMatch(/502/);
+        expect(message).not.toContain(MARKER);
+        expect(message).not.toContain(MARKED_REF);
+      });
+      expect(logText).not.toContain(MARKER);
+    });
+
+    it("scrubs the marker from a malformed-envelope path (server 200 with garbage body)", async () => {
+      const h = track(
+        spawn(async () =>
+          new Response(
+            JSON.stringify({ envelope_from: MARKED_REF, marker: MARKER }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        ),
+      );
+      const runtime = createHttpArtifactSkillRuntime({ baseUrl: h.baseUrl, serviceSecret: BEARER });
+
+      const { logText } = await withConsoleSpy(async () => {
+        let caught: unknown;
+        try {
+          await runtime.run(markedInput());
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        const message = (caught as Error).message;
+        expect(message).toMatch(/malformed envelope/);
+        expect(message).not.toContain(MARKER);
+        expect(message).not.toContain(MARKED_REF);
+      });
+      expect(logText).not.toContain(MARKER);
+    });
+
+    it("scrubs the marker from a non-JSON response error", async () => {
+      const h = track(
+        spawn(async () =>
+          new Response(`<html>${MARKED_REF} ${MARKER}</html>`, {
+            status: 502,
+            headers: { "content-type": "text/html" },
+          }),
+        ),
+      );
+      const runtime = createHttpArtifactSkillRuntime({ baseUrl: h.baseUrl, serviceSecret: BEARER });
+
+      const { logText } = await withConsoleSpy(async () => {
+        let caught: unknown;
+        try {
+          await runtime.run(markedInput());
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        const message = (caught as Error).message;
+        expect(message).toMatch(/non-JSON/);
+        expect(message).not.toContain(MARKER);
+        expect(message).not.toContain(MARKED_REF);
+      });
+      expect(logText).not.toContain(MARKER);
+    });
+
+    it("scrubs the marker from a 200 body that embeds it verbatim (candidate + trace)", async () => {
+      const h = track(
+        spawn(async () =>
+          new Response(
+            JSON.stringify({
+              ok: true,
+              tool: RUN_ARTIFACT_SKILL,
+              result: {
+                data: {
+                  ...stubOutput(),
+                  candidates: [
+                    {
+                      title: `uses ${MARKED_REF}`,
+                      body: { text: `LOWERCASE_${MARKER}=${MARKER}` },
+                    },
+                  ],
+                  trace: {
+                    ...stubOutput().trace,
+                    toolCalls: [{ name: "demo", purpose: `secretRef=${MARKED_REF}` }],
+                    stageTrace: [
+                      {
+                        stageId: "stub",
+                        declaredCapabilities: [],
+                        grantedCapabilities: [],
+                        authorityUsed: false,
+                        deniedReasons: [`missing ${MARKER}`],
+                      },
+                    ],
+                  },
+                },
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        ),
+      );
+      const runtime = createHttpArtifactSkillRuntime({ baseUrl: h.baseUrl, serviceSecret: BEARER });
+
+      const output = await runtime.run(markedInput());
+      const serialized = JSON.stringify(output);
+      expect(serialized).not.toContain(MARKER);
+      expect(serialized).not.toContain(MARKED_REF);
+      expect(serialized).toContain("[REDACTED]");
+    });
+
+    it("scrubs the marker on a network error path (fetch rejects with a marker-embedded reason)", async () => {
+      const runtime = createHttpArtifactSkillRuntime({
+        baseUrl: "http://127.0.0.1:1",
+        serviceSecret: BEARER,
+        fetch: (async () => {
+          throw new Error(`connect ECONNREFUSED ${MARKED_REF} ${MARKER}`);
+        }) as unknown as typeof fetch,
+      });
+
+      const { logText } = await withConsoleSpy(async () => {
+        let caught: unknown;
+        try {
+          await runtime.run(markedInput());
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        const message = (caught as Error).message;
+        expect(message).not.toContain(MARKER);
+        expect(message).not.toContain(MARKED_REF);
+      });
+      expect(logText).not.toContain(MARKER);
+    });
   });
 });

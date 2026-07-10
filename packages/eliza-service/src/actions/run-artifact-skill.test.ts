@@ -135,4 +135,113 @@ describe("runArtifactSkillAction", () => {
     expect(redacted).not.toContain("OPENAI_API_KEY");
     expect(redacted).toContain("[REDACTED]");
   });
+
+  // Planted-marker regression: operator-supplied secret material (custom vault
+  // prefix / lowercase name) must be scrubbed from the redactor even when the
+  // caller threads it in as `sensitiveValues`. This backstops the action
+  // wiring that derives sensitiveValues from args.secretEnv up front and
+  // passes it into `redactArtifactSkillRuntimeError` on both error paths.
+  it("scrubs operator-shaped sensitiveValues even when they miss the built-in patterns", () => {
+    const marker = "PLANTED_SECRET_tc73_agents_7e2a";
+    const markedRef = `my-org/prod/${marker}/openai`;
+    const redacted = redactArtifactSkillRuntimeError(
+      new Error(`runtime.run failed referencing ${markedRef} and env LOWERCASE_${marker}`),
+      [markedRef, `LOWERCASE_${marker}`, marker],
+    );
+    expect(redacted).not.toContain(marker);
+    expect(redacted).not.toContain(markedRef);
+    expect(redacted).toContain("[REDACTED]");
+  });
+
+  it("scrubs a planted marker end-to-end when secretEnv-bearing args trip the input assertion", async () => {
+    const marker = "PLANTED_SECRET_tc73_agents_7e2a";
+    const markedRef = `my-org/prod/${marker}/openai`;
+
+    // Force `assertArtifactSkillRuntimeInput` into its ambient-authority branch
+    // so the action wraps the assertion error via redactArtifactSkillRuntimeError.
+    // The input carries a planted secretRef in secretEnv; the action must
+    // thread that value into the redactor so nothing downstream can leak it.
+    const invalid = validInput({
+      runtimePolicy: {
+        ...validInput().runtimePolicy,
+        allowedTools: ["tinycloud"],
+      },
+      secretEnv: [
+        {
+          name: `LOWERCASE_${marker}`,
+          secretRef: markedRef,
+          injection: "env",
+          stageId: "generate",
+          source: "worker_injected",
+        },
+      ],
+    });
+
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map((v) => String(v)).join(" "));
+    };
+
+    try {
+      const result = await handlePostTool(
+        "run_artifact_skill",
+        AGENT_ID,
+        { args: invalid as unknown as Record<string, unknown> },
+        host(),
+      );
+      expect(result.status).toBe(400);
+      expect(result.body).toEqual({ error: "invalid_args" });
+      // handlePostTool only surfaces the error CODE in the response; the
+      // ToolError.message never reaches the wire on the 400 path. This
+      // assertion pins that contract: the response body must not contain the
+      // marker even if the message did (it doesn't, but the shape of the wire
+      // response is the load-bearing invariant).
+      const serialized = JSON.stringify(result.body);
+      expect(serialized).not.toContain(marker);
+      expect(serialized).not.toContain(markedRef);
+    } finally {
+      console.error = originalError;
+    }
+    expect(errors.join("\n")).not.toContain(marker);
+    expect(errors.join("\n")).not.toContain(markedRef);
+  });
+
+  it("rejects malformed secretEnv through the redacted invalid_args path", async () => {
+    const marker = "PLANTED_SECRET_tc73_agents_malformed_8f4c";
+    const markedRef = `my-org/prod/${marker}/openai`;
+    const invalid = {
+      ...validInput(),
+      secretEnv: {
+        name: `LOWERCASE_${marker}`,
+        secretRef: markedRef,
+        injection: "env",
+        stageId: "generate",
+        source: "worker_injected",
+      },
+    };
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map((value) => String(value)).join(" "));
+    };
+
+    try {
+      const result = await handlePostTool(
+        "run_artifact_skill",
+        AGENT_ID,
+        { args: invalid as unknown as Record<string, unknown> },
+        host(),
+      );
+      expect(result.status).toBe(400);
+      expect(result.body).toEqual({ error: "invalid_args" });
+      expect(JSON.stringify(result.body)).not.toContain(marker);
+      expect(JSON.stringify(result.body)).not.toContain(markedRef);
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(errors.join("\n")).not.toContain(marker);
+    expect(errors.join("\n")).not.toContain(markedRef);
+  });
 });

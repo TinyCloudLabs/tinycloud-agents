@@ -144,14 +144,10 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
       }
 
       return json(404, { error: "not_found" });
-    } catch (err) {
-      // Surface the cause (message + stack only — never the request body, which may
-      // carry the serialized delegation per the security invariant) so an
-      // unexpected handler throw is debuggable instead of a silent 500.
-      console.error(
-        "[eliza-service] unhandled request error:",
-        err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err),
-      );
+    } catch {
+      // Unexpected handler throws are intentionally logged without details to
+      // avoid leaking request bodies or downstream secret-bearing payloads.
+      console.error("[eliza-service] unhandled request error");
       return json(500, { error: "internal_error" });
     }
   };
