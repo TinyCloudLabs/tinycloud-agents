@@ -206,4 +206,42 @@ describe("runArtifactSkillAction", () => {
     expect(errors.join("\n")).not.toContain(marker);
     expect(errors.join("\n")).not.toContain(markedRef);
   });
+
+  it("rejects malformed secretEnv through the redacted invalid_args path", async () => {
+    const marker = "PLANTED_SECRET_tc73_agents_malformed_8f4c";
+    const markedRef = `my-org/prod/${marker}/openai`;
+    const invalid = {
+      ...validInput(),
+      secretEnv: {
+        name: `LOWERCASE_${marker}`,
+        secretRef: markedRef,
+        injection: "env",
+        stageId: "generate",
+        source: "worker_injected",
+      },
+    };
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map((value) => String(value)).join(" "));
+    };
+
+    try {
+      const result = await handlePostTool(
+        "run_artifact_skill",
+        AGENT_ID,
+        { args: invalid as unknown as Record<string, unknown> },
+        host(),
+      );
+      expect(result.status).toBe(400);
+      expect(result.body).toEqual({ error: "invalid_args" });
+      expect(JSON.stringify(result.body)).not.toContain(marker);
+      expect(JSON.stringify(result.body)).not.toContain(markedRef);
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(errors.join("\n")).not.toContain(marker);
+    expect(errors.join("\n")).not.toContain(markedRef);
+  });
 });

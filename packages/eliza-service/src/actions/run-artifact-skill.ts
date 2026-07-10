@@ -46,7 +46,20 @@ function isArtifactSkillRuntimeInput(value: unknown): value is ArtifactSkillRunt
   if (typeof rp.maxModelCalls !== "number") return false;
   if (typeof rp.timeoutMs !== "number") return false;
   if (typeof rp.maxOutputBytes !== "number") return false;
+  if (value.secretEnv !== undefined && !Array.isArray(value.secretEnv)) return false;
   return true;
+}
+
+function secretEnvSensitiveValues(value: unknown): string[] {
+  if (!isRecord(value) || value.secretEnv === undefined) return [];
+  const entries = Array.isArray(value.secretEnv) ? value.secretEnv : [value.secretEnv];
+  return entries.flatMap((entry) => {
+    if (typeof entry === "string") return entry.length > 0 ? [entry] : [];
+    if (!isRecord(entry)) return [];
+    return [entry.secretRef, entry.name].filter(
+      (candidate): candidate is string => typeof candidate === "string" && candidate.length > 0,
+    );
+  });
 }
 
 export const runArtifactSkillAction: Action = {
@@ -61,9 +74,13 @@ export const runArtifactSkillAction: Action = {
   validate: async () => true,
   handler: async (_runtime, _message, _state, options) => {
     const args = (options as { args?: Record<string, unknown> } | undefined)?.args;
+    const sensitiveValues = secretEnvSensitiveValues(args);
     if (!isArtifactSkillRuntimeInput(args)) {
       throw new ToolError(
-        "run_artifact_skill: invalid ArtifactSkillRuntimeInput payload",
+        redactArtifactSkillRuntimeError(
+          new Error("run_artifact_skill: invalid ArtifactSkillRuntimeInput payload"),
+          sensitiveValues,
+        ),
         400,
         "invalid_args",
       );
@@ -76,10 +93,6 @@ export const runArtifactSkillAction: Action = {
     // lowercase names, etc.) so we scrub them explicitly on top of pattern
     // matches. Derived before the assertion so an assertion that ever grows to
     // embed input values will still be scrubbed on the way out.
-    const sensitiveValues = args.secretEnv
-      ?.flatMap((secret) => [secret.secretRef, secret.name])
-      .filter((value): value is string => typeof value === "string" && value.length > 0) ?? [];
-
     try {
       assertArtifactSkillRuntimeInput(args);
     } catch (err) {
