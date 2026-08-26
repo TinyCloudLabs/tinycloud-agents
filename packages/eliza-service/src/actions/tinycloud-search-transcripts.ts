@@ -1,3 +1,6 @@
+import type { Action, Content, Memory, Plugin } from "@elizaos/core";
+import { ToolError } from "../handlers/tools.js";
+
 /**
  * Fixed-name action contract.  The implementation deliberately accepts no SQL,
  * TinyCloud path, space, or caller-controlled result limit.
@@ -46,6 +49,23 @@ export interface TranscriptMetadata {
 export interface TranscriptReader {
   listMetadata(): Promise<TranscriptMetadata[]>;
   getTranscript(source: TranscriptMetadata["source"], sourceId: string): Promise<string | null>;
+}
+
+/*
+ * This registry is intentionally capability-only: it stores a reader factory, never
+ * a transcript body or a prior result.  The session/activation layer installs a
+ * per-entity factory after it has activated that entity's separate transcript
+ * delegation.  Keeping this seam here makes the action directly testable while
+ * preventing a tool invocation from selecting a path, SQL statement, or entity.
+ */
+const readers = new Map<string, () => Promise<TranscriptReader>>();
+
+export function registerTranscriptReader(entityId: string, reader: () => Promise<TranscriptReader>): void {
+  readers.set(entityId, reader);
+}
+
+export function clearTranscriptReader(entityId: string): void {
+  readers.delete(entityId);
 }
 
 interface TranscriptExcerpt {
@@ -155,3 +175,42 @@ export async function searchTranscripts(
     data,
   };
 }
+
+/** Registered Eliza action backing POST /tools/tinycloud_search_transcripts. */
+export const tinycloudSearchTranscriptsAction: Action = {
+  name: "TINYCLOUD_SEARCH_TRANSCRIPTS",
+  description: "Search the caller's delegated TinyCloud meeting transcripts.",
+  similes: [TINYCLOUD_SEARCH_TRANSCRIPTS],
+  examples: [],
+  validate: async (_runtime, message, _state, options) => {
+    const args = (options as { args?: Record<string, unknown> } | undefined)?.args
+      ?? { query: message.content?.text };
+    return parseTranscriptSearchArgs(args) !== null;
+  },
+  handler: async (_runtime, message: Memory, _state, options, callback) => {
+    const raw = (options as { args?: Record<string, unknown> } | undefined)?.args
+      ?? { query: message.content?.text };
+    const args = parseTranscriptSearchArgs(raw);
+    if (!args) throw new ToolError("invalid transcript tool arguments", 400, "invalid_args");
+    const factory = readers.get(message.entityId);
+    if (!factory) throw new ToolError("transcript delegation required", 409, "delegation_required");
+    let reader: TranscriptReader;
+    try {
+      reader = await factory();
+    } catch {
+      throw new ToolError("transcript delegation unavailable", 409, "delegation_expired");
+    }
+    const result = await searchTranscripts(reader, args);
+    // Only the bounded final result is handed to the calling model.  The registry
+    // retains no plaintext and callback frames deliberately carry no evidence.
+    const content: Content = { text: result.text };
+    if (callback) await callback(content);
+    return { success: true, text: result.text, data: result.data };
+  },
+};
+
+export const tinycloudSearchTranscriptsPlugin: Plugin = {
+  name: "tinycloud-search-transcripts",
+  description: "Bounded read-only delegated TinyCloud transcript retrieval.",
+  actions: [tinycloudSearchTranscriptsAction],
+};

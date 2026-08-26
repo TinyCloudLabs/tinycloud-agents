@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { parseTranscriptSearchArgs, searchTranscripts } from "./tinycloud-search-transcripts.js";
+import {
+  clearTranscriptReader,
+  parseTranscriptSearchArgs,
+  registerTranscriptReader,
+  searchTranscripts,
+  tinycloudSearchTranscriptsPlugin,
+} from "./tinycloud-search-transcripts.js";
 
 describe("tinycloud_search_transcripts arguments", () => {
   test("accepts only the bounded public contract", () => {
@@ -15,6 +21,25 @@ describe("tinycloud_search_transcripts arguments", () => {
 });
 
 describe("tinycloud_search_transcripts retrieval bounds", () => {
+  test("is registered and resolves only the calling entity's delegated reader", async () => {
+    const action = tinycloudSearchTranscriptsPlugin.actions?.[0];
+    expect(action?.name).toBe("TINYCLOUD_SEARCH_TRANSCRIPTS");
+    registerTranscriptReader("entity-a", async () => ({
+      listMetadata: async () => [{ source: "fireflies", sourceId: "a", title: "Canary", startedAt: null }],
+      getTranscript: async () => "the final choice is ember compass",
+    }));
+    const result = await action!.handler(
+      {} as never,
+      { entityId: "entity-a", content: { text: "choice" } } as never,
+      undefined,
+      { args: { query: "choice" } },
+      undefined,
+      [],
+    );
+    clearTranscriptReader("entity-a");
+    expect(result?.data).toMatchObject({ matches: [{ citation: "[T1]" }] });
+  });
+
   test("returns cited, injection-fenced evidence through fixed reader calls", async () => {
     const reads: string[] = [];
     const result = await searchTranscripts({
