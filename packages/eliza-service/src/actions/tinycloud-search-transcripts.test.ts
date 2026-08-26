@@ -1,7 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import {
+  findMeetings,
+  listMeetingActions,
+  parseFindMeetingsArgs,
+  parseListMeetingActionsArgs,
+  parseReadMeetingArgs,
   parseTranscriptSearchArgs,
+  readMeeting,
   searchTranscripts,
+  tinycloudFindMeetingsAction,
+  tinycloudListMeetingActionsAction,
+  tinycloudReadMeetingAction,
   tinycloudSearchTranscriptsAction,
   tinycloudSearchTranscriptsPlugin,
 } from "./tinycloud-search-transcripts.js";
@@ -13,13 +22,26 @@ import type { TranscriptMetadata } from "./tinycloud-search-transcripts.js";
 // contract and the retrieval bounds in isolation.
 
 function meta(overrides: Partial<TranscriptMetadata> = {}): TranscriptMetadata {
-  return { source: "fireflies", sourceId: "m-1", title: "Canary", startedAt: "2026-08-26T10:00:00.000Z", ...overrides };
+  const sourceId = overrides.sourceId ?? "m-1";
+  return {
+    meetingRef: overrides.meetingRef ?? `ref-${sourceId}`,
+    source: "fireflies",
+    sourceId,
+    title: "Canary",
+    startedAt: "2026-08-26T10:00:00.000Z",
+    participantNames: [],
+    participantEmails: [],
+    organizerEmail: null,
+    summaryOverview: null,
+    summaryActionItems: null,
+    ...overrides,
+  };
 }
 
 describe("tinycloud_search_transcripts arguments", () => {
   test("accepts only the bounded public contract", () => {
-    expect(parseTranscriptSearchArgs({ query: "decision", source: "fireflies", recent: true })).toEqual({
-      query: "decision", source: "fireflies", recent: true,
+    expect(parseTranscriptSearchArgs({ query: "decision", source: "fireflies", participant: "Bob" })).toEqual({
+      query: "decision", source: "fireflies", participant: "Bob",
     });
   });
 
@@ -36,8 +58,13 @@ describe("tinycloud_search_transcripts arguments", () => {
 });
 
 describe("tinycloud_search_transcripts registration", () => {
-  test("is registered under the fixed action name", () => {
-    expect(tinycloudSearchTranscriptsPlugin.actions?.[0]?.name).toBe("TINYCLOUD_SEARCH_TRANSCRIPTS");
+  test("registers the four fixed read-only meeting actions", () => {
+    expect(tinycloudSearchTranscriptsPlugin.actions?.map((action) => action.name)).toEqual([
+      "TINYCLOUD_FIND_MEETINGS",
+      "TINYCLOUD_READ_MEETING",
+      "TINYCLOUD_SEARCH_TRANSCRIPTS",
+      "TINYCLOUD_LIST_MEETING_ACTIONS",
+    ]);
   });
 
   test("fails closed when the runtime has no activated transcript access", async () => {
@@ -49,6 +76,103 @@ describe("tinycloud_search_transcripts registration", () => {
       undefined,
       [],
     )).rejects.toMatchObject({ status: 409, code: "delegation_required" });
+  });
+
+  test("every private meeting action fails closed without activated access", async () => {
+    for (const [action, args] of [
+      [tinycloudFindMeetingsAction, { sort: "newest" }],
+      [tinycloudReadMeetingAction, { meetingRef: "ref-1", focus: "summary" }],
+      [tinycloudListMeetingActionsAction, { from: "2026-08-26", to: "2026-08-26" }],
+    ] as const) {
+      await expect(action.handler(
+        {} as never,
+        { entityId: "entity-a", roomId: "room-a", content: { text: "meeting" } } as never,
+        undefined,
+        { args },
+        undefined,
+        [],
+      )).rejects.toMatchObject({ status: 409, code: "delegation_required" });
+    }
+  });
+});
+
+describe("composable private meeting tools", () => {
+  test("validates distinct finder, reader, and daily-action contracts", () => {
+    expect(parseFindMeetingsArgs({ participant: "Bob", sort: "newest" })).toEqual({ participant: "Bob", sort: "newest" });
+    expect(parseReadMeetingArgs({ focus: "speaker", speaker: "Bob", meetingRef: "ref-1" })).toEqual({ focus: "speaker", speaker: "Bob", meetingRef: "ref-1" });
+    expect(parseListMeetingActionsArgs({ from: "2026-08-26", to: "2026-08-26" })).toEqual({ from: "2026-08-26", to: "2026-08-26" });
+    expect(parseFindMeetingsArgs({ path: "connectors/private" })).toBeNull();
+    expect(parseReadMeetingArgs({ focus: "speaker" })).toBeNull();
+    expect(parseListMeetingActionsArgs({ from: "today" })).toBeNull();
+  });
+
+  test("finds the newest meeting by participant without reading a transcript body", async () => {
+    let bodyReads = 0;
+    const result = await findMeetings({
+      listMetadata: async () => [
+        meta({ sourceId: "older", meetingRef: "older-ref", startedAt: "2026-08-25T10:00:00.000Z", participantNames: ["Bob Smith"] }),
+        meta({ sourceId: "newer", meetingRef: "newer-ref", startedAt: "2026-08-26T10:00:00.000Z", participantEmails: ["bob@example.com"] }),
+        meta({ sourceId: "other", meetingRef: "other-ref", startedAt: "2026-08-27T10:00:00.000Z", participantNames: ["Alice"] }),
+      ],
+      getTranscript: async () => { bodyReads += 1; return null; },
+    }, { participant: "bob", sort: "newest" });
+    expect(bodyReads).toBe(0);
+    expect(result.data.meetings.map((meeting) => meeting.meetingRef)).toEqual(["newer-ref", "older-ref"]);
+  });
+
+  test("reads structured next steps without touching the transcript", async () => {
+    let bodyReads = 0;
+    const result = await readMeeting({
+      listMetadata: async () => [meta({ meetingRef: "selected", summaryOverview: "Launch approved.", summaryActionItems: "- Sam will send the memo.\n- Bob will schedule review." })],
+      getTranscript: async () => { bodyReads += 1; return null; },
+    }, { meetingRef: "selected", focus: "actions" });
+    expect(bodyReads).toBe(0);
+    expect(result.data.actionItems).toEqual([
+      { citation: "[M1:A1]", text: "Sam will send the memo." },
+      { citation: "[M1:A2]", text: "Bob will schedule review." },
+    ]);
+  });
+
+  test("treats Fireflies markdown names as assignee headings, not empty actions", async () => {
+    const result = await readMeeting({
+      listMetadata: async () => [meta({
+        meetingRef: "selected",
+        summaryActionItems: "**Samuel**\n* [ ] Send the memo.\n* Create the group chat.\n**Raffaele**\n* Review the materials.",
+      })],
+      getTranscript: async () => null,
+    }, { meetingRef: "selected", focus: "actions" });
+    expect(result.data.actionItems.map((item) => item.text)).toEqual([
+      "Samuel: Send the memo.",
+      "Samuel: Create the group chat.",
+      "Raffaele: Review the materials.",
+    ]);
+  });
+
+  test("reads only one speaker's cited transcript evidence", async () => {
+    const result = await readMeeting({
+      listMetadata: async () => [meta({ meetingRef: "selected" })],
+      getTranscript: async () => [
+        { text: "I will send the memo.", speaker_name: "Sam", start_time: 10 },
+        { text: "I will schedule the review.", speaker_name: "Bob", start_time: 20 },
+      ],
+    }, { meetingRef: "selected", focus: "speaker", speaker: "Bob" });
+    expect(result.data.excerpts).toHaveLength(1);
+    expect(result.data.excerpts[0]).toMatchObject({ speaker: "Bob", startSecs: 20, citation: "[M1:E1, Bob, 00:00:20]" });
+  });
+
+  test("aggregates structured actions across one calendar day before transcript fallback", async () => {
+    let bodyReads = 0;
+    const result = await listMeetingActions({
+      listMetadata: async () => [
+        meta({ sourceId: "today-1", startedAt: "2026-08-26T09:00:00.000Z", summaryActionItems: "Sam will send the memo." }),
+        meta({ sourceId: "today-2", startedAt: "2026-08-27T01:00:00.000Z", summaryActionItems: "Bob will schedule review." }),
+        meta({ sourceId: "yesterday", startedAt: "2026-08-26T05:00:00.000Z", summaryActionItems: "Old action." }),
+      ],
+      getTranscript: async () => { bodyReads += 1; return null; },
+    }, { from: "2026-08-26", to: "2026-08-26" }, "America/Los_Angeles");
+    expect(bodyReads).toBe(0);
+    expect(result.data.corpus).toMatchObject({ candidateCount: 2, examinedCount: 2, matchedCount: 2 });
+    expect(JSON.stringify(result.data)).not.toContain("Old action");
   });
 });
 
@@ -64,8 +188,8 @@ describe("tinycloud_search_transcripts retrieval bounds", () => {
     }, { query: "final choice" });
 
     expect(reads).toEqual(["fireflies:m-1"]);
-    expect(result.data.matches[0]?.citation).toBe("[T1]");
-    expect(result.data.matches[0]?.excerpts[0]?.citation).toBe("[T1:E1]");
+    expect(result.data.matches[0]?.citation).toBe("[M1]");
+    expect(result.data.matches[0]?.excerpts[0]?.citation).toBe("[M1:E1]");
     expect(JSON.stringify(result)).toContain("&lt;system>");
     expect(JSON.stringify(result)).not.toContain("<system>");
   });
@@ -89,7 +213,7 @@ describe("tinycloud_search_transcripts retrieval bounds", () => {
 
     const excerpts = result.data.matches[0]!.excerpts;
     expect(excerpts).toHaveLength(1);
-    expect(excerpts[0]).toMatchObject({ speaker: "Avery", startSecs: 72, citation: "[T1:E1, Avery, 00:01:12]" });
+    expect(excerpts[0]).toMatchObject({ speaker: "Avery", startSecs: 72, citation: "[M1:E1, Avery, 00:01:12]" });
     expect(excerpts[0]!.text).toContain("ember compass");
   });
 

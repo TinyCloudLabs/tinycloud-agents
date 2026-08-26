@@ -52,6 +52,8 @@ export interface PostToolBody {
   roomId?: string;
   /** Tool arguments, e.g. { query } for web search. */
   args?: Record<string, unknown>;
+  /** Server-validated, non-authority context used for local-calendar filtering. */
+  context?: { localDate?: string; timeZone?: string };
 }
 
 export interface ToolResult {
@@ -118,7 +120,7 @@ export async function handlePostTool(
       runtime,
       message,
       undefined,
-      { args: body.args ?? {} },
+      { args: body.args ?? {}, context: body.context },
       callback,
       [],
     );

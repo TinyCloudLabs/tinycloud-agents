@@ -18,7 +18,12 @@ import type { SessionHandlerHost } from "./handlers/sessions.js";
 import { SessionStore } from "./session-store.js";
 import { TranscriptAccessRegistry } from "./transcript-registry.js";
 import type { TranscriptNode } from "./transcript-registry.js";
-import { setTranscriptRegistry, tinycloudSearchTranscriptsAction } from "./actions/tinycloud-search-transcripts.js";
+import {
+  setTranscriptRegistry,
+  tinycloudFindMeetingsAction,
+  tinycloudReadMeetingAction,
+  tinycloudSearchTranscriptsAction,
+} from "./actions/tinycloud-search-transcripts.js";
 import { MEMORY_DB_HANDLE } from "@tinycloud/eliza-plugin-memory";
 
 const AGENT_DID = "did:pkh:eip155:1:0x83cD9777d4128012F878376aCbd6a092DcdDE01c";
@@ -181,14 +186,22 @@ const FIREFLIES_CANARY = [
 
 function corpusA(): Corpus {
   return {
-    rows: [["fireflies", "canary-1", "Agent Retrieval Canary", "2026-08-26T10:00:00.000Z"]],
+    rows: [[
+      "meeting-a", "fireflies", "canary-1", "Agent Retrieval Canary", "2026-08-26T10:00:00.000Z",
+      "avery@example.test", JSON.stringify([{ name: "Avery", email: "avery@example.test" }]),
+      "The team approved ember compass.", "Avery will send the decision memo.",
+    ]],
     bodies: { [`${KV_PATH}fireflies/transcript/canary-1`]: FIREFLIES_CANARY },
   };
 }
 
 function corpusB(): Corpus {
   return {
-    rows: [["fireflies", "other-1", "Someone Else's Meeting", "2026-08-25T10:00:00.000Z"]],
+    rows: [[
+      "meeting-b", "fireflies", "other-1", "Someone Else's Meeting", "2026-08-25T10:00:00.000Z",
+      "blake@example.test", JSON.stringify([{ name: "Blake", email: "blake@example.test" }]),
+      null, null,
+    ]],
     bodies: { [`${KV_PATH}fireflies/transcript/other-1`]: [{ text: "unrelated chatter", speaker_name: "Blake", start_time: 1 }] },
   };
 }
@@ -264,12 +277,12 @@ describe("session registration reaches the production transcript action", () => 
     const data = (result as { data: { corpus: Record<string, number | boolean>; matches: Array<Record<string, unknown>> } }).data;
 
     expect(data.matches).toHaveLength(1);
-    expect(data.matches[0]).toMatchObject({ citation: "[T1]", source: "fireflies", sourceId: "canary-1", title: "Agent Retrieval Canary" });
+    expect(data.matches[0]).toMatchObject({ citation: "[M1]", meetingRef: "meeting-a", source: "fireflies", title: "Agent Retrieval Canary" });
     const excerpts = data.matches[0].excerpts as Array<{ citation: string; text: string; speaker?: string; startSecs?: number }>;
     expect(excerpts[0].text).toContain("ember compass");
     expect(excerpts[0].speaker).toBe("Avery");
     expect(excerpts[0].startSecs).toBe(72);
-    expect(excerpts[0].citation).toBe("[T1:E1, Avery, 00:01:12]");
+    expect(excerpts[0].citation).toBe("[M1:E1, Avery, 00:01:12]");
     expect(data.corpus).toMatchObject({ candidateCount: 1, examinedCount: 1, matchedCount: 1, truncated: false, partial: false });
   });
 
@@ -282,8 +295,32 @@ describe("session registration reaches the production transcript action", () => 
     await runTool(runtime, "entity-a", { query: "ember compass" });
 
     expect(trace.dbs).toEqual([SQL_PATH]);
-    expect(trace.sql).toEqual(["SELECT source, source_id, title, started_at FROM connector_meeting ORDER BY started_at DESC LIMIT 501"]);
+    expect(trace.sql).toEqual(["SELECT id, source, source_id, title, started_at, organizer_email, participants, summary_overview, summary_action_items FROM connector_meeting ORDER BY started_at DESC LIMIT 501"]);
     expect(trace.kvKeys).toEqual([`${KV_PATH}fireflies/transcript/canary-1`]);
+  });
+
+  test("a unique metadata find selects the room for a content-free follow-up read", async () => {
+    const { host, store, runtime, registry } = makeSlice();
+    await handlePostSessions({
+      agentId: AGENT_ID, entityId: "entity-a",
+      session: { version: 2, delegations: { memory: memoryGrant(), transcripts: transcriptGrant() }, roomId: "thread-1" },
+    }, host, store);
+
+    const found = await tinycloudFindMeetingsAction.handler(
+      runtime, { entityId: "entity-a", roomId: "thread-1", content: { text: "latest meeting" } } as never,
+      undefined, { args: { sort: "newest" } }, undefined, [],
+    );
+    expect((found as { data: { meetings: Array<{ meetingRef: string }> } }).data.meetings[0]?.meetingRef).toBe("meeting-a");
+    expect(registry.selectedMeetingFor("entity-a", "thread-1")).toBe("meeting-a");
+
+    // A model may echo the display citation into meetingRef. Citation aliases
+    // are room-local and resolve only through the already-selected meeting.
+    const read = await tinycloudReadMeetingAction.handler(
+      runtime, { entityId: "entity-a", roomId: "thread-1", content: { text: "what next?" } } as never,
+      undefined, { args: { focus: "actions", meetingRef: "[M1]" } }, undefined, [],
+    );
+    expect(JSON.stringify(read)).toContain("send the decision memo");
+    expect(JSON.stringify(read)).toContain("[M1:A1]");
   });
 });
 

@@ -36,6 +36,8 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
   private readonly entries = new Map<string, Entry>();
   private readonly pending = new Map<string, Promise<void>>();
   private readonly roomToEntity = new Map<string, string>();
+  /** Content-free follow-up state; transcript text is never retained here. */
+  private readonly selectedMeetingByRoom = new Map<string, string>();
 
   constructor(
     private readonly args: {
@@ -96,6 +98,20 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
     return createReader(entry.access);
   }
 
+  selectedMeetingFor(entityId: string, roomId?: string): string | null {
+    if (!roomId || this.roomToEntity.get(roomId) !== entityId) return null;
+    return this.selectedMeetingByRoom.get(roomId) ?? null;
+  }
+
+  selectMeeting(entityId: string, roomId: string | undefined, meetingRef: string): void {
+    if (!roomId) return;
+    const roomOwner = this.roomToEntity.get(roomId);
+    if (roomOwner !== undefined && roomOwner !== entityId) throw new NoDelegationError(entityId);
+    if (!this.entries.has(entityId)) throw new NoDelegationError(entityId);
+    this.roomToEntity.set(roomId, entityId);
+    this.selectedMeetingByRoom.set(roomId, meetingRef);
+  }
+
   /** True only while this entity has live, unexpired activated access. */
   has(entityId: string): boolean {
     const entry = this.entries.get(entityId);
@@ -107,6 +123,7 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
   async stop(): Promise<void> {
     this.entries.clear();
     this.roomToEntity.clear();
+    this.selectedMeetingByRoom.clear();
     this.pending.clear();
   }
 
@@ -126,7 +143,11 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
 
   private drop(entityId: string): void {
     this.entries.delete(entityId);
-    for (const [room, owner] of this.roomToEntity) if (owner === entityId) this.roomToEntity.delete(room);
+    for (const [room, owner] of this.roomToEntity) {
+      if (owner !== entityId) continue;
+      this.roomToEntity.delete(room);
+      this.selectedMeetingByRoom.delete(room);
+    }
   }
 
   private evictLru(): void {
@@ -139,7 +160,7 @@ export function createReader(access: Access): TranscriptReader {
   return {
     async listMetadata(): Promise<TranscriptMetadata[]> {
       const response = await access.sql.db(SQL_PATH).query(
-        `SELECT source, source_id, title, started_at FROM connector_meeting ORDER BY started_at DESC LIMIT ${METADATA_ROW_LIMIT}`,
+        `SELECT id, source, source_id, title, started_at, organizer_email, participants, summary_overview, summary_action_items FROM connector_meeting ORDER BY started_at DESC LIMIT ${METADATA_ROW_LIMIT}`,
       ) as { ok?: boolean; data?: { rows?: unknown[][] }; error?: { code?: unknown } };
       if (response?.ok !== true || !Array.isArray(response.data?.rows)) {
         // Keep upstream details out of the tool response, but retain the stable
@@ -150,9 +171,21 @@ export function createReader(access: Access): TranscriptReader {
         throw new Error("metadata unavailable");
       }
       return response.data.rows.flatMap((row): TranscriptMetadata[] => {
-        const [source, sourceId, title, startedAt] = row;
-        if (!isSource(source) || typeof sourceId !== "string") return [];
-        return [{ source, sourceId, title: typeof title === "string" ? title : null, startedAt: typeof startedAt === "string" ? startedAt : null }];
+        const [meetingRef, source, sourceId, title, startedAt, organizerEmail, participants, summaryOverview, summaryActionItems] = row;
+        if (typeof meetingRef !== "string" || !safeMeetingRef(meetingRef) || !isSource(source) || typeof sourceId !== "string") return [];
+        const parsedParticipants = parseParticipants(participants);
+        return [{
+          meetingRef,
+          source,
+          sourceId,
+          title: typeof title === "string" ? title : null,
+          startedAt: typeof startedAt === "string" && Number.isFinite(Date.parse(startedAt)) ? startedAt : null,
+          participantNames: parsedParticipants.names,
+          participantEmails: parsedParticipants.emails,
+          organizerEmail: typeof organizerEmail === "string" ? organizerEmail : null,
+          summaryOverview: typeof summaryOverview === "string" ? summaryOverview : null,
+          summaryActionItems: typeof summaryActionItems === "string" ? summaryActionItems : null,
+        }];
       });
     },
     async getTranscript(source, sourceId): Promise<unknown | null> {
@@ -180,4 +213,26 @@ function isSource(value: unknown): value is TranscriptMetadata["source"] {
 
 function safeSegment(value: string): boolean {
   return value.length > 0 && value.length <= 512 && !value.includes("/") && !value.includes("\\") && !value.includes("..");
+}
+
+function safeMeetingRef(value: string): boolean {
+  return value.length > 0 && value.length <= 128 && /^[A-Za-z0-9._:-]+$/.test(value) && !value.includes("..");
+}
+
+function parseParticipants(value: unknown): { names: string[]; emails: string[] } {
+  let parsed = value;
+  if (typeof value === "string") {
+    try { parsed = JSON.parse(value) as unknown; } catch { return { names: [], emails: [] }; }
+  }
+  if (!Array.isArray(parsed)) return { names: [], emails: [] };
+  const names: string[] = [];
+  const emails: string[] = [];
+  for (const entry of parsed.slice(0, 100)) {
+    if (!entry || typeof entry !== "object") continue;
+    const participant = entry as { name?: unknown; email?: unknown; displayName?: unknown };
+    const name = typeof participant.name === "string" ? participant.name : participant.displayName;
+    if (typeof name === "string" && name.length <= 160) names.push(name);
+    if (typeof participant.email === "string" && participant.email.length <= 254) emails.push(participant.email);
+  }
+  return { names: [...new Set(names)], emails: [...new Set(emails)] };
 }
