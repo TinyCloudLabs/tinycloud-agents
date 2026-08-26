@@ -25,7 +25,16 @@ export function parseTranscriptSearchArgs(args: Record<string, unknown>): Transc
   if (args.to !== undefined && typeof args.to !== "string") return null;
   if (args.recent !== undefined && typeof args.recent !== "boolean") return null;
   if (args.source !== undefined && !["fireflies", "google-meet", "tinycloud-transcriber"].includes(args.source as string)) return null;
-  return args as TranscriptSearchArgs;
+  // The preceding runtime checks establish every property of this narrow tool
+  // contract.  `Record<string, unknown>` cannot express that refinement to TS.
+  return {
+    query: args.query,
+    ...(typeof args.title === "string" ? { title: args.title } : {}),
+    ...(typeof args.from === "string" ? { from: args.from } : {}),
+    ...(typeof args.to === "string" ? { to: args.to } : {}),
+    ...(args.source !== undefined ? { source: args.source as TranscriptSearchArgs["source"] } : {}),
+    ...(typeof args.recent === "boolean" ? { recent: args.recent } : {}),
+  };
 }
 
 /** Fixed TinyChat connector paths. They are never model-controlled. */
