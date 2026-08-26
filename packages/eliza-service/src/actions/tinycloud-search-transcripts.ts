@@ -57,7 +57,7 @@ export interface TranscriptMetadata {
 /** The only I/O seam used by the action; both calls are fixed-path reads. */
 export interface TranscriptReader {
   listMetadata(): Promise<TranscriptMetadata[]>;
-  getTranscript(source: TranscriptMetadata["source"], sourceId: string): Promise<string | null>;
+  getTranscript(source: TranscriptMetadata["source"], sourceId: string): Promise<unknown | null>;
 }
 
 /*
@@ -67,6 +67,17 @@ export interface TranscriptReader {
  * delegation.  Keeping this seam here makes the action directly testable while
  * preventing a tool invocation from selecting a path, SQL statement, or entity.
  */
+interface TranscriptRegistry {
+  readerFor(entityId: string, roomId?: string): TranscriptReader;
+}
+
+let transcriptRegistry: TranscriptRegistry | null = null;
+
+/** Installed by RuntimeHost during production boot; no plaintext is retained here. */
+export function setTranscriptRegistry(registry: TranscriptRegistry | null): void {
+  transcriptRegistry = registry;
+}
+
 const readers = new Map<string, () => Promise<TranscriptReader>>();
 
 export function registerTranscriptReader(entityId: string, reader: () => Promise<TranscriptReader>): void {
@@ -80,6 +91,8 @@ export function clearTranscriptReader(entityId: string): void {
 interface TranscriptExcerpt {
   citation: string;
   text: string;
+  speaker?: string;
+  startSecs?: number;
 }
 
 interface TranscriptMatch {
@@ -103,6 +116,23 @@ function escapeEvidence(text: string): string {
   // Transcript content is evidence, never instructions. Delimiters make that
   // boundary explicit to the synthesis model without changing the source text.
   return text.replace(/<\/?(?:system|tool|assistant|user|instructions?)\b/gi, (token) => token.replace("<", "&lt;"));
+}
+
+function excerptsFor(query: string, transcript: unknown): Array<Omit<TranscriptExcerpt, "citation">> {
+  const sentences = Array.isArray(transcript) ? transcript : null;
+  const entries: Array<{ text: string; speaker?: string; startSecs?: number }> = sentences
+    ? sentences.flatMap((sentence) => {
+        if (!sentence || typeof sentence !== "object") return [];
+        const value = sentence as { text?: unknown; speaker_name?: unknown; start_time?: unknown };
+        if (typeof value.text !== "string") return [];
+        return [{ text: value.text, speaker: typeof value.speaker_name === "string" ? value.speaker_name : undefined, startSecs: typeof value.start_time === "number" ? value.start_time : undefined }];
+      })
+    : typeof transcript === "string" ? [{ text: transcript }] : [];
+  const joined = entries.map((entry) => entry.text).join("\n");
+  const excerpt = excerptFor(query, joined);
+  if (!excerpt) return [];
+  const matched = entries.find((entry) => query.toLowerCase().split(/\s+/).some((term) => term.length > 1 && entry.text.toLowerCase().includes(term)));
+  return [{ text: excerpt, ...(matched?.speaker ? { speaker: matched.speaker } : {}), ...(matched?.startSecs !== undefined ? { startSecs: matched.startSecs } : {}) }];
 }
 
 function excerptFor(query: string, transcript: string): string | null {
@@ -151,7 +181,7 @@ export async function searchTranscripts(
   let examinedCount = 0;
   for (const row of candidates.slice(0, MAX_BODIES)) {
     examinedCount += 1;
-    let transcript: string | null;
+    let transcript: unknown | null;
     try {
       transcript = await reader.getTranscript(row.source, row.sourceId);
     } catch {
@@ -159,8 +189,8 @@ export async function searchTranscripts(
       continue;
     }
     if (!transcript) continue;
-    const excerpt = excerptFor(args.query, transcript);
-    if (!excerpt) continue;
+    const excerpts = excerptsFor(args.query, transcript);
+    if (excerpts.length === 0) continue;
     if (matches.length >= MAX_MATCHES) {
       truncated = true;
       continue;
@@ -169,7 +199,7 @@ export async function searchTranscripts(
     matches.push({
       citation: `[T${index}]`, source: row.source, sourceId: row.sourceId,
       title: row.title, startedAt: row.startedAt,
-      excerpts: [{ citation: `[T${index}:E1]`, text: excerpt }].slice(0, MAX_EXCERPTS_PER_MATCH),
+      excerpts: excerpts.slice(0, MAX_EXCERPTS_PER_MATCH).map((excerpt, excerptIndex) => ({ citation: `[T${index}:E${excerptIndex + 1}]`, ...excerpt })),
     });
   }
   const data = { corpus: { candidateCount, examinedCount, matchedCount: matches.length, truncated, partial }, matches };
@@ -202,11 +232,19 @@ export const tinycloudSearchTranscriptsAction: Action = {
     const args = parseTranscriptSearchArgs(raw);
     if (!args) throw new ToolError("invalid transcript tool arguments", 400, "invalid_args");
     const factory = readers.get(message.entityId);
-    if (!factory) throw new ToolError("transcript delegation required", 409, "delegation_required");
+    if (!factory && !transcriptRegistry) {
+      throw new ToolError("transcript delegation required", 409, "delegation_required");
+    }
     let reader: TranscriptReader;
     try {
-      reader = await factory();
-    } catch {
+      reader = factory
+        ? await factory()
+        : transcriptRegistry?.readerFor(message.entityId, message.roomId) as TranscriptReader;
+      if (!reader) throw new ToolError("transcript delegation required", 409, "delegation_required");
+    } catch (error) {
+      if (error instanceof ToolError || (error as { name?: unknown })?.name === "NoDelegationError") {
+        throw new ToolError("transcript delegation required", 409, "delegation_required");
+      }
       throw new ToolError("transcript delegation unavailable", 409, "delegation_expired");
     }
     const result = await searchTranscripts(reader, args);

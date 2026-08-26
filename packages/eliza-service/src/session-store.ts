@@ -15,6 +15,8 @@ export interface SessionRecord {
   agentId: string;
   /** Stored verbatim — never log or leak this value. */
   serializedDelegation: string;
+  /** V2 only: independently scoped transcript delegation. */
+  serializedTranscriptDelegation?: string;
   roomId?: string;
 }
 

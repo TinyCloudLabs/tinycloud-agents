@@ -132,6 +132,40 @@ export function defaultElizaMemoryPolicy(
   };
 }
 
+/** The deliberately small, read-only TinyChat connector grant used by the transcript tool. */
+export function defaultTinychatTranscriptPolicy(): DelegationPolicy {
+  return {
+    resources: [
+      { serviceLong: "tinycloud.sql", serviceShort: "sql", path: "xyz.tinycloud.tinychat/connectors", requiredActions: [SQL.READ], required: true },
+      { serviceLong: "tinycloud.kv", serviceShort: "kv", path: "xyz.tinycloud.tinychat/connectors/", requiredActions: ["tinycloud.kv/get", "tinycloud.kv/list"], required: true },
+      { serviceLong: "tinycloud.capabilities", serviceShort: "capabilities", path: "", requiredActions: [CAPABILITIES.READ], required: false },
+    ],
+  };
+}
+
+/**
+ * Transcript delegations are attenuation grants, not a minimum permission set:
+ * require every configured resource and reject any additional resource or action.
+ */
+export function validateExactDelegationPolicy(
+  delegation: PortableDelegation,
+  opts: { agentDID: string; policy: DelegationPolicy; now?: Date },
+): void {
+  validateDelegationPolicy(delegation, opts);
+  const resources = delegation.resources ?? [];
+  for (const granted of resources) {
+    const policyResource = opts.policy.resources.find((candidate) => serviceMatches(granted.service, candidate));
+    if (!policyResource || granted.path !== policyResource.path) {
+      throw new DelegationPolicyError("delegation grants a resource outside the transcript policy", "MALFORMED", { field: "resources" });
+    }
+    const allowed = new Set(expandActionShortNames(policyResource.serviceLong, policyResource.requiredActions));
+    const actions = expandActionShortNames(policyResource.serviceLong, granted.actions);
+    if (actions.some((action) => !allowed.has(action))) {
+      throw new DelegationPolicyError("delegation grants an action outside the transcript policy", "INSUFFICIENT_ACTIONS", { field: "resources.actions" });
+    }
+  }
+}
+
 /**
  * Returns true if the given resource service string (short or long form) matches the
  * policy resource. The PolicyResource carries both forms (serviceLong / serviceShort),

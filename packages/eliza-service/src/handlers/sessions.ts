@@ -22,6 +22,10 @@ import {
   validateDelegationPolicy,
   defaultElizaMemoryPolicy,
   evaluateDelegationStatus,
+  defaultTinychatTranscriptPolicy,
+  deserializeAndNormalize,
+  signedOwnerAddress,
+  validateExactDelegationPolicy,
   DelegationShapeError,
   DelegationPolicyError,
 } from "@tinycloud/agent-client";
@@ -37,14 +41,17 @@ export interface SessionHandlerHost {
   storageFor(agentId: string): Promise<{
     registerDelegation(entityId: string, serialized: string, roomId?: string): Promise<void>;
   }>;
+  registerTranscriptDelegation?(agentId: string, entityId: string, serializedDelegation: string, roomId?: string): Promise<void>;
 }
 
 export interface PostSessionsBody {
   agentId: string;
   entityId: string;
   /** Opaque serialized delegation — never log or leak. */
-  serializedDelegation: string;
+  serializedDelegation?: string;
   roomId?: string;
+  /** V2 envelope. v1 serializedDelegation remains accepted during migration. */
+  session?: { version: 2; delegations: { memory: string; transcripts: string }; roomId?: string };
 }
 
 export interface HandlerResult {
@@ -57,7 +64,12 @@ export async function handlePostSessions(
   host: SessionHandlerHost,
   store: SessionStore,
 ): Promise<HandlerResult> {
-  const { agentId, entityId, serializedDelegation, roomId } = body;
+  const { agentId, entityId } = body;
+  const envelope = body.session;
+  const serializedDelegation = envelope?.delegations.memory ?? body.serializedDelegation;
+  const serializedTranscriptDelegation = envelope?.delegations.transcripts;
+  const roomId = envelope?.roomId ?? body.roomId;
+  if (typeof serializedDelegation !== "string") return { status: 400, body: { error: "invalid_body" } };
   const policy = defaultElizaMemoryPolicy();
 
   // 1. Deserialize
@@ -66,6 +78,31 @@ export async function handlePostSessions(
     deleg = deserializeDelegationSafe(serializedDelegation);
   } catch {
     return { status: 400, body: { error: "malformed" } };
+  }
+
+  // V2 has a separately activated fixed-policy transcript grant. Its signed att,
+  // not top-level summaries, is the only capability input accepted here.
+  let transcriptDelegation: ReturnType<typeof deserializeAndNormalize> | undefined;
+  if (serializedTranscriptDelegation !== undefined) {
+    try {
+      transcriptDelegation = deserializeAndNormalize(serializedTranscriptDelegation);
+      validateExactDelegationPolicy(transcriptDelegation, {
+        agentDID: host.agentDid,
+        policy: defaultTinychatTranscriptPolicy(),
+      });
+      const expiry = transcriptDelegation.expiry instanceof Date ? transcriptDelegation.expiry : new Date(transcriptDelegation.expiry as unknown as string);
+      if (expiry.getTime() - Date.now() > 7 * 24 * 60 * 60 * 1000) {
+        return { status: 400, body: { error: "delegation_expiry_too_long" } };
+      }
+      const memoryOwner = signedOwnerAddress(deserializeAndNormalize(serializedDelegation));
+      const transcriptOwner = signedOwnerAddress(transcriptDelegation);
+      if (!memoryOwner || !transcriptOwner || memoryOwner.toLowerCase() !== transcriptOwner.toLowerCase()) {
+        return { status: 400, body: { error: "wrong_delegator" } };
+      }
+    } catch (e) {
+      if (e instanceof DelegationPolicyError) return { status: 400, body: { error: (e.reason as string).toLowerCase() } };
+      return { status: 400, body: { error: "malformed" } };
+    }
   }
 
   // 2. Shape validation (shallow: ownerAddress, delegateDID, expiry, SQL presence)
@@ -94,14 +131,18 @@ export async function handlePostSessions(
   // 4. Register via B's seam — the ONLY write path from C into B's registry
   const storage = await host.storageFor(agentId);
   await storage.registerDelegation(entityId, serializedDelegation, roomId);
+  if (serializedTranscriptDelegation) {
+    if (!host.registerTranscriptDelegation) return { status: 503, body: { error: "transcript_unavailable" } };
+    await host.registerTranscriptDelegation(agentId, entityId, serializedTranscriptDelegation, roomId);
+  }
 
   // 5. Record in C-local store so GET /sessions can re-evaluate liveness without
   //    touching entity-registry.ts (B's frozen keystone)
-  store.set(entityId, { agentId, serializedDelegation, roomId });
+  store.set(entityId, { agentId, serializedDelegation, serializedTranscriptDelegation, roomId });
 
   // 6. Return liveness status
   const status = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: host.agentDid });
-  return { status: 200, body: { entityId, status } };
+  return { status: 200, body: { entityId, status: serializedTranscriptDelegation ? status : status } };
 }
 
 export async function handleGetSessions(
@@ -135,6 +176,21 @@ export async function handleGetSessions(
       };
     }
     throw e;
+  }
+
+  if (record.serializedTranscriptDelegation) {
+    try {
+      const transcript = deserializeAndNormalize(record.serializedTranscriptDelegation);
+      const transcriptStatus = evaluateDelegationStatus({
+        delegation: transcript,
+        policy: defaultTinychatTranscriptPolicy(),
+        agentDID: host.agentDid,
+      });
+      if (transcriptStatus !== "active") delegStatus = transcriptStatus;
+    } catch (e) {
+      if (e instanceof DelegationPolicyError && e.reason === "EXPIRED") delegStatus = "expired";
+      else return { status: 400, body: { error: "invalid_transcript_delegation" } };
+    }
   }
 
   return { status: 200, body: { entityId, status: delegStatus } };
