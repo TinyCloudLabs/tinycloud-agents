@@ -83,6 +83,26 @@ function transcriptGrant(opts: {
   } as unknown as PortableDelegation);
 }
 
+function cidTranscriptGrant(owner = OWNER_A): string {
+  const cid = "bafy-transcript-cid-test";
+  return serializeDelegation({
+    cid,
+    delegateDID: AGENT_DID,
+    spaceId: space(owner),
+    path: SQL_PATH,
+    actions: ["tinycloud.sql/read", "tinycloud.kv/get", "tinycloud.kv/list"],
+    resources: [
+      { service: "tinycloud.sql", space: space(owner), path: SQL_PATH, actions: ["tinycloud.sql/read"] },
+      { service: "tinycloud.kv", space: space(owner), path: KV_PATH, actions: ["tinycloud.kv/get", "tinycloud.kv/list"] },
+    ],
+    expiry: new Date(Date.now() + 60 * 60 * 1000),
+    ownerAddress: owner,
+    chainId: 1,
+    host: "https://node.tinycloud.xyz",
+    delegationHeader: { Authorization: `Bearer ${cid}` },
+  } as unknown as PortableDelegation);
+}
+
 function memoryGrant(owner = OWNER_A): string {
   const att = {
     [`${space(owner)}/sql/${MEMORY_DB_HANDLE}`]: {
@@ -141,7 +161,8 @@ function fakeNodeFactory(corpusFor: (privateKey: string) => Corpus, trace: NodeT
           },
         },
         kv: {
-          async get(key: string) {
+          async get(key: string, options?: { prefix?: string }) {
+            expect(options).toEqual({ prefix: "" });
             trace.kvKeys.push(key);
             if (!(key in corpus.bodies)) return { ok: false, error: { code: "KV_NOT_FOUND" } };
             return { ok: true, data: { data: JSON.stringify(corpus.bodies[key]) } };
@@ -414,6 +435,17 @@ describe("GET /sessions reports both grants", () => {
     await handlePostSessions({
       agentId: AGENT_ID, entityId: "entity-a",
       session: { version: 2, delegations: { memory: memoryGrant(), transcripts: transcriptGrant() } },
+    }, host, store);
+    const got = await handleGetSessions("entity-a", host, store);
+    expect(got.status).toBe(200);
+    expect(got.body).toMatchObject({ entityId: "entity-a", status: "active", transcriptStatus: "active" });
+  });
+
+  test("keeps a current SDK CID-backed transcript grant active on liveness polls", async () => {
+    const { host, store } = makeSlice();
+    await handlePostSessions({
+      agentId: AGENT_ID, entityId: "entity-a",
+      session: { version: 2, delegations: { memory: memoryGrant(), transcripts: cidTranscriptGrant() } },
     }, host, store);
     const got = await handleGetSessions("entity-a", host, store);
     expect(got.status).toBe(200);

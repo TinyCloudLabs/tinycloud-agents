@@ -24,6 +24,7 @@ import {
   evaluateDelegationStatus,
   defaultTinychatTranscriptPolicy,
   deserializeAndNormalize,
+  deserializeTranscriptDelegationForActivation,
   signedOwnerAddress,
   validateExactDelegationPolicy,
   DelegationShapeError,
@@ -80,12 +81,13 @@ export async function handlePostSessions(
     return { status: 400, body: { error: "malformed" } };
   }
 
-  // V2 has a separately activated fixed-policy transcript grant. Its signed att,
-  // not top-level summaries, is the only capability input accepted here.
-  let transcriptDelegation: ReturnType<typeof deserializeAndNormalize> | undefined;
+  // V2 has a separately activated fixed-policy transcript grant. Compact UCANs
+  // are normalized from signed att; current CID-backed children are policy-
+  // checked here and cryptographically verified by the host during activation.
+  let transcriptDelegation: ReturnType<typeof deserializeTranscriptDelegationForActivation> | undefined;
   if (serializedTranscriptDelegation !== undefined) {
     try {
-      transcriptDelegation = deserializeAndNormalize(serializedTranscriptDelegation);
+      transcriptDelegation = deserializeTranscriptDelegationForActivation(serializedTranscriptDelegation);
       validateExactDelegationPolicy(transcriptDelegation, {
         agentDID: host.agentDid,
         policy: defaultTinychatTranscriptPolicy(),
@@ -201,7 +203,7 @@ export async function handleGetSessions(
   let transcriptStatus: string | undefined;
   if (record.serializedTranscriptDelegation) {
     try {
-      const transcript = deserializeAndNormalize(record.serializedTranscriptDelegation);
+      const transcript = deserializeTranscriptDelegationForActivation(record.serializedTranscriptDelegation);
       transcriptStatus = evaluateDelegationStatus({
         delegation: transcript,
         policy: defaultTinychatTranscriptPolicy(),

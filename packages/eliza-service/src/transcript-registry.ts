@@ -1,14 +1,13 @@
 import {
   TinyCloudNode,
   defaultTinychatTranscriptPolicy,
-  deserializeAndNormalize,
+  deserializeTranscriptDelegationForActivation,
   validateExactDelegationPolicy,
 } from "@tinycloud/agent-client";
 import { DelegationExpiredError, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
 import type { TranscriptMetadata, TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
 
 const SQL_PATH = "xyz.tinycloud.tinychat/connectors";
-const KV_PREFIX = `${SQL_PATH}/`;
 const MAX_ENTRIES = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_MAX_CLIENTS) || 256;
 const TTL_MS = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_TTL_MS) || 4 * 60 * 60 * 1000;
 /** Bounded discovery: one row over the policy ceiling is the overflow sentinel. */
@@ -16,7 +15,7 @@ const METADATA_ROW_LIMIT = 501;
 
 type Access = {
   sql: { db(name: string): { query(sql: string): Promise<unknown> } };
-  kv: { get(key: string): Promise<unknown> };
+  kv: { get(key: string, options?: { prefix?: string }): Promise<unknown> };
 };
 
 /** The delegated-node surface this registry uses; injectable for tests. */
@@ -112,7 +111,7 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
   }
 
   private async activate(entityId: string, serialized: string, roomId?: string): Promise<void> {
-    const delegation = deserializeAndNormalize(serialized);
+    const delegation = deserializeTranscriptDelegationForActivation(serialized);
     validateExactDelegationPolicy(delegation, { agentDID: this.args.agentDid, policy: defaultTinychatTranscriptPolicy() });
     const expiry = delegation.expiry instanceof Date ? delegation.expiry : new Date(delegation.expiry as unknown as string);
     const node = this.args.nodeFactory
@@ -141,8 +140,15 @@ export function createReader(access: Access): TranscriptReader {
     async listMetadata(): Promise<TranscriptMetadata[]> {
       const response = await access.sql.db(SQL_PATH).query(
         `SELECT source, source_id, title, started_at FROM connector_meeting ORDER BY started_at DESC LIMIT ${METADATA_ROW_LIMIT}`,
-      ) as { ok?: boolean; data?: { rows?: unknown[][] } };
-      if (response?.ok !== true || !Array.isArray(response.data?.rows)) throw new Error("metadata unavailable");
+      ) as { ok?: boolean; data?: { rows?: unknown[][] }; error?: { code?: unknown } };
+      if (response?.ok !== true || !Array.isArray(response.data?.rows)) {
+        // Keep upstream details out of the tool response, but retain the stable
+        // service code in process logs so operators can distinguish an auth
+        // contract mismatch from a storage outage without logging user data.
+        const code = typeof response?.error?.code === "string" ? response.error.code : "unknown";
+        console.warn(`[transcript-registry] metadata query failed (${code})`);
+        throw new Error("metadata unavailable");
+      }
       return response.data.rows.flatMap((row): TranscriptMetadata[] => {
         const [source, sourceId, title, startedAt] = row;
         if (!isSource(source) || typeof sourceId !== "string") return [];
@@ -151,8 +157,12 @@ export function createReader(access: Access): TranscriptReader {
     },
     async getTranscript(source, sourceId): Promise<unknown | null> {
       if (!isSource(source) || !safeSegment(sourceId)) throw new Error("invalid stored metadata");
-      const key = `${KV_PREFIX}${source}/transcript/${sourceId}`;
-      const response = await access.kv.get(key) as { ok?: boolean; error?: { code?: string }; data?: { data?: unknown } };
+      // DelegatedAccess configures an automatic KV prefix from the portable
+      // delegation's compatibility path. Use the fixed full connector key and
+      // explicitly disable that automatic prefix, or the SDK doubles the path
+      // and turns an existing transcript into KV_NOT_FOUND.
+      const key = `${SQL_PATH}/${source}/transcript/${sourceId}`;
+      const response = await access.kv.get(key, { prefix: "" }) as { ok?: boolean; error?: { code?: string }; data?: { data?: unknown } };
       if (response?.ok !== true) {
         if (response?.error?.code === "KV_NOT_FOUND") return null;
         throw new Error("transcript unavailable");

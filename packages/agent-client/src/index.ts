@@ -109,7 +109,7 @@ export type { AgentIdentity } from "./agent-identity";
 export { defaultElizaMemoryPolicy, defaultTinychatTranscriptPolicy, deserializeDelegationSafe, assertWellFormed, validateDelegationPolicy, validateExactDelegationPolicy, computePolicyHash, evaluateDelegationStatus } from "./delegation-policy";
 export type { DelegationPolicy, PolicyResource } from "./delegation-policy";
 
-export { deserializeAndNormalize, normalizeDelegationGrants, signedOwnerAddress } from "./delegation-normalize";
+export { deserializeAndNormalize, deserializeTranscriptDelegationForActivation, normalizeDelegationGrants, signedOwnerAddress } from "./delegation-normalize";
 
 export { serializeDelegation, deserializeDelegation } from "@tinycloud/node-sdk";
 export { TinyCloudNode } from "@tinycloud/node-sdk";
