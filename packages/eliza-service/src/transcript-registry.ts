@@ -5,17 +5,25 @@ import {
   validateExactDelegationPolicy,
 } from "@tinycloud/agent-client";
 import { DelegationExpiredError, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
-import type { TranscriptMetadata, TranscriptReader } from "./actions/tinycloud-search-transcripts.js";
+import type { TranscriptMetadata, TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
 
 const SQL_PATH = "xyz.tinycloud.tinychat/connectors";
 const KV_PREFIX = `${SQL_PATH}/`;
 const MAX_ENTRIES = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_MAX_CLIENTS) || 256;
 const TTL_MS = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_TTL_MS) || 4 * 60 * 60 * 1000;
+/** Bounded discovery: one row over the policy ceiling is the overflow sentinel. */
+const METADATA_ROW_LIMIT = 501;
 
 type Access = {
   sql: { db(name: string): { query(sql: string): Promise<unknown> } };
   kv: { get(key: string): Promise<unknown> };
 };
+
+/** The delegated-node surface this registry uses; injectable for tests. */
+export interface TranscriptNode {
+  signIn(): Promise<unknown>;
+  useDelegation(delegation: unknown): Promise<unknown>;
+}
 
 interface Entry {
   access: Access;
@@ -25,36 +33,76 @@ interface Entry {
 }
 
 /** Per-entity activated transcript access. It retains only delegated handles, never bodies. */
-export class TranscriptAccessRegistry {
+export class TranscriptAccessRegistry implements TranscriptRegistry {
   private readonly entries = new Map<string, Entry>();
   private readonly pending = new Map<string, Promise<void>>();
   private readonly roomToEntity = new Map<string, string>();
 
   constructor(
-    private readonly args: { agentDid: string; agentKey: string; host: string; maxEntries?: number; ttlMs?: number },
+    private readonly args: {
+      agentDid: string;
+      agentKey: string;
+      host: string;
+      maxEntries?: number;
+      ttlMs?: number;
+      /** Overrides the delegated-node client. Production leaves this unset. */
+      nodeFactory?: (args: { privateKey: string; host: string }) => TranscriptNode;
+    },
   ) {}
 
+  /**
+   * Activate and retain one entity's transcript grant.
+   *
+   * A registration always activates the delegation it was handed: an in-flight
+   * activation for the same entity is awaited (and ignored) first, because
+   * returning it would silently substitute the PREVIOUS grant for a freshly
+   * minted one. A failure is isolated to this entity — it drops that entity's
+   * access and rethrows without touching any other entity's entry.
+   */
   async register(entityId: string, serializedDelegation: string, roomId?: string): Promise<void> {
-    const current = this.entries.get(entityId);
-    if (current) await this.drop(entityId);
     const inFlight = this.pending.get(entityId);
-    if (inFlight) return inFlight;
+    if (inFlight) await inFlight.catch(() => undefined);
+    this.drop(entityId);
     const work = this.activate(entityId, serializedDelegation, roomId);
     this.pending.set(entityId, work);
-    try { await work; } finally { this.pending.delete(entityId); }
+    try {
+      await work;
+    } catch (error) {
+      this.drop(entityId);
+      throw error;
+    } finally {
+      if (this.pending.get(entityId) === work) this.pending.delete(entityId);
+    }
+  }
+
+  /** Drop one entity's access (session stop, replacement, or explicit revocation). */
+  revoke(entityId: string): void {
+    this.drop(entityId);
   }
 
   readerFor(entityId: string, roomId?: string): TranscriptReader {
-    const resolved = roomId ? this.roomToEntity.get(roomId) : entityId;
-    if (!resolved || resolved !== entityId) throw new NoDelegationError(entityId);
+    // Room binding is an ISOLATION check, not an index: a room that another
+    // entity owns must never resolve here. A room this registry has never seen
+    // (tool dispatch synthesizes one when the caller omits it, and a user has
+    // many threads per grant) is simply not a cross-entity collision.
+    const roomOwner = roomId ? this.roomToEntity.get(roomId) : undefined;
+    if (roomOwner !== undefined && roomOwner !== entityId) throw new NoDelegationError(entityId);
     const entry = this.entries.get(entityId);
     if (!entry) throw new NoDelegationError(entityId);
     if (Date.now() >= entry.expiry.getTime() || Date.now() - entry.lastUsed > (this.args.ttlMs ?? TTL_MS)) {
-      void this.drop(entityId);
+      this.drop(entityId);
       throw new DelegationExpiredError(entityId);
     }
     entry.lastUsed = Date.now();
     return createReader(entry.access);
+  }
+
+  /** True only while this entity has live, unexpired activated access. */
+  has(entityId: string): boolean {
+    const entry = this.entries.get(entityId);
+    return entry !== undefined
+      && Date.now() < entry.expiry.getTime()
+      && Date.now() - entry.lastUsed <= (this.args.ttlMs ?? TTL_MS);
   }
 
   async stop(): Promise<void> {
@@ -67,30 +115,32 @@ export class TranscriptAccessRegistry {
     const delegation = deserializeAndNormalize(serialized);
     validateExactDelegationPolicy(delegation, { agentDID: this.args.agentDid, policy: defaultTinychatTranscriptPolicy() });
     const expiry = delegation.expiry instanceof Date ? delegation.expiry : new Date(delegation.expiry as unknown as string);
-    const node = new TinyCloudNode({ privateKey: this.args.agentKey, host: this.args.host });
+    const node = this.args.nodeFactory
+      ? this.args.nodeFactory({ privateKey: this.args.agentKey, host: this.args.host })
+      : new TinyCloudNode({ privateKey: this.args.agentKey, host: this.args.host }) as unknown as TranscriptNode;
     await node.signIn();
     const access = await node.useDelegation(delegation) as unknown as Access;
-    if (this.entries.size >= (this.args.maxEntries ?? MAX_ENTRIES)) await this.evictLru();
+    if (this.entries.size >= (this.args.maxEntries ?? MAX_ENTRIES)) this.evictLru();
     this.entries.set(entityId, { access, expiry, lastUsed: Date.now(), roomId });
     if (roomId) this.roomToEntity.set(roomId, entityId);
   }
 
-  private async drop(entityId: string): Promise<void> {
+  private drop(entityId: string): void {
     this.entries.delete(entityId);
     for (const [room, owner] of this.roomToEntity) if (owner === entityId) this.roomToEntity.delete(room);
   }
 
-  private async evictLru(): Promise<void> {
+  private evictLru(): void {
     const lru = [...this.entries.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0]?.[0];
-    if (lru) await this.drop(lru);
+    if (lru) this.drop(lru);
   }
 }
 
-function createReader(access: Access): TranscriptReader {
+export function createReader(access: Access): TranscriptReader {
   return {
     async listMetadata(): Promise<TranscriptMetadata[]> {
       const response = await access.sql.db(SQL_PATH).query(
-        "SELECT source, source_id, title, started_at FROM connector_meeting ORDER BY started_at DESC LIMIT 501",
+        `SELECT source, source_id, title, started_at FROM connector_meeting ORDER BY started_at DESC LIMIT ${METADATA_ROW_LIMIT}`,
       ) as { ok?: boolean; data?: { rows?: unknown[][] } };
       if (response?.ok !== true || !Array.isArray(response.data?.rows)) throw new Error("metadata unavailable");
       return response.data.rows.flatMap((row): TranscriptMetadata[] => {

@@ -209,8 +209,10 @@ export class RuntimeHost {
     }
 
     registry.clientFor(entityId);
-    const transcripts = (await this._bootOnce(agentId as UUID)).transcriptRegistry;
-    if (transcripts) transcripts.readerFor(entityId);
+    // Transcript access is deliberately NOT preflighted here. /messages is the
+    // memory-backed conversational path and still serves v1 (memory-only)
+    // sessions; the transcript tool fails closed on its own with
+    // delegation_required/delegation_expired.
   }
 
   async registerTranscriptDelegation(agentId: string, entityId: string, serializedDelegation: string, roomId?: string): Promise<void> {
@@ -364,7 +366,6 @@ export class RuntimeHost {
       agentKey: this._normalizedKey,
       host,
     });
-    setTranscriptRegistry(transcriptRegistry);
 
     // webSearchPlugin is passed as an instance only (no character.plugins string):
     // it is a local plugin with no installable package name to resolve. Its action
@@ -402,6 +403,11 @@ export class RuntimeHost {
           `for agentId ${agentId}, got: ${storageService?.constructor?.name}`,
       );
     }
+
+    // Bind the activated-transcript registry to THIS runtime (not a module
+    // global), so a second booted agent can neither observe nor overwrite
+    // another agent's per-entity access.
+    setTranscriptRegistry(runtime as unknown as object, transcriptRegistry);
 
     // Embedding seam (Milestone F): _registerEmbedder would be called here.
     // await this._registerEmbedder(runtime);

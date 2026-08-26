@@ -90,8 +90,10 @@ export async function handlePostSessions(
         agentDID: host.agentDid,
         policy: defaultTinychatTranscriptPolicy(),
       });
-      const expiry = transcriptDelegation.expiry instanceof Date ? transcriptDelegation.expiry : new Date(transcriptDelegation.expiry as unknown as string);
-      if (expiry.getTime() - Date.now() > 7 * 24 * 60 * 60 * 1000) {
+      // The 7-day ceiling is read from the SIGNED `exp` claim when the UCAN
+      // carries one; the top-level `expiry` summary is unsigned and forgeable,
+      // so a short summary must not launder a long-lived signed grant.
+      if (!withinTranscriptExpiryCeiling(serializedTranscriptDelegation, transcriptDelegation)) {
         return { status: 400, body: { error: "delegation_expiry_too_long" } };
       }
       const memoryOwner = signedOwnerAddress(deserializeAndNormalize(serializedDelegation));
@@ -100,7 +102,7 @@ export async function handlePostSessions(
         return { status: 400, body: { error: "wrong_delegator" } };
       }
     } catch (e) {
-      if (e instanceof DelegationPolicyError) return { status: 400, body: { error: (e.reason as string).toLowerCase() } };
+      if (e instanceof DelegationPolicyError) return { status: 400, body: { error: transcriptErrorCode(e) } };
       return { status: 400, body: { error: "malformed" } };
     }
   }
@@ -133,7 +135,15 @@ export async function handlePostSessions(
   await storage.registerDelegation(entityId, serializedDelegation, roomId);
   if (serializedTranscriptDelegation) {
     if (!host.registerTranscriptDelegation) return { status: 503, body: { error: "transcript_unavailable" } };
-    await host.registerTranscriptDelegation(agentId, entityId, serializedTranscriptDelegation, roomId);
+    try {
+      await host.registerTranscriptDelegation(agentId, entityId, serializedTranscriptDelegation, roomId);
+    } catch (e) {
+      // Activation failed (node unreachable, or the grant fails the exact policy
+      // at activation time). Memory registration stands; transcripts fail closed
+      // with a stable code and no delegation material in the body.
+      if (e instanceof DelegationPolicyError) return { status: 400, body: { error: transcriptErrorCode(e) } };
+      return { status: 503, body: { error: "transcript_unavailable" } };
+    }
   }
 
   // 5. Record in C-local store so GET /sessions can re-evaluate liveness without
@@ -142,7 +152,17 @@ export async function handlePostSessions(
 
   // 6. Return liveness status
   const status = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: host.agentDid });
-  return { status: 200, body: { entityId, status: serializedTranscriptDelegation ? status : status } };
+  return {
+    status: 200,
+    body: {
+      entityId,
+      status,
+      // Additive, and only on the v2 envelope so the v1 response stays exactly
+      // as it was: v2 callers can tell WHICH grant needs reconnecting instead
+      // of re-minting both.
+      ...(serializedTranscriptDelegation ? { transcriptStatus: "active" } : {}),
+    },
+  };
 }
 
 export async function handleGetSessions(
@@ -178,20 +198,69 @@ export async function handleGetSessions(
     throw e;
   }
 
+  let transcriptStatus: string | undefined;
   if (record.serializedTranscriptDelegation) {
     try {
       const transcript = deserializeAndNormalize(record.serializedTranscriptDelegation);
-      const transcriptStatus = evaluateDelegationStatus({
+      transcriptStatus = evaluateDelegationStatus({
         delegation: transcript,
         policy: defaultTinychatTranscriptPolicy(),
         agentDID: host.agentDid,
       });
-      if (transcriptStatus !== "active") delegStatus = transcriptStatus;
     } catch (e) {
-      if (e instanceof DelegationPolicyError && e.reason === "EXPIRED") delegStatus = "expired";
+      if (e instanceof DelegationPolicyError && e.reason === "EXPIRED") transcriptStatus = "expired";
       else return { status: 400, body: { error: "invalid_transcript_delegation" } };
     }
+    // Agent enablement requires BOTH grants, so the combined status degrades to
+    // the weaker one; `transcriptStatus` says which grant caused it.
+    if (transcriptStatus !== "active") delegStatus = transcriptStatus as typeof delegStatus;
   }
 
-  return { status: 200, body: { entityId, status: delegStatus } };
+  return { status: 200, body: { entityId, status: delegStatus, ...(transcriptStatus ? { transcriptStatus } : {}) } };
+}
+
+/** Map a policy rejection to a stable, non-revealing session error code. */
+function transcriptErrorCode(error: DelegationPolicyError): string {
+  switch (error.reason) {
+    case "WRONG_DELEGATEE": return "wrong_delegatee";
+    case "EXPIRED": return "delegation_expired";
+    case "INSUFFICIENT_ACTIONS": return "transcript_policy_exceeded";
+    default: return "malformed";
+  }
+}
+
+const MAX_TRANSCRIPT_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Enforce the transcript grant's 7-day ceiling against the signed UCAN `exp`
+ * claim, falling back to the (already policy-validated) top-level expiry only
+ * when the token carries no `exp`. Never throws and never echoes token bytes.
+ */
+function withinTranscriptExpiryCeiling(
+  serialized: string,
+  delegation: { expiry?: unknown },
+): boolean {
+  const summary = delegation.expiry instanceof Date
+    ? delegation.expiry
+    : new Date(delegation.expiry as unknown as string);
+  if (!Number.isFinite(summary.getTime())) return false;
+  const signedExpSecs = signedExpirySeconds(serialized);
+  const effective = signedExpSecs === null
+    ? summary.getTime()
+    : Math.max(summary.getTime(), signedExpSecs * 1_000);
+  return effective - Date.now() <= MAX_TRANSCRIPT_EXPIRY_MS;
+}
+
+function signedExpirySeconds(serialized: string): number | null {
+  try {
+    const parsed = JSON.parse(serialized) as { delegationHeader?: { Authorization?: unknown } };
+    const auth = parsed.delegationHeader?.Authorization;
+    if (typeof auth !== "string") return null;
+    const segment = auth.replace(/^Bearer\s+/i, "").split(".")[1];
+    if (!segment) return null;
+    const payload = JSON.parse(Buffer.from(segment, "base64url").toString("utf8")) as { exp?: unknown };
+    return typeof payload.exp === "number" && Number.isFinite(payload.exp) ? payload.exp : null;
+  } catch {
+    return null;
+  }
 }

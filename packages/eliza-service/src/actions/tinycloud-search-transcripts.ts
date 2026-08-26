@@ -1,4 +1,4 @@
-import type { Action, Content, Memory, Plugin } from "@elizaos/core";
+import type { Action, Content, IAgentRuntime, Memory, Plugin } from "@elizaos/core";
 import { ToolError } from "../handlers/tools.js";
 
 /**
@@ -45,6 +45,7 @@ const MAX_BODIES = 12;
 const MAX_MATCHES = 4;
 const MAX_EXCERPTS_PER_MATCH = 4;
 const MAX_EXCERPT_CHARS = 1_400;
+const MAX_TITLE_CHARS = 300;
 const MAX_SERIALIZED_RESULT_CHARS = 16_000;
 
 export interface TranscriptMetadata {
@@ -60,32 +61,31 @@ export interface TranscriptReader {
   getTranscript(source: TranscriptMetadata["source"], sourceId: string): Promise<unknown | null>;
 }
 
-/*
- * This registry is intentionally capability-only: it stores a reader factory, never
- * a transcript body or a prior result.  The session/activation layer installs a
- * per-entity factory after it has activated that entity's separate transcript
- * delegation.  Keeping this seam here makes the action directly testable while
- * preventing a tool invocation from selecting a path, SQL statement, or entity.
+/**
+ * Per-entity resolution of an ALREADY-ACTIVATED transcript delegation.
+ *
+ * There is deliberately no way to install a reader for an entity from outside
+ * the activation path: the only implementation is TranscriptAccessRegistry,
+ * which is bound to a runtime by RuntimeHost after it has validated and
+ * activated that entity's separately scoped transcript grant.  A tool
+ * invocation therefore cannot select a path, SQL statement, space, or entity.
  */
-interface TranscriptRegistry {
+export interface TranscriptRegistry {
   readerFor(entityId: string, roomId?: string): TranscriptReader;
 }
 
-let transcriptRegistry: TranscriptRegistry | null = null;
+// Keyed by runtime so a second booted agent cannot observe or overwrite another
+// agent's activated access (a module-level singleton would let the last boot win).
+const registries = new WeakMap<object, TranscriptRegistry>();
 
 /** Installed by RuntimeHost during production boot; no plaintext is retained here. */
-export function setTranscriptRegistry(registry: TranscriptRegistry | null): void {
-  transcriptRegistry = registry;
+export function setTranscriptRegistry(runtime: object, registry: TranscriptRegistry | null): void {
+  if (registry) registries.set(runtime, registry);
+  else registries.delete(runtime);
 }
 
-const readers = new Map<string, () => Promise<TranscriptReader>>();
-
-export function registerTranscriptReader(entityId: string, reader: () => Promise<TranscriptReader>): void {
-  readers.set(entityId, reader);
-}
-
-export function clearTranscriptReader(entityId: string): void {
-  readers.delete(entityId);
+export function transcriptRegistryFor(runtime: object | null | undefined): TranscriptRegistry | null {
+  return runtime ? registries.get(runtime) ?? null : null;
 }
 
 interface TranscriptExcerpt {
@@ -118,31 +118,81 @@ function escapeEvidence(text: string): string {
   return text.replace(/<\/?(?:system|tool|assistant|user|instructions?)\b/gi, (token) => token.replace("<", "&lt;"));
 }
 
-function excerptsFor(query: string, transcript: unknown): Array<Omit<TranscriptExcerpt, "citation">> {
-  const sentences = Array.isArray(transcript) ? transcript : null;
-  const entries: Array<{ text: string; speaker?: string; startSecs?: number }> = sentences
-    ? sentences.flatMap((sentence) => {
-        if (!sentence || typeof sentence !== "object") return [];
-        const value = sentence as { text?: unknown; speaker_name?: unknown; start_time?: unknown };
-        if (typeof value.text !== "string") return [];
-        return [{ text: value.text, speaker: typeof value.speaker_name === "string" ? value.speaker_name : undefined, startSecs: typeof value.start_time === "number" ? value.start_time : undefined }];
-      })
-    : typeof transcript === "string" ? [{ text: transcript }] : [];
-  const joined = entries.map((entry) => entry.text).join("\n");
-  const excerpt = excerptFor(query, joined);
-  if (!excerpt) return [];
-  const matched = entries.find((entry) => query.toLowerCase().split(/\s+/).some((term) => term.length > 1 && entry.text.toLowerCase().includes(term)));
-  return [{ text: excerpt, ...(matched?.speaker ? { speaker: matched.speaker } : {}), ...(matched?.startSecs !== undefined ? { startSecs: matched.startSecs } : {}) }];
+/** Render a known offset; never invent one when the source omitted it. */
+function formatOffset(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const parts = [Math.floor(total / 3_600), Math.floor((total % 3_600) / 60), total % 60];
+  return parts.map((part) => String(part).padStart(2, "0")).join(":");
 }
 
-function excerptFor(query: string, transcript: string): string | null {
-  const haystack = transcript.toLowerCase();
-  const terms = query.toLowerCase().split(/\s+/).filter((term) => term.length > 1);
-  const index = terms.map((term) => haystack.indexOf(term)).find((found) => found >= 0);
-  if (index === undefined) return null;
-  const start = Math.max(0, index - 280);
-  const end = Math.min(transcript.length, start + MAX_EXCERPT_CHARS);
-  return escapeEvidence(transcript.slice(start, end));
+function excerptCitation(matchIndex: number, excerptIndex: number, excerpt: Omit<TranscriptExcerpt, "citation">): string {
+  const attribution = [
+    excerpt.speaker,
+    excerpt.startSecs !== undefined ? formatOffset(excerpt.startSecs) : undefined,
+  ].filter((part): part is string => part !== undefined && part !== "");
+  const identity = `T${matchIndex}:E${excerptIndex}`;
+  return attribution.length > 0 ? `[${identity}, ${attribution.join(", ")}]` : `[${identity}]`;
+}
+
+interface Sentence { text: string; speaker?: string; startSecs?: number }
+
+/**
+ * Accept the stored Fireflies sentence shape (`{ text, speaker_name, start_time }`,
+ * plus the camelCase variants TinyChat also writes) and the legacy plain-string body.
+ * Anything else yields no sentences, which the caller reports as an unmatched meeting.
+ */
+function sentencesOf(transcript: unknown): Sentence[] {
+  if (typeof transcript === "string") return transcript ? [{ text: transcript }] : [];
+  if (!Array.isArray(transcript)) return [];
+  return transcript.flatMap((entry): Sentence[] => {
+    if (!entry || typeof entry !== "object") return [];
+    const value = entry as Record<string, unknown>;
+    if (typeof value.text !== "string" || value.text.trim() === "") return [];
+    const speaker = [value.speaker_name, value.speaker, value.speakerName]
+      .find((candidate): candidate is string => typeof candidate === "string" && candidate.trim() !== "");
+    const startSecs = [value.start_time, value.startTime]
+      .find((candidate): candidate is number => typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0);
+    return [{
+      text: value.text,
+      ...(speaker !== undefined ? { speaker } : {}),
+      ...(startSecs !== undefined ? { startSecs } : {}),
+    }];
+  });
+}
+
+function queryTerms(query: string): string[] {
+  return [...new Set(query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((term) => term.length > 1))];
+}
+
+/**
+ * Deterministic lexical selection over the SOURCE sentences.
+ *
+ * Each returned excerpt keeps the speaker and offset of the sentence it was cut
+ * from, so an attribution is never transplanted from an unrelated sentence.
+ */
+function excerptsFor(query: string, transcript: unknown): Array<Omit<TranscriptExcerpt, "citation">> {
+  const sentences = sentencesOf(transcript);
+  if (sentences.length === 0) return [];
+  const terms = queryTerms(query);
+  if (terms.length === 0) return [];
+
+  const scored = sentences
+    .map((sentence, index) => {
+      const haystack = sentence.text.toLowerCase();
+      return { sentence, index, score: terms.filter((term) => haystack.includes(term)).length };
+    })
+    .filter((entry) => entry.score > 0)
+    // Highest term coverage first; source order breaks every tie so the same
+    // corpus always produces the same citations.
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, MAX_EXCERPTS_PER_MATCH)
+    .sort((a, b) => a.index - b.index);
+
+  return scored.map(({ sentence }) => ({
+    text: escapeEvidence(sentence.text.slice(0, MAX_EXCERPT_CHARS)),
+    ...(sentence.speaker !== undefined ? { speaker: escapeEvidence(sentence.speaker).slice(0, 120) } : {}),
+    ...(sentence.startSecs !== undefined ? { startSecs: sentence.startSecs } : {}),
+  }));
 }
 
 /**
@@ -158,7 +208,9 @@ export async function searchTranscripts(
   try {
     rows = await reader.listMetadata();
   } catch {
-    throw new Error("transcript_metadata_unavailable");
+    // A metadata outage is not an empty corpus, and it is not a delegation
+    // problem either: answer with the contract's stable unavailable code.
+    throw new ToolError("transcript metadata unavailable", 503, "transcript_unavailable");
   }
   let truncated = rows.length > MAX_METADATA_ROWS;
   rows = rows.slice(0, MAX_METADATA_ROWS);
@@ -198,8 +250,14 @@ export async function searchTranscripts(
     const index = matches.length + 1;
     matches.push({
       citation: `[T${index}]`, source: row.source, sourceId: row.sourceId,
-      title: row.title, startedAt: row.startedAt,
-      excerpts: excerpts.slice(0, MAX_EXCERPTS_PER_MATCH).map((excerpt, excerptIndex) => ({ citation: `[T${index}:E${excerptIndex + 1}]`, ...excerpt })),
+      // A meeting title is user/provider-controlled text on the same untrusted
+      // footing as the body, so it is fenced identically before synthesis.
+      title: row.title === null ? null : escapeEvidence(row.title).slice(0, MAX_TITLE_CHARS),
+      startedAt: row.startedAt,
+      excerpts: excerpts.map((excerpt, excerptIndex) => ({
+        citation: excerptCitation(index, excerptIndex + 1, excerpt),
+        ...excerpt,
+      })),
     });
   }
   const data = { corpus: { candidateCount, examinedCount, matchedCount: matches.length, truncated, partial }, matches };
@@ -215,6 +273,10 @@ export async function searchTranscripts(
   };
 }
 
+function isNamedError(error: unknown, name: string): boolean {
+  return (error as { name?: unknown } | null)?.name === name;
+}
+
 /** Registered Eliza action backing POST /tools/tinycloud_search_transcripts. */
 export const tinycloudSearchTranscriptsAction: Action = {
   name: "TINYCLOUD_SEARCH_TRANSCRIPTS",
@@ -226,26 +288,25 @@ export const tinycloudSearchTranscriptsAction: Action = {
       ?? { query: message.content?.text };
     return parseTranscriptSearchArgs(args) !== null;
   },
-  handler: async (_runtime, message: Memory, _state, options, callback) => {
+  handler: async (runtime: IAgentRuntime, message: Memory, _state, options, callback) => {
     const raw = (options as { args?: Record<string, unknown> } | undefined)?.args
       ?? { query: message.content?.text };
     const args = parseTranscriptSearchArgs(raw);
     if (!args) throw new ToolError("invalid transcript tool arguments", 400, "invalid_args");
-    const factory = readers.get(message.entityId);
-    if (!factory && !transcriptRegistry) {
-      throw new ToolError("transcript delegation required", 409, "delegation_required");
-    }
+    const registry = transcriptRegistryFor(runtime as unknown as object);
+    // No registry at all means this runtime never activated transcript access;
+    // it must fail closed exactly like a missing per-entity grant rather than
+    // letting the turn silently proceed without the user's transcripts.
+    if (!registry) throw new ToolError("transcript delegation required", 409, "delegation_required");
     let reader: TranscriptReader;
     try {
-      reader = factory
-        ? await factory()
-        : transcriptRegistry?.readerFor(message.entityId, message.roomId) as TranscriptReader;
-      if (!reader) throw new ToolError("transcript delegation required", 409, "delegation_required");
+      reader = registry.readerFor(message.entityId, message.roomId);
     } catch (error) {
-      if (error instanceof ToolError || (error as { name?: unknown })?.name === "NoDelegationError") {
-        throw new ToolError("transcript delegation required", 409, "delegation_required");
+      if (error instanceof ToolError) throw error;
+      if (isNamedError(error, "DelegationExpiredError")) {
+        throw new ToolError("transcript delegation expired", 409, "delegation_expired");
       }
-      throw new ToolError("transcript delegation unavailable", 409, "delegation_expired");
+      throw new ToolError("transcript delegation required", 409, "delegation_required");
     }
     const result = await searchTranscripts(reader, args);
     // Only the bounded final result is handed to the calling model.  The registry
