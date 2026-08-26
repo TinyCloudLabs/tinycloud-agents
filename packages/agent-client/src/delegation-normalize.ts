@@ -205,3 +205,62 @@ export function deserializeAndNormalize(serialized: string): PortableDelegation 
   // (shared with delegation-policy; review #8 dedup — was a byte-identical try/catch).
   return normalizeDelegationGrants(deserializeDelegationSafe(serialized));
 }
+
+/**
+ * Deserialize a transcript delegation for the node-sdk activation boundary.
+ *
+ * Current web-sdk multi-resource delegations use `Bearer <cid>` rather than an
+ * inline compact UCAN. In that form, `resources` is the exact attenuation the
+ * agent asks node-sdk to install as a child session; the TinyCloud host verifies
+ * that attenuation against the signed parent addressed by the CID. We therefore
+ * accept it only when Authorization and `cid` are identical, then let callers
+ * enforce the fixed transcript policy before the host performs cryptographic
+ * activation. A wider forged attenuation cannot activate; a narrower one only
+ * reduces the child session's authority.
+ *
+ * Compact-UCAN delegations keep the stronger inline path above: grants are
+ * derived from signed `att` and unsigned summaries are discarded.
+ */
+export function deserializeTranscriptDelegationForActivation(
+  serialized: string,
+): PortableDelegation {
+  const delegation = deserializeDelegationSafe(serialized);
+  const auth = delegation.delegationHeader?.Authorization;
+  if (typeof auth !== "string" || auth.trim() === "") {
+    throw new DelegationPolicyError(
+      "malformed transcript delegation: missing Authorization",
+      "MALFORMED",
+      { field: "delegationHeader.Authorization" },
+    );
+  }
+
+  const bearer = auth.replace(BEARER_RE, "");
+  if (bearer.includes(".")) return normalizeDelegationGrants(delegation);
+
+  if (bearer !== delegation.cid) {
+    throw new DelegationPolicyError(
+      "malformed transcript delegation: Authorization CID does not match cid",
+      "MALFORMED",
+      { field: "delegationHeader.Authorization" },
+    );
+  }
+  if (!Array.isArray(delegation.resources) || delegation.resources.length === 0) {
+    throw new DelegationPolicyError(
+      "malformed transcript delegation: CID form requires resource attenuation",
+      "MALFORMED",
+      { field: "resources" },
+    );
+  }
+
+  const resources = delegation.resources.map((resource) => ({
+    ...resource,
+    actions: [...resource.actions],
+  }));
+  const actions = [...new Set(resources.flatMap((resource) => resource.actions))];
+  // DelegatedAccess configures KVService's automatic prefix from the portable
+  // top-level path. Multi-resource delegates may serialize either resource
+  // first, so pin that compatibility summary to the explicit KV attenuation;
+  // the host still verifies the full resources[] child request against the CID.
+  const kvPath = resources.find((resource) => resource.service.replace(/^tinycloud\./, "") === "kv")?.path;
+  return { ...delegation, ...(kvPath ? { path: kvPath } : {}), resources, actions };
+}

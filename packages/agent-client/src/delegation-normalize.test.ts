@@ -8,7 +8,11 @@ import { describe, expect, test } from "bun:test";
 import type { PortableDelegation } from "@tinycloud/node-sdk";
 import { serializeDelegation } from "@tinycloud/node-sdk";
 import { DelegationPolicyError } from "./errors";
-import { deserializeAndNormalize, normalizeDelegationGrants } from "./delegation-normalize";
+import {
+  deserializeAndNormalize,
+  deserializeTranscriptDelegationForActivation,
+  normalizeDelegationGrants,
+} from "./delegation-normalize";
 import {
   AGENT_DID,
   b64url,
@@ -190,5 +194,62 @@ describe("deserializeAndNormalize — full round-trip through the SDK deserializ
 
   test("undeserializable input throws MALFORMED", () => {
     expect(() => deserializeAndNormalize("{not valid")).toThrow(DelegationPolicyError);
+  });
+});
+
+describe("deserializeTranscriptDelegationForActivation — CID-backed multi-resource grants", () => {
+  const transcriptResources = [
+    {
+      service: "kv",
+      space: SPACE,
+      path: "xyz.tinycloud.tinychat/connectors/",
+      actions: ["tinycloud.kv/get", "tinycloud.kv/list"],
+    },
+    {
+      service: "sql",
+      space: SPACE,
+      path: "xyz.tinycloud.tinychat/connectors",
+      actions: ["tinycloud.sql/read"],
+    },
+  ];
+
+  test("accepts a matching Authorization CID and derives actions from the requested attenuation", () => {
+    const serialized = serializeDelegation(makeDelegation("Bearer bafytest", {
+      actions: ["forged/action"],
+      resources: transcriptResources,
+    }));
+    const out = deserializeTranscriptDelegationForActivation(serialized);
+    expect(out.resources).toEqual(transcriptResources);
+    expect(out.path).toBe("xyz.tinycloud.tinychat/connectors/");
+    expect([...out.actions].sort()).toEqual([
+      "tinycloud.kv/get",
+      "tinycloud.kv/list",
+      "tinycloud.sql/read",
+    ]);
+  });
+
+  test("rejects a CID authorization that does not match the portable cid", () => {
+    const serialized = serializeDelegation(makeDelegation("Bearer bafyother", {
+      resources: transcriptResources,
+    }));
+    expect(() => deserializeTranscriptDelegationForActivation(serialized)).toThrow(
+      DelegationPolicyError,
+    );
+  });
+
+  test("rejects CID form without an explicit child attenuation", () => {
+    const serialized = serializeDelegation(makeDelegation("Bearer bafytest"));
+    expect(() => deserializeTranscriptDelegationForActivation(serialized)).toThrow(
+      DelegationPolicyError,
+    );
+  });
+
+  test("keeps compact UCANs on the signed-att normalization path", () => {
+    const serialized = serializeDelegation(makeDelegation(makeJwt(FULL_GRANT_ATT), {
+      resources: transcriptResources,
+    }));
+    const out = deserializeTranscriptDelegationForActivation(serialized);
+    expect(out.resources?.some((resource) => resource.path === DB_HANDLE)).toBe(true);
+    expect(out.resources?.some((resource) => resource.path.includes("tinychat/connectors"))).toBe(false);
   });
 });

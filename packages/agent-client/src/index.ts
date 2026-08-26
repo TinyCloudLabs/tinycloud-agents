@@ -106,10 +106,11 @@ export type { HttpArtifactSkillRuntimeOptions } from "./http-artifact-skill-runt
 export { normalizeAgentKey, agentIdentityFromKey, agentIdentityFromFile } from "./agent-identity";
 export type { AgentIdentity } from "./agent-identity";
 
-export { defaultElizaMemoryPolicy, deserializeDelegationSafe, assertWellFormed, validateDelegationPolicy, computePolicyHash, evaluateDelegationStatus } from "./delegation-policy";
+export { defaultElizaMemoryPolicy, defaultTinychatTranscriptPolicy, deserializeDelegationSafe, assertWellFormed, validateDelegationPolicy, validateExactDelegationPolicy, computePolicyHash, evaluateDelegationStatus } from "./delegation-policy";
 export type { DelegationPolicy, PolicyResource } from "./delegation-policy";
 
-export { deserializeAndNormalize, normalizeDelegationGrants } from "./delegation-normalize";
+export { deserializeAndNormalize, deserializeTranscriptDelegationForActivation, normalizeDelegationGrants, signedOwnerAddress } from "./delegation-normalize";
 
 export { serializeDelegation, deserializeDelegation } from "@tinycloud/node-sdk";
+export { TinyCloudNode } from "@tinycloud/node-sdk";
 export type { PortableDelegation } from "@tinycloud/node-sdk";

@@ -25,7 +25,9 @@ import tinycloudMemoryPlugin, {
   TinyCloudMemoryStorageService,
 } from "@tinycloud/eliza-plugin-memory";
 import { webSearchPlugin } from "./actions/web-search.js";
+import { setTranscriptRegistry, tinycloudSearchTranscriptsPlugin } from "./actions/tinycloud-search-transcripts.js";
 import { runArtifactSkillPlugin } from "./actions/run-artifact-skill.js";
+import { TranscriptAccessRegistry } from "./transcript-registry.js";
 
 const DEFAULT_AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" as UUID;
 const DEFAULT_HOST = "https://node.tinycloud.xyz";
@@ -45,6 +47,7 @@ export interface BootedRuntime {
   /** Null in stub mode (no TinyCloud plugin registered). */
   storageService: TinyCloudMemoryStorageService | null;
   agentId: UUID;
+  transcriptRegistry?: TranscriptAccessRegistry;
 }
 
 /**
@@ -206,6 +209,16 @@ export class RuntimeHost {
     }
 
     registry.clientFor(entityId);
+    // Transcript access is deliberately NOT preflighted here. /messages is the
+    // memory-backed conversational path and still serves v1 (memory-only)
+    // sessions; the transcript tool fails closed on its own with
+    // delegation_required/delegation_expired.
+  }
+
+  async registerTranscriptDelegation(agentId: string, entityId: string, serializedDelegation: string, roomId?: string): Promise<void> {
+    const registry = (await this._bootOnce(agentId as UUID)).transcriptRegistry;
+    if (!registry) throw new Error("RuntimeHost: transcript registry unavailable");
+    await registry.register(entityId, serializedDelegation, roomId);
   }
 
   /**
@@ -224,8 +237,9 @@ export class RuntimeHost {
    * Clears the internal map so the host can be GC'd cleanly.
    */
   async stop(): Promise<void> {
-    for (const { runtime, storageService } of this._runtimes.values()) {
+    for (const { runtime, storageService, transcriptRegistry } of this._runtimes.values()) {
       if (storageService) await storageService.stop();
+      if (transcriptRegistry) await transcriptRegistry.stop();
       await runtime.stop();
     }
     this._runtimes.clear();
@@ -347,13 +361,19 @@ export class RuntimeHost {
       settings: delegationSettings,
     });
 
+    const transcriptRegistry = new TranscriptAccessRegistry({
+      agentDid: this._agentDid,
+      agentKey: this._normalizedKey,
+      host,
+    });
+
     // webSearchPlugin is passed as an instance only (no character.plugins string):
     // it is a local plugin with no installable package name to resolve. Its action
     // is pure-API (no useModel) so it works with no TEXT model registered in prod.
     const runtime = new AgentRuntime({
       agentId,
       character,
-      plugins: [tinycloudMemoryPlugin, sqlPlugin, webSearchPlugin, runArtifactSkillPlugin],
+      plugins: [tinycloudMemoryPlugin, sqlPlugin, webSearchPlugin, tinycloudSearchTranscriptsPlugin, runArtifactSkillPlugin],
       adapter: new InMemoryDatabaseAdapter(),
       settings: delegationSettings,
       logLevel: "warn",
@@ -384,10 +404,15 @@ export class RuntimeHost {
       );
     }
 
+    // Bind the activated-transcript registry to THIS runtime (not a module
+    // global), so a second booted agent can neither observe nor overwrite
+    // another agent's per-entity access.
+    setTranscriptRegistry(runtime as unknown as object, transcriptRegistry);
+
     // Embedding seam (Milestone F): _registerEmbedder would be called here.
     // await this._registerEmbedder(runtime);
 
-    return { agentId, runtime, storageService };
+    return { agentId, runtime, storageService, transcriptRegistry };
   }
 }
 

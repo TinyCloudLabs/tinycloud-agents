@@ -81,6 +81,14 @@ export interface PolicyResource {
   path: string;
   requiredActions: string[];
   required: boolean;
+  /**
+   * Exact-policy only: accept this resource at whatever path the SDK minted it
+   * at. Used for `tinycloud.capabilities`, whose grant path is chosen by the
+   * SDK's capability chain rather than by the app, and which conveys no access
+   * to user data. Ignored by `validateDelegationPolicy` (which only inspects
+   * `required` resources) — never set it on a resource that reads user data.
+   */
+  anyPath?: boolean;
 }
 
 /**
@@ -130,6 +138,43 @@ export function defaultElizaMemoryPolicy(
       },
     ],
   };
+}
+
+/** The deliberately small, read-only TinyChat connector grant used by the transcript tool. */
+export function defaultTinychatTranscriptPolicy(): DelegationPolicy {
+  return {
+    resources: [
+      { serviceLong: "tinycloud.sql", serviceShort: "sql", path: "xyz.tinycloud.tinychat/connectors", requiredActions: [SQL.READ], required: true },
+      { serviceLong: "tinycloud.kv", serviceShort: "kv", path: "xyz.tinycloud.tinychat/connectors/", requiredActions: ["tinycloud.kv/get", "tinycloud.kv/list"], required: true },
+      // The SDK emits (and `useDelegation` needs) a capabilities/read entry whose
+      // path is part of its own capability chain. It is permitted, read-only, and
+      // never path-pinned; every USER-DATA resource above stays exact.
+      { serviceLong: "tinycloud.capabilities", serviceShort: "capabilities", path: "", requiredActions: [CAPABILITIES.READ], required: false, anyPath: true },
+    ],
+  };
+}
+
+/**
+ * Transcript delegations are attenuation grants, not a minimum permission set:
+ * require every configured resource and reject any additional resource or action.
+ */
+export function validateExactDelegationPolicy(
+  delegation: PortableDelegation,
+  opts: { agentDID: string; policy: DelegationPolicy; now?: Date },
+): void {
+  validateDelegationPolicy(delegation, opts);
+  const resources = delegation.resources ?? [];
+  for (const granted of resources) {
+    const policyResource = opts.policy.resources.find((candidate) => serviceMatches(granted.service, candidate));
+    if (!policyResource || (policyResource.anyPath !== true && granted.path !== policyResource.path)) {
+      throw new DelegationPolicyError("delegation grants a resource outside the transcript policy", "MALFORMED", { field: "resources" });
+    }
+    const allowed = new Set(expandActionShortNames(policyResource.serviceLong, policyResource.requiredActions));
+    const actions = expandActionShortNames(policyResource.serviceLong, granted.actions);
+    if (actions.some((action) => !allowed.has(action))) {
+      throw new DelegationPolicyError("delegation grants an action outside the transcript policy", "INSUFFICIENT_ACTIONS", { field: "resources.actions" });
+    }
+  }
 }
 
 /**

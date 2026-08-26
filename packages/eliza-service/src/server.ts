@@ -220,10 +220,17 @@ async function readJsonObject(
 
 function isPostSessionsBody(value: unknown): value is PostSessionsBody {
   if (!isObject(value)) return false;
+  const session = value.session;
+  const v2 = isObject(session)
+    && session.version === 2
+    && isObject(session.delegations)
+    && typeof session.delegations.memory === "string"
+    && typeof session.delegations.transcripts === "string"
+    && (session.roomId === undefined || typeof session.roomId === "string");
   return (
     typeof value.agentId === "string"
     && typeof value.entityId === "string"
-    && typeof value.serializedDelegation === "string"
+    && (typeof value.serializedDelegation === "string" || v2)
     && (value.roomId === undefined || typeof value.roomId === "string")
   );
 }
