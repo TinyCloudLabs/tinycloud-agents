@@ -3,6 +3,7 @@ import type { Action, IAgentRuntime } from "@elizaos/core";
 import { NoDelegationError } from "@tinycloud/eliza-plugin-memory";
 import { handlePostTool, ToolError, type ToolHandlerHost } from "./tools.js";
 import { webSearchAction } from "../actions/web-search.js";
+import { setTranscriptRegistry, tinycloudReadMeetingAction, tinycloudListMeetingActionsAction } from "../actions/tinycloud-search-transcripts.js";
 
 const AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
@@ -12,6 +13,29 @@ function hostWithActions(actions: Action[]): ToolHandlerHost {
 }
 
 describe("handlePostTool", () => {
+  it("discards a late tool result after request abort", async () => {
+    const controller = new AbortController();
+    let release!: () => void;
+    const action = { name: "SLOW", handler: async () => { await new Promise<void>(resolve => { release = resolve; }); return { text: "private late content" }; } } as unknown as Action;
+    const result = handlePostTool("slow", AGENT_ID, {}, hostWithActions([action]), { signal: controller.signal });
+    await new Promise(resolve => setTimeout(resolve, 0)); controller.abort(); release();
+    expect(await result).toMatchObject({ status: 499, body: { error: "retrieval_cancelled" } });
+  });
+  it("fits the complete v2 wire response including callback frames and legacy copies", async () => {
+    const runtime = { actions: [tinycloudReadMeetingAction, tinycloudListMeetingActionsAction] } as unknown as IAgentRuntime;
+    const rows = Array.from({ length: 12 }, (_, i) => ({ meetingRef: `ref-${i}`, source: "fireflies" as const, sourceId: `source-${i}`, title: 'title"\\'.repeat(100), startedAt: "2026-09-09T10:00:00Z", participantNames: Array.from({ length: 20 }, () => "P".repeat(120)), participantEmails: [], organizerEmail: "organizer@example.com", summaryOverview: 'overview"\\'.repeat(2000), summaryActionItems: Array.from({ length: 8 }, () => '- Sam will send "\\'.repeat(70)).join("\n") }));
+    setTranscriptRegistry(runtime, { readerFor: () => ({ listMetadata: async () => rows, getTranscript: async () => [{ text: 'long"\\'.repeat(3000) }] }), selectedMeetingFor: () => null, selectMeeting: () => {} });
+    for (const [tool, args, mode] of [["tinycloud_read_meeting", { meetingRef: "ref-0", focus: "summary", includeBody: true }, "single"], ["tinycloud_list_meeting_actions", { includeBody: true }, "range"]] as const) {
+      const response = await handlePostTool(tool, AGENT_ID, { args, context: { retrievalMode: mode } }, { runtimeFor: async () => runtime });
+      expect(response.status).toBe(200);
+      expect(JSON.stringify(response.body).length).toBeLessThanOrEqual(16_000);
+      const data = (response.body as any).result.data;
+      expect(data.outcomes).toHaveLength(mode === "range" ? 12 : 1);
+      expect(data.outcomes.every((outcome: any) => outcome.evidence.length > 0)).toBe(true);
+      expect(data.outcomes.some((outcome: any) => outcome.coverage.omissionReasons.length > 0)).toBe(true);
+      for (const outcome of data.outcomes) expect(outcome.coverage.evidenceRetained).toBe(outcome.evidence.length);
+    }
+  });
   it("returns 404 for an unknown tool", async () => {
     const host = hostWithActions([]);
     const result = await handlePostTool("nope", AGENT_ID, { args: {} }, host);

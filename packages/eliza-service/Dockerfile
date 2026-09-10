@@ -17,6 +17,9 @@
 #   `tsc` build, in dependency order. There is no WASM and no postinstall, so the
 #   image stays a single stage on the official Bun image.
 FROM oven/bun:1.3.9 AS app
+ARG BUILD_REVISION=unknown
+ENV BUILD_REVISION=${BUILD_REVISION}
+LABEL org.opencontainers.image.revision=${BUILD_REVISION}
 WORKDIR /app
 
 # Workspace manifests + lockfile first for a cacheable install layer.

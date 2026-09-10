@@ -21,6 +21,8 @@ import type { Action, Content, HandlerCallback, IAgentRuntime, Memory, UUID } fr
 import { RUN_ARTIFACT_SKILL } from "@tinycloud/agent-client";
 import { mapDelegationError } from "../errors.js";
 import { ARTIFACTORY_APP_ID } from "../auth/app-registry.js";
+import { checkContext, MeetingRetrievalError, withinContext } from "../meeting-evidence.js";
+import type { RetrievalContext } from "../meeting-evidence.js";
 
 // App-identity gate. RUN_ARTIFACT_SKILL is registered on every production
 // runtime (runtime-host boots one plugin set per agent), so tool dispatch must
@@ -53,7 +55,7 @@ export interface PostToolBody {
   /** Tool arguments, e.g. { query } for web search. */
   args?: Record<string, unknown>;
   /** Server-validated, non-authority context used for local-calendar filtering. */
-  context?: { localDate?: string; timeZone?: string };
+  context?: Omit<RetrievalContext, "signal">;
 }
 
 export interface ToolResult {
@@ -89,6 +91,7 @@ export async function handlePostTool(
   agentId: string,
   body: PostToolBody,
   host: ToolHandlerHost,
+  transport: { signal?: AbortSignal } = {},
 ): Promise<ToolResult> {
   const runtime = await host.runtimeFor(agentId);
   const actions: Action[] = runtime.actions ?? [];
@@ -110,26 +113,30 @@ export async function handlePostTool(
   };
 
   const frames: Content[] = [];
+  const meetingTool = /^TINYCLOUD_(?:FIND_MEETINGS|READ_MEETING|SEARCH_TRANSCRIPTS|LIST_MEETING_ACTIONS)$/i.test(action.name);
+  const context: RetrievalContext = { ...body.context, signal: transport.signal,
+    ...(meetingTool ? { deadlineAt: Math.min(typeof body.context?.deadlineAt === "number" ? body.context.deadlineAt : Infinity, Date.now() + 10_000) } : {}) };
   const callback: HandlerCallback = async (content: Content) => {
+    checkContext(context);
     frames.push(content);
     return [];
   };
 
   try {
-    const result = await action.handler(
+    const result = await withinContext(signal => action.handler(
       runtime,
       message,
       undefined,
-      { args: body.args ?? {}, context: body.context },
+      { args: body.args ?? {}, context: { ...context, signal, ...(meetingTool ? { deadlineAt: context.deadlineAt! - 50 } : {}) } },
       callback,
       [],
-    );
+    ), context);
 
     const text =
       frames.map((f) => f.text ?? "").filter(Boolean).join("\n") ||
       (typeof result?.text === "string" ? result.text : "");
 
-    return {
+    const response = {
       status: 200,
       body: {
         ok: true,
@@ -141,10 +148,15 @@ export async function handlePostTool(
         },
       },
     };
+    if ((result?.data as { contractVersion?: number } | undefined)?.contractVersion === 2 && JSON.stringify(response.body).length > 16_000) {
+      throw new MeetingRetrievalError("meeting_result_size_limit", 413);
+    }
+    return response;
   } catch (err) {
     const delegationCode = mapDelegationError(err);
     if (delegationCode) return { status: 409, body: { error: delegationCode } };
     if (err instanceof ToolError) return { status: err.status, body: { error: err.code } };
+    if (err instanceof MeetingRetrievalError) return { status: err.status, body: { error: err.code } };
     return { status: 502, body: { error: "tool_failed" } };
   }
 }
