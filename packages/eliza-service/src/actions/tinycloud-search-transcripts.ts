@@ -272,7 +272,7 @@ function action(operation: "find" | "read" | "search" | "actions", name: string,
           const proven = reference || (discovery?.countKind === "exact" && discovery.matchedCount === 1) || ((args as FindMeetingsArgs).selectFirst && discovery?.orderProven);
           if (proven) registry.selectMeeting(message.entityId, message.roomId, first.meetingRef);
           else registry.setSelection?.(message.entityId, message.roomId, { state: "ambiguous" });
-        } else if (context.retrievalMode === undefined && first && (operation === "read" || (operation === "find" && (discovery?.matchedCount === 1 || (args as FindMeetingsArgs).selectFirst)) || (operation === "search" && result.data.matches.length === 1))) registry.selectMeeting(message.entityId, message.roomId, first.meetingRef);
+        } else if (context.retrievalMode === undefined && first && (operation === "read" || (operation === "find" && (discovery?.matchedCount === 1 || (args as FindMeetingsArgs).selectFirst)) || (operation === "search" && result.data.matches.length === 1))) registry.selectMeeting(message.entityId, message.roomId, operation === "search" ? result.data.matches[0]!.meetingRef : first.meetingRef);
         return finish(callback, result);
       } catch (error) {
         if (isAccessError(error) || (error as { code?: string }).code === "meeting_not_found") registry.setSelection?.(message.entityId, message.roomId, { state: "none" });
