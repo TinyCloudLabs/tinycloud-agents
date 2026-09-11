@@ -165,6 +165,19 @@ describe("eliza-service HTTP server", () => {
     expect(body).toEqual({ ok: true, agentDid: TEST_AGENT_DID });
   });
 
+  it("GET /capabilities authenticates and reports an immutable configured build revision", async () => {
+    const { host } = makeHost();
+    server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+    const saved = process.env.BUILD_REVISION;
+    try {
+      process.env.BUILD_REVISION = "e5665616433857442391255807d6c18f1bea7a88";
+      expect((await fetch(url("/capabilities"))).status).toBe(401);
+      const response = await fetch(url("/capabilities"), { headers: { Authorization: `Bearer ${TEST_SERVICE_SECRET}` } });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ meetingRetrieval: { contractVersion: 2 }, buildRevision: process.env.BUILD_REVISION });
+    } finally { if (saved === undefined) delete process.env.BUILD_REVISION; else process.env.BUILD_REVISION = saved; }
+  });
+
   it("POST /sessions routes to the sessions handler", async () => {
     const { host, storage } = makeHost();
     const sessions = new SessionStore();

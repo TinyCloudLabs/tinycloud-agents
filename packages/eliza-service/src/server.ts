@@ -63,6 +63,13 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
         return json(200, { ok: true, agentDid: opts.host.agentDid });
       }
 
+      if (request.method === "GET" && url.pathname === "/capabilities") {
+        const auth = checkServiceAuth(request);
+        if (!auth.ok) return auth.response;
+        const revision = process.env.BUILD_REVISION ?? process.env.GIT_SHA;
+        return json(200, { meetingRetrieval: { contractVersion: 2 }, buildRevision: revision && /^[a-f0-9]{40,64}$/i.test(revision) ? revision : "unknown" });
+      }
+
       if (request.method === "POST" && url.pathname === "/sessions") {
         const auth = checkServiceAuth(request);
         if (!auth.ok) return auth.response;
@@ -139,7 +146,7 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
         }
 
         // agentId is server-trusted: resolved from the credential, never caller-supplied.
-        const result = await handlePostTool(toolName, auth.resolved.agentId, parsed.value, opts.host);
+        const result = await handlePostTool(toolName, auth.resolved.agentId, parsed.value, opts.host, { signal: request.signal });
         return json(result.status, result.body);
       }
 
@@ -241,6 +248,11 @@ function isPostToolBody(value: unknown): value is PostToolBody {
     (value.entityId === undefined || typeof value.entityId === "string")
     && (value.roomId === undefined || typeof value.roomId === "string")
     && (value.args === undefined || isObject(value.args))
+    && (value.context === undefined || (isObject(value.context)
+      && (value.context.retrievalMode === undefined || ["selected", "single", "range"].includes(value.context.retrievalMode as string))
+      && (value.context.localDate === undefined || typeof value.context.localDate === "string")
+      && (value.context.timeZone === undefined || typeof value.context.timeZone === "string")
+      && (value.context.deadlineAt === undefined || (typeof value.context.deadlineAt === "number" && Number.isFinite(value.context.deadlineAt)))))
   );
 }
 

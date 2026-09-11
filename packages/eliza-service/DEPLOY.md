@@ -33,10 +33,26 @@ by TinyCloud delegated memory.
 From the repo root (`tinycloud-agents/`):
 
 ```bash
-docker build -f packages/eliza-service/Dockerfile -t ghcr.io/tinycloudlabs/eliza-service:latest .
+docker build --build-arg BUILD_REVISION="$(git rev-parse HEAD)" -f packages/eliza-service/Dockerfile -t ghcr.io/tinycloudlabs/eliza-service:latest .
 ```
 
 (`--platform linux/amd64` if building on Apple Silicon for an amd64 CVM.)
+
+Build from a committed, clean checkout so the revision identifies the image's
+source. CI should pass its immutable commit SHA as `BUILD_REVISION`. The service
+exposes the revision and `meetingRetrieval.contractVersion: 2` from authenticated
+`GET /capabilities`; an omitted/invalid revision is reported as `unknown`, which
+keeps TinyChat's version-2 meeting controller unavailable. Health alone does not
+establish contract compatibility or deployment provenance.
+
+The transcript transport propagates SQL/KV abort signals and deadline cancellation
+through the pinned SDK 2.6.0. It caps retained decoded input at 1 MiB before the
+SDK buffers or parses KV, SQL and error bodies, cancelling streams that exceed
+the limit. Native fetch has already allocated the crossing chunk; native queues,
+decompression and later bounded decoding/parsing copies remain outside this
+buffer bound. No process-memory ceiling or deployed memory acceptance is
+established. Verify memory behavior and latency in the target environment before
+enabling the new controller; no SDK upgrade is bundled here.
 
 ## 2. Push to GHCR
 

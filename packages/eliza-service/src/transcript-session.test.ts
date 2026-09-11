@@ -158,16 +158,16 @@ function fakeNodeFactory(corpusFor: (privateKey: string) => Corpus, trace: NodeT
           db(name: string) {
             trace.dbs.push(name);
             return {
-              async query(sql: string) {
+              async query(sql: string, params?: unknown[]) {
                 trace.sql.push(sql);
-                return { ok: true, data: { rows: corpus.rows } };
+                return { ok: true, data: { rows: sql.includes("WHERE id = ?") ? corpus.rows.filter(row => row[0] === params?.[0]) : corpus.rows } };
               },
             };
           },
         },
         kv: {
           async get(key: string, options?: { prefix?: string }) {
-            expect(options).toEqual({ prefix: "" });
+            expect(options).toMatchObject({ prefix: "", raw: true });
             trace.kvKeys.push(key);
             if (!(key in corpus.bodies)) return { ok: false, error: { code: "KV_NOT_FOUND" } };
             return { ok: true, data: { data: JSON.stringify(corpus.bodies[key]) } };
@@ -208,7 +208,7 @@ function corpusB(): Corpus {
 
 // ── Wiring that mirrors RuntimeHost, minus a real AgentRuntime ────────────────
 
-function makeSlice(opts: { trace?: NodeTrace; failSignIn?: boolean; ttlMs?: number; maxEntries?: number } = {}) {
+function makeSlice(opts: { trace?: NodeTrace; failSignIn?: boolean; ttlMs?: number; maxEntries?: number; corpus?: Corpus } = {}) {
   const trace: NodeTrace = opts.trace ?? { sql: [], dbs: [], kvKeys: [], signIns: 0 };
   const registry = new TranscriptAccessRegistry({
     agentDid: AGENT_DID,
@@ -217,7 +217,7 @@ function makeSlice(opts: { trace?: NodeTrace; failSignIn?: boolean; ttlMs?: numb
     ...(opts.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
     ...(opts.maxEntries !== undefined ? { maxEntries: opts.maxEntries } : {}),
     nodeFactory: fakeNodeFactory(
-      (ownerSpace) => (ownerSpace.toLowerCase().includes(OWNER_B.toLowerCase()) ? corpusB() : corpusA()),
+      (ownerSpace) => opts.corpus ?? (ownerSpace.toLowerCase().includes(OWNER_B.toLowerCase()) ? corpusB() : corpusA()),
       trace,
       opts.failSignIn ?? false,
     ),
@@ -294,8 +294,10 @@ describe("session registration reaches the production transcript action", () => 
     }, host, store);
     await runTool(runtime, "entity-a", { query: "ember compass" });
 
-    expect(trace.dbs).toEqual([SQL_PATH]);
-    expect(trace.sql).toEqual(["SELECT id, source, source_id, title, started_at, organizer_email, participants, summary_overview, summary_action_items FROM connector_meeting ORDER BY started_at DESC LIMIT 501"]);
+    expect(trace.dbs).toEqual([SQL_PATH, SQL_PATH]);
+    expect(trace.sql).toHaveLength(2);
+    expect(trace.sql[0]).toContain("FROM connector_meeting ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) DESC, id ASC LIMIT 501");
+    expect(trace.sql[1]).toContain("FROM connector_meeting WHERE id = ? LIMIT 1");
     expect(trace.kvKeys).toEqual([`${KV_PATH}fireflies/transcript/canary-1`]);
   });
 
@@ -321,6 +323,73 @@ describe("session registration reaches the production transcript action", () => 
     );
     expect(JSON.stringify(read)).toContain("send the decision memo");
     expect(JSON.stringify(read)).toContain("[M1:A1]");
+  });
+});
+
+describe("v2 scope and live selection", () => {
+  async function slice(corpus = corpusA()) {
+    const value = makeSlice({ corpus });
+    await value.registry.register("entity-a", transcriptGrant(), "thread-v2");
+    const call = (action: typeof tinycloudFindMeetingsAction, args: Record<string, unknown>, mode: "single" | "selected" | "range") => action.handler(value.runtime, { entityId: "entity-a", roomId: "thread-v2", content: {} } as never, undefined, { args, context: { retrievalMode: mode } }, undefined, []);
+    return { ...value, call };
+  }
+  test("ambiguous and zero-result scopes suspend a previous selection", async () => {
+    const corpus = corpusA(); const value = await slice(corpus);
+    await value.call(tinycloudFindMeetingsAction, { meetingRef: "meeting-a" }, "single");
+    corpus.rows.push(["meeting-b", "fireflies", "other", "Another meeting", "2026-08-26T10:00:00Z", null, [], null, null]);
+    await value.call(tinycloudFindMeetingsAction, {}, "single");
+    expect(value.registry.selectedMeetingFor("entity-a", "thread-v2")).toBeNull();
+    await expect(value.call(tinycloudReadMeetingAction, { focus: "summary" }, "selected")).rejects.toMatchObject({ code: "meeting_selection_required" });
+    await value.call(tinycloudFindMeetingsAction, { title: "absent" }, "single");
+    expect(value.registry.selectedMeetingFor("entity-a", "thread-v2")).toBeNull();
+  });
+  test("one match inside a limited scan is not a unique selection", async () => {
+    const corpus = corpusA(); corpus.rows.push(...Array.from({ length: 500 }, () => [null]));
+    const value = await slice(corpus);
+    const found = await value.call(tinycloudFindMeetingsAction, { title: "Canary" }, "single");
+    expect((found as any).data.discovery.countKind).toBe("lower_bound");
+    expect(value.registry.selectedMeetingFor("entity-a", "thread-v2")).toBeNull();
+  });
+  test("range fan-out and a lone topic match cannot select a meeting", async () => {
+    const value = await slice();
+    await value.call(tinycloudFindMeetingsAction, { meetingRef: "meeting-a" }, "single");
+    await value.call(tinycloudSearchTranscriptsAction, { query: "ember compass" }, "range");
+    await value.call(tinycloudReadMeetingAction, { meetingRef: "meeting-a", focus: "summary" }, "range");
+    expect(value.registry.selectedMeetingFor("entity-a", "thread-v2")).toBeNull();
+    await expect(value.call(tinycloudFindMeetingsAction, {}, "selected")).rejects.toMatchObject({ code: "meeting_selection_required" });
+  });
+  test("selected metadata uses exact SQL and never touches KV", async () => {
+    const value = await slice();
+    await value.call(tinycloudFindMeetingsAction, { meetingRef: "meeting-a" }, "single");
+    value.trace.sql.length = 0;
+    await value.call(tinycloudFindMeetingsAction, {}, "selected");
+    expect(value.trace.sql).toHaveLength(1);
+    expect(value.trace.sql[0]).toContain("WHERE id = ?");
+    expect(value.trace.kvKeys).toHaveLength(0);
+  });
+  test("selected conflicting filters and citation aliases never broaden scope", async () => {
+    const value = await slice();
+    await value.call(tinycloudFindMeetingsAction, { meetingRef: "meeting-a" }, "single");
+    const calls = value.trace.sql.length;
+    await expect(value.call(tinycloudSearchTranscriptsAction, { query: "ember", title: "new" }, "selected")).rejects.toMatchObject({ code: "invalid_scope" });
+    await expect(value.call(tinycloudReadMeetingAction, { focus: "summary", meetingRef: "[M1]" }, "single")).rejects.toMatchObject({ code: "invalid_args" });
+    expect(value.trace.sql).toHaveLength(calls);
+  });
+  test("cached reader cannot return evidence after revocation during a body request", async () => {
+    let release!: () => void; let started!: () => void;
+    const bodyStarted = new Promise<void>(resolve => { started = resolve; });
+    const registry = new TranscriptAccessRegistry({ agentDid: AGENT_DID, agentKey: AGENT_KEY, host: "https://node.tinycloud.xyz", nodeFactory: () => ({ signIn: async () => {}, useDelegation: async () => ({ sql: { db: () => ({ query: async () => ({ ok: true, data: { rows: corpusA().rows } }) }) }, kv: { get: async () => { started(); await new Promise<void>(resolve => { release = resolve; }); return { ok: true, data: { data: '"private late evidence"' } }; } } }) }) });
+    await registry.register("entity-a", transcriptGrant(), "thread-v2");
+    const reader = registry.readerFor("entity-a", "thread-v2");
+    const body = reader.readBody!("fireflies", "canary-1");
+    await bodyStarted; registry.revoke("entity-a"); release();
+    await expect(body).rejects.toMatchObject({ name: "NoDelegationError" });
+  });
+  test("replacing the entity bound to a room clears the former entity's selection", async () => {
+    const value = await slice();
+    await value.call(tinycloudFindMeetingsAction, { meetingRef: "meeting-a" }, "single");
+    await value.registry.register("entity-b", transcriptGrant({ owner: OWNER_B }), "thread-v2");
+    expect(value.registry.selectedMeetingFor("entity-b", "thread-v2")).toBeNull();
   });
 });
 

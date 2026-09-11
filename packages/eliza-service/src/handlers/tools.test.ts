@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { Action, IAgentRuntime } from "@elizaos/core";
 import { NoDelegationError } from "@tinycloud/eliza-plugin-memory";
 import { handlePostTool, ToolError, type ToolHandlerHost } from "./tools.js";
 import { webSearchAction } from "../actions/web-search.js";
+import { setTranscriptRegistry, tinycloudReadMeetingAction, tinycloudListMeetingActionsAction, tinycloudSearchTranscriptsAction, type TranscriptMetadata } from "../actions/tinycloud-search-transcripts.js";
 
 const AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
@@ -12,6 +13,29 @@ function hostWithActions(actions: Action[]): ToolHandlerHost {
 }
 
 describe("handlePostTool", () => {
+  it("discards a late tool result after request abort", async () => {
+    const controller = new AbortController();
+    let release!: () => void;
+    const action = { name: "SLOW", handler: async () => { await new Promise<void>(resolve => { release = resolve; }); return { text: "private late content" }; } } as unknown as Action;
+    const result = handlePostTool("slow", AGENT_ID, {}, hostWithActions([action]), { signal: controller.signal });
+    await new Promise(resolve => setTimeout(resolve, 0)); controller.abort(); release();
+    expect(await result).toMatchObject({ status: 499, body: { error: "retrieval_cancelled" } });
+  });
+  it("fits the complete v2 wire response including callback frames and legacy copies", async () => {
+    const runtime = { actions: [tinycloudReadMeetingAction, tinycloudListMeetingActionsAction] } as unknown as IAgentRuntime;
+    const rows = Array.from({ length: 12 }, (_, i) => ({ meetingRef: `ref-${i}`, source: "fireflies" as const, sourceId: `source-${i}`, title: 'title"\\'.repeat(100), startedAt: "2026-09-09T10:00:00Z", participantNames: Array.from({ length: 20 }, () => "P".repeat(120)), participantEmails: [], organizerEmail: "organizer@example.com", summaryOverview: 'overview"\\'.repeat(2000), summaryActionItems: Array.from({ length: 8 }, () => '- Sam will send "\\'.repeat(70)).join("\n") }));
+    setTranscriptRegistry(runtime, { readerFor: () => ({ listMetadata: async () => rows, getTranscript: async () => [{ text: 'long"\\'.repeat(3000) }] }), selectedMeetingFor: () => null, selectMeeting: () => {} });
+    for (const [tool, args, mode] of [["tinycloud_read_meeting", { meetingRef: "ref-0", focus: "summary", includeBody: true }, "single"], ["tinycloud_list_meeting_actions", { includeBody: true }, "range"]] as const) {
+      const response = await handlePostTool(tool, AGENT_ID, { args, context: { retrievalMode: mode } }, { runtimeFor: async () => runtime });
+      expect(response.status).toBe(200);
+      expect(JSON.stringify(response.body).length).toBeLessThanOrEqual(16_000);
+      const data = (response.body as any).result.data;
+      expect(data.outcomes).toHaveLength(mode === "range" ? 12 : 1);
+      expect(data.outcomes.every((outcome: any) => outcome.evidence.length > 0)).toBe(true);
+      expect(data.outcomes.some((outcome: any) => outcome.coverage.omissionReasons.length > 0)).toBe(true);
+      for (const outcome of data.outcomes) expect(outcome.coverage.evidenceRetained).toBe(outcome.evidence.length);
+    }
+  });
   it("returns 404 for an unknown tool", async () => {
     const host = hostWithActions([]);
     const result = await handlePostTool("nope", AGENT_ID, { args: {} }, host);
@@ -83,6 +107,84 @@ describe("handlePostTool", () => {
     const result = await handlePostTool("throws", AGENT_ID, {}, hostWithActions([action]));
     expect(result.status).toBe(502);
     expect(result.body).toEqual({ error: "tool_failed" });
+  });
+});
+
+describe("legacy meeting selection", () => {
+  const rows: TranscriptMetadata[] = [
+    { meetingRef: "newer-nonmatch", source: "fireflies", sourceId: "newer-source",
+      title: "Gardening", startedAt: "2026-09-09T10:00:00Z", participantNames: [],
+      participantEmails: [], organizerEmail: null, summaryOverview: "We discussed gardening.", summaryActionItems: null },
+    { meetingRef: "older-match", source: "fireflies", sourceId: "older-source",
+      title: "Launch", startedAt: "2026-09-08T10:00:00Z", participantNames: [],
+      participantEmails: [], organizerEmail: null, summaryOverview: "We discussed cobalt for launch.", summaryActionItems: null },
+  ];
+  const session = { entityId: "synthetic-entity", roomId: "synthetic-room" };
+  let selected: string | null;
+  let runtime: IAgentRuntime;
+  let host: ToolHandlerHost;
+
+  beforeEach(() => {
+    selected = null;
+    runtime = { agentId: AGENT_ID, actions: [tinycloudSearchTranscriptsAction, tinycloudReadMeetingAction] } as unknown as IAgentRuntime;
+    host = { runtimeFor: async () => runtime };
+    setTranscriptRegistry(runtime, {
+      readerFor: () => ({
+        listMetadata: async () => rows,
+        getTranscript: async (_source, sourceId) => [{ text: rows.find(row => row.sourceId === sourceId)!.summaryOverview! }],
+      }),
+      selectedMeetingFor: () => selected,
+      selectMeeting: (_entity, _room, reference) => { selected = reference; },
+    });
+  });
+  afterEach(() => setTranscriptRegistry(runtime, null));
+
+  it("legacy search selects its sole match for the follow-up read", async () => {
+    const search = await handlePostTool("tinycloud_search_transcripts", AGENT_ID, { ...session, args: { query: "cobalt" } }, host);
+    expect(search.status).toBe(200);
+    expect((search.body as any).result.data.matches.map((item: { meetingRef: string }) => item.meetingRef)).toEqual(["older-match"]);
+    expect(selected).toBe("older-match");
+
+    const followup = await handlePostTool("tinycloud_read_meeting", AGENT_ID, { ...session, args: { focus: "summary" } }, host);
+    expect(followup.status).toBe(200);
+    expect((followup.body as any).result.data.outcomes.map((item: { meetingRef: string }) => item.meetingRef)).toEqual(["older-match"]);
+    expect((followup.body as any).result.data.summary.text).toBe(rows[1]!.summaryOverview!);
+    expect(JSON.stringify(followup.body)).not.toContain("newer-nonmatch");
+    expect((followup.body as any).result.data.summary.text).not.toContain(rows[0]!.summaryOverview!);
+
+    const explicit = await handlePostTool("tinycloud_read_meeting", AGENT_ID, { ...session, args: { focus: "summary", meetingRef: "newer-nonmatch" } }, host);
+    expect(explicit.status).toBe(200);
+    expect(selected).toBe("newer-nonmatch");
+    expect((explicit.body as any).result.data.outcomes[0].meetingRef).toBe("newer-nonmatch");
+    expect((explicit.body as any).result.data.summary.text).toBe(rows[0]!.summaryOverview!);
+
+    const next = await handlePostTool("tinycloud_read_meeting", AGENT_ID, { ...session, args: { focus: "summary" } }, host);
+    expect(next.status).toBe(200);
+    expect((next.body as any).result.data.outcomes[0].meetingRef).toBe("newer-nonmatch");
+    expect((next.body as any).result.data.summary.text).toBe(rows[0]!.summaryOverview!);
+    expect((next.body as any).result.data.summary.text).not.toContain(rows[1]!.summaryOverview!);
+  });
+
+  it.each([
+    ["quartz", 0, null], ["quartz", 0, "older-match"],
+    ["discussed", 2, null], ["discussed", 2, "older-match"],
+  ] as const)("legacy search for %s with %i matches preserves selection %j", async (query, matchCount, prior) => {
+    selected = prior;
+    const search = await handlePostTool("tinycloud_search_transcripts", AGENT_ID, { ...session, args: { query } }, host);
+    expect(search.status).toBe(200);
+    expect((search.body as any).result.data.matches).toHaveLength(matchCount);
+    expect(selected).toBe(prior);
+
+    const followup = await handlePostTool("tinycloud_read_meeting", AGENT_ID, { ...session, args: { focus: "summary" } }, host);
+    if (prior) {
+      expect(followup.status).toBe(200);
+      expect((followup.body as any).result.data.outcomes[0].meetingRef).toBe(prior);
+      expect((followup.body as any).result.data.summary.text).toBe(rows[1]!.summaryOverview!);
+      expect((followup.body as any).result.data.summary.text).not.toContain(rows[0]!.summaryOverview!);
+    } else {
+      expect(followup).toEqual({ status: 409, body: { error: "meeting_selection_required" } });
+    }
+    expect(selected).toBe(prior);
   });
 });
 
