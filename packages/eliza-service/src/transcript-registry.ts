@@ -6,13 +6,16 @@ import {
 import type { PortableDelegation } from "@tinycloud/agent-client";
 import { DelegationExpiredError, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
 import type { TranscriptMetadata, TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
-import { decodeBody, discoveryResult, MeetingRetrievalError, withinContext } from "./meeting-evidence.js";
+import { checkContext, decodeBody, discoveryResult, MeetingRetrievalError, withinContext } from "./meeting-evidence.js";
 import type { BodyResult, MeetingSelection, RetrievalContext } from "./meeting-evidence.js";
 import { createTranscriptNode, TranscriptResponseLimitError } from "./transcript-transport.js";
 
 const SQL_PATH = "xyz.tinycloud.tinychat/connectors";
 const MAX_ENTRIES = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_MAX_CLIENTS) || 256;
 const TTL_MS = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_TTL_MS) || 4 * 60 * 60 * 1000;
+// node-sdk 2.6.0 activates a child session lasting at most one hour, even when
+// its portable parent is valid for days. Renew on the next read before expiry.
+const SESSION_REFRESH_MS = 50 * 60 * 1000;
 /** Bounded discovery: one row over the policy ceiling is the overflow sentinel. */
 const METADATA_ROW_LIMIT = 501;
 
@@ -29,12 +32,15 @@ export interface TranscriptNode {
 
 interface Entry {
   access: Access;
+  delegation: PortableDelegation;
+  refreshAt: number;
+  refresh?: Promise<void>;
   expiry: Date;
   lastUsed: number;
   roomId?: string;
 }
 
-/** Per-entity activated transcript access. It retains only delegated handles, never bodies. */
+/** Per-entity transcript grants and renewable delegated access; never retains bodies. */
 export class TranscriptAccessRegistry implements TranscriptRegistry {
   private readonly entries = new Map<string, Entry>();
   private readonly pending = new Map<string, Promise<void>>();
@@ -98,12 +104,33 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
       throw new DelegationExpiredError(entityId);
     }
     entry.lastUsed = Date.now();
-    return createReader(entry.access, () => {
+    const assertAccess = () => {
       // Recheck the current grant before and after every storage operation. Replaced
       // handles cannot finish an old request with evidence from their former grant.
       this.readerFor(entityId, roomId);
       if (this.entries.get(entityId) !== entry) throw new NoDelegationError(entityId);
-    }, () => this.drop(entityId));
+    };
+    return createReader(async () => {
+      assertAccess();
+      if (Date.now() >= entry.refreshAt) {
+        if (!entry.refresh) {
+          const startedAt = Date.now();
+          entry.refresh = this.activateAccess(entry.delegation).then(access => {
+            // Renewal preserves the entry and its selection. A late activation
+            // must never restore a revoked, replaced, evicted, or stopped entry.
+            assertAccess();
+            entry.access = access;
+            entry.refreshAt = startedAt + SESSION_REFRESH_MS;
+          }, () => {
+            assertAccess();
+            throw new MeetingRetrievalError("transcript_unavailable");
+          }).finally(() => { entry.refresh = undefined; });
+        }
+        await entry.refresh;
+      }
+      assertAccess();
+      return entry.access;
+    }, assertAccess, () => this.drop(entityId));
   }
 
   selectedMeetingFor(entityId: string, roomId?: string): string | null {
@@ -152,17 +179,23 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
     const delegation = deserializeTranscriptDelegationForActivation(serialized);
     validateExactDelegationPolicy(delegation, { agentDID: this.args.agentDid, policy: defaultTinychatTranscriptPolicy() });
     const expiry = delegation.expiry instanceof Date ? delegation.expiry : new Date(delegation.expiry as unknown as string);
-    const node = this.args.nodeFactory
-      ? this.args.nodeFactory({ privateKey: this.args.agentKey, host: this.args.host })
-      : createTranscriptNode({ privateKey: this.args.agentKey, host: this.args.host });
-    await node.signIn();
-    const access = await node.useDelegation(delegation) as unknown as Access;
+    const startedAt = Date.now();
+    const access = await this.activateAccess(delegation);
     if (this.entries.size >= (this.args.maxEntries ?? MAX_ENTRIES)) this.evictLru();
-    this.entries.set(entityId, { access, expiry, lastUsed: Date.now(), roomId });
+    this.entries.set(entityId, { access, delegation, refreshAt: startedAt + SESSION_REFRESH_MS, expiry, lastUsed: Date.now(), roomId });
     if (roomId) {
       this.selectedMeetingByRoom.delete(roomId);
       this.roomToEntity.set(roomId, entityId);
     }
+  }
+
+  private async activateAccess(delegation: PortableDelegation): Promise<Access> {
+    // Build a fresh wallet session, then reactivate the same exact parent grant.
+    const node = this.args.nodeFactory
+      ? this.args.nodeFactory({ privateKey: this.args.agentKey, host: this.args.host })
+      : createTranscriptNode({ privateKey: this.args.agentKey, host: this.args.host });
+    await node.signIn();
+    return await node.useDelegation(delegation) as unknown as Access;
   }
 
   private drop(entityId: string): void {
@@ -222,7 +255,15 @@ export function classifyBodyFailure(error: unknown): BodyResult {
   if (code === "KV_NOT_FOUND") return /(?:key|entry) not found/i.test(text) ? { state: "missing", reasonCode: code } : { state: "unavailable", reasonCode: "ambiguous_not_found" };
   return { state: "unavailable", reasonCode: code };
 }
-export function createReader(access: Access, assertAccess: () => void = () => {}, invalidateAccess: () => void = () => {}): TranscriptReader {
+export function createReader(access: Access | (() => Promise<Access>), assertAccess: () => void = () => {}, invalidateAccess: () => void = () => {}): TranscriptReader {
+  const withAccess = async <T>(signal: AbortSignal | undefined, operation: (active: Access) => Promise<T>) => {
+    const active = typeof access === "function" ? await access() : access;
+    // A caller can stop waiting while a shared renewal continues for others.
+    // Check again before storage so cancelled callers never start a late read.
+    checkContext({ signal });
+    assertAccess();
+    return operation(active);
+  };
   const enforceAccess = (body: BodyResult) => {
     if (body.state !== "access_denied") return;
     const code = body.reasonCode === "DELEGATION_REVOKED" ? "delegation_revoked" : body.reasonCode === "DELEGATION_EXPIRED" || body.reasonCode === "AUTH_EXPIRED" ? "delegation_expired" : "access_denied";
@@ -231,7 +272,7 @@ export function createReader(access: Access, assertAccess: () => void = () => {}
   };
   const query = async (sql: string, params: Array<string | number | null> = [], context: RetrievalContext = {}): Promise<unknown[][]> => {
     assertAccess();
-    const response = await withinContext(signal => access.sql.db(SQL_PATH).query(sql, params, { signal }), context) as { ok?: boolean; data?: { rows?: unknown[][] }; error?: unknown };
+    const response = await withinContext(signal => withAccess(signal, active => active.sql.db(SQL_PATH).query(sql, params, { signal })), context) as { ok?: boolean; data?: { rows?: unknown[][] }; error?: unknown };
     assertAccess();
     if (response?.ok !== true || !Array.isArray(response.data?.rows)) {
       enforceAccess(classifyBodyFailure(response?.error));
@@ -244,7 +285,7 @@ export function createReader(access: Access, assertAccess: () => void = () => {}
     assertAccess();
     // Transcript-only transport caps decoded bytes before SDK buffering. Retain
     // the decoded-value check for injected readers and UTF-8 replacement growth.
-    const response = await withinContext(signal => access.kv.get(`${SQL_PATH}/${source}/transcript/${sourceId}`, { prefix: "", raw: true, signal }), context) as { ok?: boolean; error?: unknown; data?: { data?: unknown } };
+    const response = await withinContext(signal => withAccess(signal, active => active.kv.get(`${SQL_PATH}/${source}/transcript/${sourceId}`, { prefix: "", raw: true, signal })), context) as { ok?: boolean; error?: unknown; data?: { data?: unknown } };
     assertAccess();
     const body = response?.ok === true ? decodeBody(response.data?.data) : classifyBodyFailure(response?.error);
     enforceAccess(body); return body;
