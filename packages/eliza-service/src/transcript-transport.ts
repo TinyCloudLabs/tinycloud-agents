@@ -1,7 +1,7 @@
 import { KVService, NodeWasmBindings, SQLService, ServiceContext, TinyCloudNode } from "@tinycloud/node-sdk";
 import type { DelegatedAccess, FetchFunction, IWasmBindings, PortableDelegation } from "@tinycloud/node-sdk";
 
-export const TRANSCRIPT_RESPONSE_BYTE_LIMIT = 1_048_576;
+export const TRANSCRIPT_RESPONSE_BYTE_LIMIT = 2_097_152;
 export type TranscriptFetch = (url: string, init?: Parameters<FetchFunction>[1]) => Promise<Response>;
 
 /** Keep activation unchanged and replace only the delegated storage services. */
@@ -50,7 +50,7 @@ export class TranscriptResponseLimitError extends Error {
 
 /**
  * Count native fetch's decoded bytes before handing a body to SDK text/json.
- * The retained input buffer is at most 1 MiB. The crossing chunk has already
+ * The retained input buffer is at most 2 MiB. The crossing chunk has already
  * been allocated by fetch, and native queues/decompression are outside this
  * bound. Response construction and SDK decoding/parsing add bounded copies;
  * this is not a process-memory or network-allocation ceiling.

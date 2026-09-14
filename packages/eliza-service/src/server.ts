@@ -67,7 +67,7 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
         const auth = checkServiceAuth(request);
         if (!auth.ok) return auth.response;
         const revision = process.env.BUILD_REVISION ?? process.env.GIT_SHA;
-        return json(200, { meetingRetrieval: { contractVersion: 2 }, buildRevision: revision && /^[a-f0-9]{40,64}$/i.test(revision) ? revision : "unknown" });
+        return json(200, { meetingRetrieval: { contractVersion: 3 }, buildRevision: revision && /^[a-f0-9]{40,64}$/i.test(revision) ? revision : "unknown" });
       }
 
       if (request.method === "POST" && url.pathname === "/sessions") {

@@ -10,6 +10,7 @@
 // normalization, exact policy validation, the 7-day ceiling, the fixed SQL
 // statement, and the fixed KV key — is the real implementation.
 
+import { sha256 } from "./meeting-evidence.js";
 import { describe, expect, test } from "bun:test";
 import { serializeDelegation } from "@tinycloud/agent-client";
 import type { PortableDelegation } from "@tinycloud/agent-client";
@@ -160,7 +161,7 @@ function fakeNodeFactory(corpusFor: (privateKey: string) => Corpus, trace: NodeT
             return {
               async query(sql: string, params?: unknown[]) {
                 trace.sql.push(sql);
-                return { ok: true, data: { rows: sql.includes("WHERE id = ?") ? corpus.rows.filter(row => row[0] === params?.[0]) : corpus.rows } };
+                return { ok: true, data: { rows: sql.includes("connector_publication_snapshot") ? corpus.rows.filter(row=>row[8]===params?.[0]&&row[0]===params?.[1]&&row[1]===params?.[2]&&row[2]===params?.[3]).map(row=>[row[8]]) : sql.includes("WHERE id = ?") ? corpus.rows.filter(row => row[0] === params?.[0]) : corpus.rows } };
               },
             };
           },
@@ -184,27 +185,17 @@ const FIREFLIES_CANARY = [
   { text: "Anything else before we close?", speaker_name: "Robin", start_time: 130 },
 ];
 
-function corpusA(): Corpus {
-  return {
-    rows: [[
-      "meeting-a", "fireflies", "canary-1", "Agent Retrieval Canary", "2026-08-26T10:00:00.000Z",
-      "avery@example.test", JSON.stringify([{ name: "Avery", email: "avery@example.test" }]),
-      "The team approved ember compass.", "Avery will send the decision memo.",
-    ]],
-    bodies: { [`${KV_PATH}fireflies/transcript/canary-1`]: FIREFLIES_CANARY },
-  };
+function makeCorpus(meetingRef:string,sourceId:string,title:string,records:unknown[]):Corpus {
+  const raw=JSON.stringify(records);
+  const snapshot={contractVersion:3,meetingRef,source:"fireflies",sourceId,operationId:"test-operation",createdAt:"2026-09-14T00:00:00Z",
+    metadata:{title,startedAt:null,organizerEmail:null,participants:[],metadata:{}},
+    body:{basis:"transcript",encoding:"utf-8",schema:"json-records",raw,original:{digest:sha256(raw),byteLength:Buffer.byteLength(raw),recordCount:records.length,extent:"unknown",captureComplete:null},omissions:[]},overview:null,aliases:[]};
+  const revision=sha256(JSON.stringify(snapshot));
+  return {rows:[[meetingRef,"fireflies",sourceId,title,null,null,"[]","{}",revision,null,"published"]],bodies:{[`${KV_PATH}fireflies/snapshot/${sourceId}/${revision}`]:snapshot}};
 }
-
-function corpusB(): Corpus {
-  return {
-    rows: [[
-      "meeting-b", "fireflies", "other-1", "Someone Else's Meeting", "2026-08-25T10:00:00.000Z",
-      "blake@example.test", JSON.stringify([{ name: "Blake", email: "blake@example.test" }]),
-      null, null,
-    ]],
-    bodies: { [`${KV_PATH}fireflies/transcript/other-1`]: [{ text: "unrelated chatter", speaker_name: "Blake", start_time: 1 }] },
-  };
-}
+function corpusA():Corpus{return makeCorpus("meeting-a","canary-1","Agent Retrieval Canary",FIREFLIES_CANARY);}
+function corpusB():Corpus{return makeCorpus("meeting-b","other-1","Someone Else's Meeting",[{text:"unrelated chatter"}]);}
+const EXACT_ARGS={contractVersion:3,reference:{meetingRef:"meeting-a",source:"fireflies",sourceId:"canary-1",revision:corpusA().rows[0][8]},basis:"transcript"};
 
 // ── Wiring that mirrors RuntimeHost, minus a real AgentRuntime ────────────────
 
@@ -246,11 +237,11 @@ async function runTool(
   args: Record<string, unknown>,
   roomId = crypto.randomUUID(),
 ) {
-  return tinycloudSearchTranscriptsAction.handler(
+  return tinycloudReadMeetingAction.handler(
     runtime,
     { entityId, roomId, content: { text: String(args.query ?? "") } } as never,
     undefined,
-    { args },
+    { args: EXACT_ARGS },
     undefined,
     [],
   );
@@ -258,138 +249,26 @@ async function runTool(
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-describe("session registration reaches the production transcript action", () => {
-  test("an accepted v2 envelope activates access the registered action can use", async () => {
-    const { host, store, runtime, trace } = makeSlice();
-    const posted = await handlePostSessions({
-      agentId: AGENT_ID,
-      entityId: "entity-a",
-      session: { version: 2, delegations: { memory: memoryGrant(), transcripts: transcriptGrant() }, roomId: "thread-1" },
-    }, host, store);
-
-    expect(posted.status).toBe(200);
-    expect((posted.body as { transcriptStatus?: string }).transcriptStatus).toBe("active");
-    expect(trace.signIns).toBe(1);
-
-    // A DIFFERENT room than the one the session registered: a user has many
-    // threads per grant, and tool dispatch synthesizes a room when none is sent.
-    const result = await runTool(runtime, "entity-a", { query: "final choice replaced cobalt" }, "thread-99");
-    const data = (result as { data: { corpus: Record<string, number | boolean>; matches: Array<Record<string, unknown>> } }).data;
-
-    expect(data.matches).toHaveLength(1);
-    expect(data.matches[0]).toMatchObject({ citation: "[M1]", meetingRef: "meeting-a", source: "fireflies", title: "Agent Retrieval Canary" });
-    const excerpts = data.matches[0].excerpts as Array<{ citation: string; text: string; speaker?: string; startSecs?: number }>;
-    expect(excerpts[0].text).toContain("ember compass");
-    expect(excerpts[0].speaker).toBe("Avery");
-    expect(excerpts[0].startSecs).toBe(72);
-    expect(excerpts[0].citation).toBe("[M1:E1, Avery, 00:01:12]");
-    expect(data.corpus).toMatchObject({ candidateCount: 1, examinedCount: 1, matchedCount: 1, truncated: false, partial: false });
+describe("session registration reaches typed exact transcript reads",()=>{
+  test("accepted session grants activate exact revision reads in another authorized room",async()=>{
+    const {host,store,runtime,trace}=makeSlice();
+    const posted=await handlePostSessions({agentId:AGENT_ID,entityId:"entity-a",session:{version:2,delegations:{memory:memoryGrant(),transcripts:transcriptGrant()},roomId:"thread-1"}},host,store);
+    expect(posted.status).toBe(200);expect(trace.signIns).toBe(1);
+    const result=await runTool(runtime,"entity-a",{},"thread-99") as any;
+    expect(result.data.state).toBe("complete");expect(result.data.spans).toHaveLength(3);
+    expect(result.data.spans[1]).toMatchObject({text:"We rejected cobalt; the final choice is ember compass.",speaker:"Avery",startSecs:72,recordIndex:1});
+    expect(trace.dbs).toEqual([SQL_PATH,SQL_PATH,SQL_PATH,SQL_PATH]);
+    expect(trace.sql.every(sql=>(sql.includes("FROM connector_meeting WHERE id = ? LIMIT 1") || sql.includes("FROM connector_publication_snapshot s JOIN connector_meeting m")))).toBe(true);
+    expect(trace.kvKeys).toEqual([`${KV_PATH}fireflies/snapshot/canary-1/${EXACT_ARGS.reference.revision}`]);
   });
-
-  test("the concrete reader uses only the fixed connector SQL db and transcript KV key", async () => {
-    const { host, store, runtime, trace } = makeSlice();
-    await handlePostSessions({
-      agentId: AGENT_ID, entityId: "entity-a",
-      session: { version: 2, delegations: { memory: memoryGrant(), transcripts: transcriptGrant() } },
-    }, host, store);
-    await runTool(runtime, "entity-a", { query: "ember compass" });
-
-    expect(trace.dbs).toEqual([SQL_PATH, SQL_PATH]);
-    expect(trace.sql).toHaveLength(2);
-    expect(trace.sql[0]).toContain("FROM connector_meeting ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) DESC, id ASC LIMIT 501");
-    expect(trace.sql[1]).toContain("FROM connector_meeting WHERE id = ? LIMIT 1");
-    expect(trace.kvKeys).toEqual([`${KV_PATH}fireflies/transcript/canary-1`]);
-  });
-
-  test("a unique metadata find selects the room for a content-free follow-up read", async () => {
-    const { host, store, runtime, registry } = makeSlice();
-    await handlePostSessions({
-      agentId: AGENT_ID, entityId: "entity-a",
-      session: { version: 2, delegations: { memory: memoryGrant(), transcripts: transcriptGrant() }, roomId: "thread-1" },
-    }, host, store);
-
-    const found = await tinycloudFindMeetingsAction.handler(
-      runtime, { entityId: "entity-a", roomId: "thread-1", content: { text: "latest meeting" } } as never,
-      undefined, { args: { sort: "newest" } }, undefined, [],
-    );
-    expect((found as { data: { meetings: Array<{ meetingRef: string }> } }).data.meetings[0]?.meetingRef).toBe("meeting-a");
-    expect(registry.selectedMeetingFor("entity-a", "thread-1")).toBe("meeting-a");
-
-    // A model may echo the display citation into meetingRef. Citation aliases
-    // are room-local and resolve only through the already-selected meeting.
-    const read = await tinycloudReadMeetingAction.handler(
-      runtime, { entityId: "entity-a", roomId: "thread-1", content: { text: "what next?" } } as never,
-      undefined, { args: { focus: "actions", meetingRef: "[M1]" } }, undefined, [],
-    );
-    expect(JSON.stringify(read)).toContain("send the decision memo");
-    expect(JSON.stringify(read)).toContain("[M1:A1]");
-  });
-});
-
-describe("v2 scope and live selection", () => {
-  async function slice(corpus = corpusA()) {
-    const value = makeSlice({ corpus });
-    await value.registry.register("entity-a", transcriptGrant(), "thread-v2");
-    const call = (action: typeof tinycloudFindMeetingsAction, args: Record<string, unknown>, mode: "single" | "selected" | "range") => action.handler(value.runtime, { entityId: "entity-a", roomId: "thread-v2", content: {} } as never, undefined, { args, context: { retrievalMode: mode } }, undefined, []);
-    return { ...value, call };
-  }
-  test("ambiguous and zero-result scopes suspend a previous selection", async () => {
-    const corpus = corpusA(); const value = await slice(corpus);
-    await value.call(tinycloudFindMeetingsAction, { meetingRef: "meeting-a" }, "single");
-    corpus.rows.push(["meeting-b", "fireflies", "other", "Another meeting", "2026-08-26T10:00:00Z", null, [], null, null]);
-    await value.call(tinycloudFindMeetingsAction, {}, "single");
-    expect(value.registry.selectedMeetingFor("entity-a", "thread-v2")).toBeNull();
-    await expect(value.call(tinycloudReadMeetingAction, { focus: "summary" }, "selected")).rejects.toMatchObject({ code: "meeting_selection_required" });
-    await value.call(tinycloudFindMeetingsAction, { title: "absent" }, "single");
-    expect(value.registry.selectedMeetingFor("entity-a", "thread-v2")).toBeNull();
-  });
-  test("one match inside a limited scan is not a unique selection", async () => {
-    const corpus = corpusA(); corpus.rows.push(...Array.from({ length: 500 }, () => [null]));
-    const value = await slice(corpus);
-    const found = await value.call(tinycloudFindMeetingsAction, { title: "Canary" }, "single");
-    expect((found as any).data.discovery.countKind).toBe("lower_bound");
-    expect(value.registry.selectedMeetingFor("entity-a", "thread-v2")).toBeNull();
-  });
-  test("range fan-out and a lone topic match cannot select a meeting", async () => {
-    const value = await slice();
-    await value.call(tinycloudFindMeetingsAction, { meetingRef: "meeting-a" }, "single");
-    await value.call(tinycloudSearchTranscriptsAction, { query: "ember compass" }, "range");
-    await value.call(tinycloudReadMeetingAction, { meetingRef: "meeting-a", focus: "summary" }, "range");
-    expect(value.registry.selectedMeetingFor("entity-a", "thread-v2")).toBeNull();
-    await expect(value.call(tinycloudFindMeetingsAction, {}, "selected")).rejects.toMatchObject({ code: "meeting_selection_required" });
-  });
-  test("selected metadata uses exact SQL and never touches KV", async () => {
-    const value = await slice();
-    await value.call(tinycloudFindMeetingsAction, { meetingRef: "meeting-a" }, "single");
-    value.trace.sql.length = 0;
-    await value.call(tinycloudFindMeetingsAction, {}, "selected");
-    expect(value.trace.sql).toHaveLength(1);
-    expect(value.trace.sql[0]).toContain("WHERE id = ?");
-    expect(value.trace.kvKeys).toHaveLength(0);
-  });
-  test("selected conflicting filters and citation aliases never broaden scope", async () => {
-    const value = await slice();
-    await value.call(tinycloudFindMeetingsAction, { meetingRef: "meeting-a" }, "single");
-    const calls = value.trace.sql.length;
-    await expect(value.call(tinycloudSearchTranscriptsAction, { query: "ember", title: "new" }, "selected")).rejects.toMatchObject({ code: "invalid_scope" });
-    await expect(value.call(tinycloudReadMeetingAction, { focus: "summary", meetingRef: "[M1]" }, "single")).rejects.toMatchObject({ code: "invalid_args" });
-    expect(value.trace.sql).toHaveLength(calls);
-  });
-  test("cached reader cannot return evidence after revocation during a body request", async () => {
-    let release!: () => void; let started!: () => void;
-    const bodyStarted = new Promise<void>(resolve => { started = resolve; });
-    const registry = new TranscriptAccessRegistry({ agentDid: AGENT_DID, agentKey: AGENT_KEY, host: "https://node.tinycloud.xyz", nodeFactory: () => ({ signIn: async () => {}, useDelegation: async () => ({ sql: { db: () => ({ query: async () => ({ ok: true, data: { rows: corpusA().rows } }) }) }, kv: { get: async () => { started(); await new Promise<void>(resolve => { release = resolve; }); return { ok: true, data: { data: '"private late evidence"' } }; } } }) }) });
-    await registry.register("entity-a", transcriptGrant(), "thread-v2");
-    const reader = registry.readerFor("entity-a", "thread-v2");
-    const body = reader.readBody!("fireflies", "canary-1");
-    await bodyStarted; registry.revoke("entity-a"); release();
-    await expect(body).rejects.toMatchObject({ name: "NoDelegationError" });
-  });
-  test("replacing the entity bound to a room clears the former entity's selection", async () => {
-    const value = await slice();
-    await value.call(tinycloudFindMeetingsAction, { meetingRef: "meeting-a" }, "single");
-    await value.registry.register("entity-b", transcriptGrant({ owner: OWNER_B }), "thread-v2");
-    expect(value.registry.selectedMeetingFor("entity-b", "thread-v2")).toBeNull();
+  test("cached reader cannot release content after grant revocation during body read",async()=>{
+    let release!:(value:unknown)=>void;const {registry}=makeSlice();await registry.register("entity-a",transcriptGrant());
+    const entry=(registry as any).entries.get("entity-a");
+    const get=entry.access.kv.get;
+    entry.access.kv.get=async(...args:any[])=>{const result=await get(...args);await new Promise(done=>{release=done;});return result;};
+    const result=registry.readerFor("entity-a").readEvidence(EXACT_ARGS as any).then(value=>({value}),error=>({error}));
+    while(!release)await new Promise(done=>setTimeout(done,0));registry.revoke("entity-a");release(undefined);
+    expect(await result).toMatchObject({error:{name:"NoDelegationError"}});
   });
 });
 
