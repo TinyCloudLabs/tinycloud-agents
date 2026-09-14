@@ -71,7 +71,7 @@ function fixture(parentMs = 7 * 24 * HOUR) {
           return {
             sql: { db(name: string) {
               expect(name).toBe(PATH);
-              return { query: async () => result("sql", { rows: [["meeting", "fireflies", "source", delegation.cid, "2030-01-01T00:00:00Z", null, "[]", "{}", request.reference.revision, null, "published"]] }) };
+              return { query: async (sql:string) => result("sql", { rows: sql.includes("connector_publication_snapshot") ? [[request.reference.revision]] : [["meeting", "fireflies", "source", delegation.cid, "2030-01-01T00:00:00Z", null, "[]", "{}", request.reference.revision, null, "published"]] }) };
             } },
             kv: { get: async (key: string, options?: { prefix?: string }) => {
               expect(key).toBe(`${PATH}/fireflies/snapshot/source/${request.reference.revision}`);
@@ -98,7 +98,7 @@ describe("transcript activated-session renewal", () => {
     expect(f.activations).toHaveLength(2);
     expect(f.activations[1]).toEqual(f.activations[0]);
     expect(f.signIns).toEqual([1, 2]);
-    expect(f.reads).toEqual(["1:sql", "2:sql", "2:sql", "2:kv", "2:sql"]);
+    expect(f.reads).toEqual(["1:sql", "2:sql", "2:sql", "2:sql", "2:kv", "2:sql", "2:sql"]);
     advance(49 * MINUTE);
     await reader.getMetadata!("meeting");
     expect(f.activations).toHaveLength(2);
@@ -127,7 +127,7 @@ describe("transcript activated-session renewal", () => {
     finally { f.release.resolve(); }
     expect(await results).toMatchObject([{ status: "fulfilled" }, { status: "fulfilled", value: { state: "complete" } }]);
     expect(f.signIns).toEqual([1, 2]);
-    expect(f.reads.sort()).toEqual(["2:kv", "2:sql", "2:sql", "2:sql"]);
+    expect(f.reads.sort()).toEqual(["2:kv", "2:sql", "2:sql", "2:sql", "2:sql", "2:sql"]);
   });
 
   for (const mutation of ["revoke", "replace", "stop"] as const) test(`${mutation} during refresh cannot revive the old grant or read its content`, async () => {
@@ -190,7 +190,7 @@ describe("transcript activated-session renewal", () => {
       expect(await cancelled).toMatchObject({ error: { code: cancellation === "abort" ? "retrieval_cancelled" : "retrieval_timeout" } });
     } finally { f.release.resolve(); }
     expect(await other).toMatchObject({ value: { state: "complete" } });
-    expect(f.reads).toEqual(["2:sql","2:kv","2:sql"]);
+    expect(f.reads).toEqual(["2:sql","2:sql","2:kv","2:sql","2:sql"]);
   });
 
   test("a failed refresh is content-free and can be retried by the next read", async () => {

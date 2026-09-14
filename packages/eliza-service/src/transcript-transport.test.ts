@@ -177,7 +177,7 @@ function snapshotFixture(text="Synthetic transcript",sourceId="synthetic") {
   return {snapshot,row,args};
 }
 function exactReader(fixture:ReturnType<typeof snapshotFixture>,body:()=>Promise<Response> = async()=>new Response(fixture.snapshot)) {
-  return createReader(services(async (_url,init)=>init?.body ? new Response(JSON.stringify({rows:[fixture.row]})) : body()));
+  return createReader(services(async (_url,init)=>init?.body ? new Response(JSON.stringify({rows:JSON.parse(init!.body as string).sql.includes("connector_publication_snapshot")?[[fixture.args.reference.revision]]:[fixture.row]})) : body()));
 }
 describe("pinned SDK version 3 evidence transport",()=>{
   test("transports a complete 1 MiB original body through SDK, exact action and full dispatcher framing",async()=>{
@@ -214,7 +214,7 @@ describe("pinned SDK version 3 evidence transport",()=>{
   });
   test("propagates deadline to pinned SDK and acknowledges local body cancellation",async()=>{
     const fixture=snapshotFixture();let cancelled=false,sdkSignal:AbortSignal|undefined;
-    const reader=createReader(services(async(_url,init)=>{sdkSignal=init?.signal;if(init?.body)return new Response(JSON.stringify({rows:[fixture.row]}));
+    const reader=createReader(services(async(_url,init)=>{sdkSignal=init?.signal;if(init?.body)return new Response(JSON.stringify({rows:JSON.parse(init!.body as string).sql.includes("connector_publication_snapshot")?[[fixture.args.reference.revision]]:[fixture.row]}));
       return new Response(new ReadableStream<Uint8Array>({pull(){return new Promise(()=>{});},cancel(){cancelled=true;}}));}));
     await expect(reader.readEvidence(fixture.args,{deadlineAt:Date.now()+20})).rejects.toMatchObject({code:"retrieval_timeout"});expect(sdkSignal?.aborted).toBe(true);expect(cancelled).toBe(true);
   });

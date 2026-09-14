@@ -161,7 +161,7 @@ function fakeNodeFactory(corpusFor: (privateKey: string) => Corpus, trace: NodeT
             return {
               async query(sql: string, params?: unknown[]) {
                 trace.sql.push(sql);
-                return { ok: true, data: { rows: sql.includes("WHERE id = ?") ? corpus.rows.filter(row => row[0] === params?.[0]) : corpus.rows } };
+                return { ok: true, data: { rows: sql.includes("connector_publication_snapshot") ? corpus.rows.filter(row=>row[8]===params?.[0]&&row[0]===params?.[1]&&row[1]===params?.[2]&&row[2]===params?.[3]).map(row=>[row[8]]) : sql.includes("WHERE id = ?") ? corpus.rows.filter(row => row[0] === params?.[0]) : corpus.rows } };
               },
             };
           },
@@ -257,8 +257,8 @@ describe("session registration reaches typed exact transcript reads",()=>{
     const result=await runTool(runtime,"entity-a",{},"thread-99") as any;
     expect(result.data.state).toBe("complete");expect(result.data.spans).toHaveLength(3);
     expect(result.data.spans[1]).toMatchObject({text:"We rejected cobalt; the final choice is ember compass.",speaker:"Avery",startSecs:72,recordIndex:1});
-    expect(trace.dbs).toEqual([SQL_PATH,SQL_PATH]);
-    expect(trace.sql.every(sql=>sql.includes("FROM connector_meeting WHERE id = ? LIMIT 1"))).toBe(true);
+    expect(trace.dbs).toEqual([SQL_PATH,SQL_PATH,SQL_PATH,SQL_PATH]);
+    expect(trace.sql.every(sql=>(sql.includes("FROM connector_meeting WHERE id = ? LIMIT 1") || sql.includes("FROM connector_publication_snapshot s JOIN connector_meeting m")))).toBe(true);
     expect(trace.kvKeys).toEqual([`${KV_PATH}fireflies/snapshot/canary-1/${EXACT_ARGS.reference.revision}`]);
   });
   test("cached reader cannot release content after grant revocation during body read",async()=>{

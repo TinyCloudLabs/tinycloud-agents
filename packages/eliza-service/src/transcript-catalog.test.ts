@@ -9,17 +9,19 @@ const base = {source:'fireflies',sourceId:'source',meetingRef:'0000'} as const;
 function fixture() {
  const db=new Database(':memory:');
  db.run(`CREATE TABLE connector_meeting(id TEXT PRIMARY KEY,source TEXT,source_id TEXT,title TEXT,started_at TEXT,organizer_email TEXT,participants TEXT,metadata TEXT,head_revision TEXT,head_snapshot_key TEXT,publication_state TEXT)`);
+ db.run(`CREATE TABLE connector_publication_snapshot(revision TEXT,meeting_id TEXT,staged INTEGER,published INTEGER)`);
  const raw='Original transcript.';
  const snapshot={contractVersion:3,...base,operationId:'op',createdAt:'2026-09-14T00:00:00Z',metadata:{title:'Original title',startedAt:null,organizerEmail:null,participants:[],metadata:{}},body:{basis:'transcript',encoding:'utf-8',schema:'text',raw,original:{digest:hash(raw),byteLength:Buffer.byteLength(raw),recordCount:1,extent:'known',captureComplete:null},omissions:[]},overview:null,aliases:[]};
  const bytes=JSON.stringify(snapshot), revision=hash(bytes); const bodies=new Map([[revision,bytes]]);
+ db.run('INSERT INTO connector_publication_snapshot VALUES(?,?,1,1)',[revision,base.meetingRef]);
  const insert=db.prepare(`INSERT INTO connector_meeting VALUES(?, 'fireflies', 'source', ?, NULL,NULL,'[]','{}', ?,NULL,'published')`);
  for(let i=0;i<601;i++)insert.run(String(i).padStart(4,'0'),i===500?'Sole target':'Other',revision);
  db.run("UPDATE connector_meeting SET source='tinycloud-transcriber' WHERE id='0500'");
- let reads=0;
- const reader=createReader({sql:{db:()=>({query:async(sql:string,params:any[]=[])=>({ok:true,data:{rows:db.query(sql).values(...params)}})})},kv:{get:async(key:string)=>{reads++;const body=bodies.get(key.split('/').at(-1)!);return body?{ok:true,data:{data:body}}:{ok:false,error:{code:'KV_NOT_FOUND',message:'Key not found'}}}}});
+ let reads=0;let onRead=()=>{};
+ const reader=createReader({sql:{db:()=>({query:async(sql:string,params:any[]=[])=>({ok:true,data:{rows:db.query(sql).values(...params)}})})},kv:{get:async(key:string)=>{reads++;onRead();const body=bodies.get(key.split('/').at(-1)!);return body?{ok:true,data:{data:body}}:{ok:false,error:{code:'KV_NOT_FOUND',message:'Key not found'}}}}});
  const page=(args:any={})=>{expect(typeof (reader as any).pageMetadata).toBe('function');return(reader as any).pageMetadata({contractVersion:3,...args});};
  const read=(ref:any={...base,revision})=>{expect(typeof (reader as any).readEvidence).toBe('function');return(reader as any).readEvidence({contractVersion:3,reference:ref,basis:'transcript'});};
- return {db,page,read,bodies,revision,reads:()=>reads};
+ return {db,page,read,bodies,revision,reads:()=>reads,setOnRead:(callback:()=>void)=>{onRead=callback;}};
 }
 test('v3 tool parsers require explicit revision and reject legacy arguments',()=>{
  expect(parseFindMeetingsArgs({contractVersion:3,filters:{source:'tinycloud-transcriber'},limit:100})).not.toBeNull();
@@ -56,4 +58,8 @@ test('transport admits complete 2 MiB framing and refuses one byte over',async()
  expect(TRANSCRIPT_RESPONSE_BYTE_LIMIT).toBe(2_097_152);
  const exact='x'.repeat(2_097_152);expect(await(await createTranscriptFetch(async()=>new Response(exact))('http://test.invalid')).text()).toBe(exact);
  await expect(createTranscriptFetch(async()=>new Response(exact+'x'))('http://test.invalid')).rejects.toMatchObject({code:'TRANSCRIPT_RESPONSE_SIZE_LIMIT'});
+});
+
+test('exact reads never admit unpublished staged revisions or revoked membership during body I/O',async()=>{
+ const f=fixture();try{f.db.run('UPDATE connector_publication_snapshot SET published=0');expect((await f.read()).state).toBe('unavailable');expect(f.reads()).toBe(0);f.db.run('UPDATE connector_publication_snapshot SET published=1');f.setOnRead(()=>f.db.run('UPDATE connector_publication_snapshot SET published=0,staged=0'));const result=await f.read();expect(result.state).toBe('unavailable');expect(result.spans).toEqual([]);}finally{f.db.close();}
 });

@@ -8,7 +8,7 @@ import { DelegationExpiredError, NoDelegationError } from "@tinycloud/eliza-plug
 import type { TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
 import { checkContext, decodeSnapshotEvidence, emptyEvidence, safeMeetingRef, sha256, MeetingRetrievalError, withinContext } from "./meeting-evidence.js";
 import type { BodyResult, RetrievalContext } from "./meeting-evidence.js";
-import type { CatalogMeeting, EvidenceOmission, PublishedMeetingSnapshot } from "./meeting-contract.js";
+import type { CatalogMeeting, EvidenceOmission, PublishedMeetingSnapshot, SourceReference } from "./meeting-contract.js";
 import { isSource, parseFindMeetingsArgs, parseReadMeetingArgs, safeSourceId } from "./actions/tinycloud-search-transcripts.js";
 import { createTranscriptNode, TranscriptResponseLimitError } from "./transcript-transport.js";
 
@@ -196,7 +196,7 @@ function decodeMetadata(row: unknown): CatalogMeeting | null {
     title:typeof title === "string"?title:null,startedAt:typeof startedAt === "string"?startedAt:null,
     organizerEmail:typeof organizerEmail === "string"?organizerEmail:null,
     participants:participants.flatMap(item => item && typeof item === "object" ? [{...(typeof item.name === "string"?{name:item.name}:typeof item.displayName === "string"?{name:item.displayName}:{}),...(typeof item.email === "string"?{email:item.email}:{})}] : []),
-    basis:metadata && typeof metadata === "object" && ((metadata as Record<string,unknown>).artifactType === "notes" || (metadata as Record<string,unknown>).basis === "notes") ? "notes" : "transcript"};
+    basis:metadata && typeof metadata === "object" && ((metadata as Record<string,unknown>).artifactType === "notes" || (metadata as Record<string,unknown>).basis === "notes" || typeof (metadata as Record<string,unknown>).notes_kind === "string") ? "notes" : "transcript"};
 }
 /** Pinned SDK 2.6.0 preserves HTTP error details, but KV_NOT_FOUND alone is ambiguous. */
 export function classifyBodyFailure(error: unknown): BodyResult {
@@ -243,6 +243,10 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     }
     return response.data.rows;
   };
+  const publishedRevision = async (reference:SourceReference, context:RetrievalContext) => {
+    const rows=await query("SELECT s.revision FROM connector_publication_snapshot s JOIN connector_meeting m ON m.id = s.meeting_id WHERE s.revision = ? AND s.meeting_id = ? AND m.source = ? AND m.source_id = ? AND s.staged = 1 AND s.published = 1 AND m.publication_state IN ('published','reserved') LIMIT 1",[reference.revision,reference.meetingRef,reference.source,reference.sourceId],context);
+    return rows.length===1 && rows[0]?.[0]===reference.revision;
+  };
   return {
     assertAccess,
     async getMetadata(reference, context = {}) {
@@ -268,6 +272,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       const {reference,basis}=args;
       const metadata=await this.getMetadata(reference.meetingRef,context);
       if(!metadata || metadata.source!==reference.source || metadata.sourceId!==reference.sourceId || metadata.readiness!=="published")return emptyEvidence(reference,basis,"unavailable","meeting_unavailable");
+      if(!await publishedRevision(reference,context))return emptyEvidence(reference,basis,"unavailable","revision_unpublished");
       const key=`${SQL_PATH}/${reference.source}/snapshot/${encodeURIComponent(reference.sourceId)}/${reference.revision}`;
       const response=await withinContext(signal=>withAccess(signal,active=>active.kv.get(key,{prefix:"",raw:true,signal})),context) as {ok?:boolean;error?:unknown;data?:{data?:unknown}};
       assertAccess();
@@ -281,6 +286,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       // A delete/identity replacement during KV I/O cannot release its former content.
       const current=await this.getMetadata(reference.meetingRef,context);
       if(!current || current.source!==reference.source || current.sourceId!==reference.sourceId || current.readiness!=="published")return emptyEvidence(reference,basis,"unavailable","meeting_unavailable");
+      if(!await publishedRevision(reference,context))return emptyEvidence(reference,basis,"unavailable","revision_unpublished");
       assertAccess();return result;
     },
   };
