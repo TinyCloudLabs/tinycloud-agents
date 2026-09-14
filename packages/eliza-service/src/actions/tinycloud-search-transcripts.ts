@@ -1,288 +1,79 @@
-import type { Action, Content, IAgentRuntime, Memory, Plugin, ProviderDataRecord } from "@elizaos/core";
-import { ToolError } from "../handlers/tools.js";
-import { checkContext, discoverMeetings, exactMeeting, formatMeetingResult, isAccessError, metadataOutcome, readMeetingEvidence, safeMeetingRef, unattemptedOutcome, validDate } from "../meeting-evidence.js";
-import type { BodyResult, DiscoveryResult, EvidenceRequest, MeetingOutcome, MeetingSelection, RetrievalContext } from "../meeting-evidence.js";
-
-export const TINYCLOUD_FIND_MEETINGS = "tinycloud_find_meetings";
-export const TINYCLOUD_READ_MEETING = "tinycloud_read_meeting";
-export const TINYCLOUD_SEARCH_TRANSCRIPTS = "tinycloud_search_transcripts";
-export const TINYCLOUD_LIST_MEETING_ACTIONS = "tinycloud_list_meeting_actions";
-
-export type TranscriptSource = "fireflies" | "google-meet" | "tinycloud-transcriber";
-type SortOrder = "newest" | "oldest";
-
-export interface MeetingFilters {
-  title?: string;
-  participant?: string;
-  from?: string;
-  to?: string;
-  source?: TranscriptSource;
-}
-
-export interface FindMeetingsArgs extends MeetingFilters { sort?: SortOrder; selectFirst?: boolean; limit?: number; meetingRef?: string }
-export interface ReadMeetingArgs {
-  meetingRef?: string;
-  focus: "summary" | "actions" | "decisions" | "speaker" | "transcript";
-  query?: string;
-  speaker?: string;
-  assignee?: string;
-  includeBody?: boolean;
-}
-export interface TranscriptSearchArgs extends MeetingFilters { query: string; speaker?: string; meetingRef?: string; sort?: SortOrder }
-export interface ListMeetingActionsArgs extends MeetingFilters { assignee?: string; includeBody?: boolean; sort?: SortOrder }
-
-const SOURCES = ["fireflies", "google-meet", "tinycloud-transcriber"] as const;
-
-function parseBoundedString(value: unknown, max: number): string | undefined | null {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 && trimmed.length <= max ? trimmed : null;
-}
-
-function parseFilters(args: Record<string, unknown>): MeetingFilters | null {
-  const title = parseBoundedString(args.title, 160);
-  const participant = parseBoundedString(args.participant, 160);
-  if (title === null || participant === null) return null;
-  if (args.from !== undefined && (typeof args.from !== "string" || !validDate(args.from))) return null;
-  if (args.to !== undefined && (typeof args.to !== "string" || !validDate(args.to))) return null;
-  if (typeof args.from === "string" && typeof args.to === "string" && args.from > args.to) return null;
-  if (args.source !== undefined && !SOURCES.includes(args.source as TranscriptSource)) return null;
-  return {
-    ...(title ? { title } : {}),
-    ...(participant ? { participant } : {}),
-    ...(typeof args.from === "string" ? { from: args.from } : {}),
-    ...(typeof args.to === "string" ? { to: args.to } : {}),
-    ...(args.source !== undefined ? { source: args.source as TranscriptSource } : {}),
-  };
-}
-
-export function parseFindMeetingsArgs(args: Record<string, unknown>): FindMeetingsArgs | null {
-  const allowed = new Set(["title", "participant", "from", "to", "source", "sort", "selectFirst", "limit", "meetingRef"]);
-  if (Object.keys(args).some((key) => !allowed.has(key))) return null;
-  const filters = parseFilters(args);
-  const meetingRef = parseBoundedString(args.meetingRef, 128);
-  if (!filters || meetingRef === null || (meetingRef && !safeMeetingRef(meetingRef))) return null;
-  if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 12)) return null;
-  if (args.sort !== undefined && args.sort !== "newest" && args.sort !== "oldest") return null;
-  if (args.selectFirst !== undefined && typeof args.selectFirst !== "boolean") return null;
-  return {
-    ...filters,
-    ...(meetingRef ? { meetingRef } : {}),
-    ...(args.limit !== undefined ? { limit: Number(args.limit) } : {}),
-    ...(args.sort ? { sort: args.sort as SortOrder } : {}),
-    ...(typeof args.selectFirst === "boolean" ? { selectFirst: args.selectFirst } : {}),
-  };
-}
-
-export function parseReadMeetingArgs(args: Record<string, unknown>): ReadMeetingArgs | null {
-  const allowed = new Set(["meetingRef", "focus", "query", "speaker", "assignee", "includeBody"]);
-  if (Object.keys(args).some((key) => !allowed.has(key))) return null;
-  const meetingRef = parseBoundedString(args.meetingRef, 128);
-  const query = parseBoundedString(args.query, 500);
-  const speaker = parseBoundedString(args.speaker, 160);
-  const assignee = parseBoundedString(args.assignee, 160);
-  if (assignee === null || (args.includeBody !== undefined && typeof args.includeBody !== "boolean")) return null;
-  if (meetingRef === null || query === null || speaker === null) return null;
-  if (!["summary", "actions", "decisions", "speaker", "transcript"].includes(args.focus as string)) return null;
-  if (args.focus === "speaker" && !speaker) return null;
-  return {
-    focus: args.focus as ReadMeetingArgs["focus"],
-    ...(assignee ? { assignee } : {}),
-    ...(args.includeBody !== undefined ? { includeBody: args.includeBody as boolean } : {}),
-    ...(meetingRef ? { meetingRef } : {}),
-    ...(query ? { query } : {}),
-    ...(speaker ? { speaker } : {}),
-  };
-}
-
-export function parseTranscriptSearchArgs(args: Record<string, unknown>): TranscriptSearchArgs | null {
-  const allowed = new Set(["query", "title", "participant", "speaker", "meetingRef", "from", "to", "source", "sort"]);
-  if (Object.keys(args).some((key) => !allowed.has(key))) return null;
-  const filters = parseFilters(args);
-  const query = parseBoundedString(args.query, 500);
-  const speaker = parseBoundedString(args.speaker, 160);
-  const meetingRef = parseBoundedString(args.meetingRef, 128);
-  if (!filters || !query || speaker === null || meetingRef === null) return null;
-  if (args.sort !== undefined && args.sort !== "newest" && args.sort !== "oldest") return null;
-  return { query, ...filters, ...(args.sort ? { sort: args.sort as SortOrder } : {}), ...(speaker ? { speaker } : {}), ...(meetingRef ? { meetingRef } : {}) };
-}
-
-export function parseListMeetingActionsArgs(args: Record<string, unknown>): ListMeetingActionsArgs | null {
-  const allowed = new Set(["title", "participant", "from", "to", "source", "assignee", "includeBody", "sort"]);
-  if (Object.keys(args).some((key) => !allowed.has(key))) return null;
-  const filters = parseFilters(args);
-  const assignee = parseBoundedString(args.assignee, 160);
-  if (!filters || assignee === null || (args.includeBody !== undefined && typeof args.includeBody !== "boolean")) return null;
-  if (args.sort !== undefined && args.sort !== "newest" && args.sort !== "oldest") return null;
-  return { ...filters, ...(args.sort ? { sort: args.sort as SortOrder } : {}), ...(assignee ? { assignee } : {}), ...(args.includeBody !== undefined ? { includeBody: args.includeBody as boolean } : {}) };
-}
-
-export const TINYCLOUD_CONNECTORS_SQL_PATH = "xyz.tinycloud.tinychat/connectors";
+import type { Action, IAgentRuntime, Memory, Plugin, ProviderDataRecord } from '@elizaos/core';
+import { ToolError } from '../handlers/tools.js';
+import { checkContext, safeMeetingRef, validRevision } from '../meeting-evidence.js';
+import type { RetrievalContext } from '../meeting-evidence.js';
+import type { CatalogMeeting, CatalogPageEnvelope, CatalogPageRequest, EvidenceEnvelope, ExactReadRequest, MeetingSource } from '../meeting-contract.js';
+export const TINYCLOUD_FIND_MEETINGS = 'tinycloud_find_meetings';
+export const TINYCLOUD_READ_MEETING = 'tinycloud_read_meeting';
+export const TINYCLOUD_SEARCH_TRANSCRIPTS = 'tinycloud_search_transcripts';
+export const TINYCLOUD_LIST_MEETING_ACTIONS = 'tinycloud_list_meeting_actions';
+export const TINYCLOUD_CONNECTORS_SQL_PATH = 'xyz.tinycloud.tinychat/connectors';
 export const TINYCLOUD_CONNECTORS_KV_PREFIX = `${TINYCLOUD_CONNECTORS_SQL_PATH}/`;
-export interface TranscriptMetadata {
-  meetingRef: string;
-  source: TranscriptSource;
-  sourceId: string;
-  title: string | null;
-  startedAt: string | null;
-  participantNames: string[];
-  participantEmails: string[];
-  organizerEmail: string | null;
-  summaryOverview: string | null;
-  summaryActionItems: string | null;
-  metadata?: Record<string, unknown>;
-  metadataLimited?: boolean;
-}
-
+export type TranscriptSource = MeetingSource;
 export interface TranscriptReader {
-  listMetadata(): Promise<TranscriptMetadata[]>;
-  getMetadata?(meetingRef: string, context?: RetrievalContext): Promise<TranscriptMetadata | null>;
-  discoverMetadata?(args: FindMeetingsArgs, context?: RetrievalContext): Promise<DiscoveryResult>;
-  readBody?(source: TranscriptSource, sourceId: string, context?: RetrievalContext): Promise<BodyResult>;
+  pageMetadata(args: CatalogPageRequest, context?: RetrievalContext): Promise<CatalogPageEnvelope>;
+  getMetadata(meetingRef: string, context?: RetrievalContext): Promise<CatalogMeeting | null>;
+  readEvidence(args: ExactReadRequest, context?: RetrievalContext): Promise<EvidenceEnvelope>;
   assertAccess?(): void;
-  getTranscript(source: TranscriptSource, sourceId: string): Promise<unknown | null>;
 }
-
-export interface TranscriptRegistry {
-  readerFor(entityId: string, roomId?: string): TranscriptReader;
-  selectedMeetingFor(entityId: string, roomId?: string): string | null;
-  setSelection?(entityId: string, roomId: string | undefined, selection: MeetingSelection): void;
-  selectMeeting(entityId: string, roomId: string | undefined, meetingRef: string): void;
-}
-
+export interface TranscriptRegistry { readerFor(entityId: string, roomId?: string): TranscriptReader }
 const registries = new WeakMap<object, TranscriptRegistry>();
 export function setTranscriptRegistry(runtime: object, registry: TranscriptRegistry | null): void {
   if (registry) registries.set(runtime, registry); else registries.delete(runtime);
 }
-export function transcriptRegistryFor(runtime: object | null | undefined): TranscriptRegistry | null {
-  return runtime ? registries.get(runtime) ?? null : null;
-}
-
-export async function findMeetings(reader: TranscriptReader, args: FindMeetingsArgs, timeZone?: string, context: RetrievalContext = {}) {
-  if (args.meetingRef) {
-    const row = await exactMeeting(reader, args.meetingRef, context);
-    if (!row) throw new ToolError("meeting not found", 404, "meeting_not_found");
-    return formatMeetingResult("find", [metadataOutcome(row)], { matchedCount: 1, countKind: "exact", returnedCount: 1, scanLimited: false, excludedUndatedCount: 0, orderProven: true, interval: {}, observedAt: new Date().toISOString(), omittedMeetingRefs: [] });
+export function transcriptRegistryFor(runtime: object | null | undefined): TranscriptRegistry | null { return runtime ? registries.get(runtime) ?? null : null; }
+export function isSource(value: unknown): value is MeetingSource { return value === 'fireflies' || value === 'google-meet' || value === 'tinycloud-transcriber'; }
+export function safeSourceId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 512 && !value.includes('..') && !/[\\/]/.test(value); }
+const record = (value: unknown): value is Record<string,unknown> => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+export function parseFindMeetingsArgs(args: Record<string,unknown>): CatalogPageRequest | null {
+  if (args.contractVersion !== 3 || Object.keys(args).some(key => !['contractVersion','after','filters','limit'].includes(key))) return null;
+  if (args.after !== undefined && !safeMeetingRef(args.after)) return null;
+  if (args.limit !== undefined && args.limit !== 100) return null;
+  if (args.filters !== undefined) {
+    if (!record(args.filters) || Object.keys(args.filters).some(key => !['source'].includes(key))) return null;
+    if (args.filters.source !== undefined && !isSource(args.filters.source)) return null;
   }
-  const result = await discoverMeetings(reader, args, { ...context, timeZone });
-  return formatMeetingResult("find", result.rows.map(metadataOutcome), result.discovery);
+  return args as unknown as CatalogPageRequest;
 }
-export async function readMeeting(reader: TranscriptReader, args: ReadMeetingArgs & { meetingRef: string }, context: RetrievalContext = {}) {
-  return formatMeetingResult("read", [await readMeetingEvidence(reader, args.meetingRef, args, context)]);
+export function parseReadMeetingArgs(args: Record<string,unknown>): ExactReadRequest | null {
+  if (args.contractVersion !== 3 || Object.keys(args).some(key => !['contractVersion','reference','basis'].includes(key))) return null;
+  if (!record(args.reference) || Object.keys(args.reference).some(key => !['meetingRef','source','sourceId','revision'].includes(key))) return null;
+  const ref = args.reference;
+  if (!safeMeetingRef(ref.meetingRef) || !isSource(ref.source) || !safeSourceId(ref.sourceId) || !validRevision(ref.revision)) return null;
+  if (!['transcript','notes','overview'].includes(args.basis as string)) return null;
+  return args as unknown as ExactReadRequest;
 }
-async function aggregate(reader: TranscriptReader, args: MeetingFilters & { meetingRef?: string; sort?: SortOrder }, request: EvidenceRequest, operation: "search" | "actions", context: RetrievalContext) {
-  if (args.meetingRef) return formatMeetingResult(operation, [await readMeetingEvidence(reader, args.meetingRef, request, context)]);
-  const discovered = await discoverMeetings(reader, { ...args, limit: 12 }, context);
-  const rows = discovered.rows.filter((row, index, all) => all.findIndex(other => other.source === row.source && other.meetingRef === row.meetingRef) === index);
-  const outcomes: MeetingOutcome[] = rows.map(row => unattemptedOutcome(row, request, "budget"));
-  const siblings = new AbortController();
-  const childContext = { ...context, signal: context.signal ? AbortSignal.any([context.signal, siblings.signal]) : siblings.signal };
-  let cursor = 0; let accessFailure: unknown;
-  await Promise.all(Array.from({ length: Math.min(3, rows.length) }, async () => {
-    while (cursor < rows.length && !accessFailure) {
-      if (context.signal?.aborted || (context.deadlineAt !== undefined && Date.now() >= context.deadlineAt)) break;
-      const index = cursor++; const row = rows[index]!;
-      try { outcomes[index] = await readMeetingEvidence(reader, row.meetingRef, request, childContext, row); }
-      catch (error) {
-        if (isAccessError(error)) { accessFailure = error; siblings.abort(); break; }
-        if (accessFailure) break;
-        if ((error as { code?: string }).code === "retrieval_cancelled") throw error;
-        outcomes[index] = unattemptedOutcome(row, request, (error as { code?: string }).code === "retrieval_timeout" ? "budget" : "metadata_unavailable");
-        if (outcomes[index]!.coverage.omissionReasons[0] !== "budget") outcomes[index]!.state = "unavailable";
-      }
-    }
-  }));
-  if (accessFailure) throw accessFailure;
-  if (context.signal?.aborted) checkContext(context);
-  reader.assertAccess?.();
-  // Older clients retain their four-match display bound. Outcomes explicitly record what was omitted.
-  if (operation === "search" && context.retrievalMode === undefined) {
-    let matches = 0;
-    for (const outcome of outcomes) if (outcome.coverage.support !== "none" && ++matches > 4) {
-      outcome.coverage.omittedEvidenceCount += outcome.evidence.length; outcome.evidence = [];
-      outcome.coverage.evidenceRetained = 0; outcome.coverage.support = "none"; outcome.coverage.omissionReasons.push("legacy_match_limit"); outcome.search.retainedMatches = 0;
-    }
-  }
-  return formatMeetingResult(operation, outcomes, discovered.discovery);
-}
-export async function searchTranscripts(reader: TranscriptReader, args: TranscriptSearchArgs, timeZone?: string, context: RetrievalContext = {}) {
-  return aggregate(reader, args, { focus: "topic", query: args.query, speaker: args.speaker }, "search", { ...context, timeZone });
-}
-export async function listMeetingActions(reader: TranscriptReader, args: ListMeetingActionsArgs, timeZone?: string, context: RetrievalContext = {}) {
-  return aggregate(reader, args, { focus: "actions", assignee: args.assignee, includeBody: args.includeBody }, "actions", { ...context, timeZone });
-}
-function toolContext(runtime: IAgentRuntime, message: Memory): { registry: TranscriptRegistry; reader: TranscriptReader } {
+function toolReader(runtime: IAgentRuntime, message: Memory): TranscriptReader {
   const registry = transcriptRegistryFor(runtime);
-  if (!registry) throw new ToolError("transcript delegation required", 409, "delegation_required");
-  try { return { registry, reader: registry.readerFor(message.entityId, message.roomId) }; }
-  catch (error) {
-    if ((error as { name?: string }).name === "DelegationExpiredError") throw new ToolError("transcript delegation expired", 409, "delegation_expired");
-    throw new ToolError("transcript delegation required", 409, "delegation_required");
+  if (!registry) throw new ToolError('transcript delegation required',409,'delegation_required');
+  try { return registry.readerFor(message.entityId,message.roomId); }
+  catch(error) {
+    const name=(error as {name?:string}).name;
+    if(name==="DelegationExpiredError")throw new ToolError("transcript delegation expired",409,"delegation_expired");
+    if(name==="NoDelegationError")throw new ToolError("transcript delegation required",409,"delegation_required");
+    throw error;
   }
 }
-function rawArgs(message: Memory, options: unknown): Record<string, unknown> { return (options as { args?: Record<string, unknown> } | undefined)?.args ?? { query: message.content?.text }; }
-function retrievalContext(options: unknown): RetrievalContext {
-  const context = (options as { context?: RetrievalContext } | undefined)?.context ?? {};
-  if (context.retrievalMode !== undefined && !["selected", "single", "range"].includes(context.retrievalMode)) throw new ToolError("invalid retrieval mode", 400, "invalid_args");
-  if (context.timeZone !== undefined) {
-    if (typeof context.timeZone !== "string") throw new ToolError("invalid time zone", 400, "invalid_args");
-    try { new Intl.DateTimeFormat("en", { timeZone: context.timeZone }); } catch { throw new ToolError("invalid time zone", 400, "invalid_args"); }
-  }
-  if (context.deadlineAt !== undefined && (typeof context.deadlineAt !== "number" || !Number.isFinite(context.deadlineAt))) throw new ToolError("invalid deadline", 400, "invalid_args");
-  checkContext(context); return context;
-}
-function scopeReference(registry: TranscriptRegistry, message: Memory, args: MeetingFilters & { meetingRef?: string; selectFirst?: boolean; sort?: SortOrder }, context: RetrievalContext, operation: "find" | "read" | "search" | "actions"): string | undefined {
-  const { retrievalMode: mode } = context;
-  const filters = [args.title, args.participant, args.from, args.to, args.source].some(value => value !== undefined);
-  if (mode === "selected" && (args.meetingRef !== undefined || filters || args.selectFirst !== undefined || args.sort !== undefined)) throw new ToolError("selected scope conflicts", 400, "invalid_scope");
-  if (args.meetingRef && filters) throw new ToolError("exact scope conflicts", 400, "invalid_scope");
-  if (mode && args.meetingRef && !safeMeetingRef(args.meetingRef)) throw new ToolError("invalid reference", 400, "invalid_args");
-  if (mode === "single" && (operation === "read" || operation === "search") && !args.meetingRef) throw new ToolError("exact reference required", 400, "invalid_scope");
-  if (mode === "range" && operation === "read" && !args.meetingRef) throw new ToolError("exact reference required", 400, "invalid_scope");
-  if (mode && mode !== "range" && operation === "actions") throw new ToolError("action aggregation requires range scope", 400, "invalid_scope");
-  if (mode === "range") registry.setSelection?.(message.entityId, message.roomId, { state: "range" });
-  else if (mode === "single") registry.setSelection?.(message.entityId, message.roomId, { state: "none" });
-  if (mode === "selected" || (mode === undefined && operation === "read" && (!args.meetingRef || /^\[?M\d+\]?$/i.test(args.meetingRef)))) {
-    const reference = registry.selectedMeetingFor(message.entityId, message.roomId);
-    if (!reference) throw new ToolError("select a meeting first", 409, "meeting_selection_required");
-    return reference;
-  }
-  return args.meetingRef;
-}
-async function finish(callback: ((content: Content) => Promise<unknown>) | undefined, result: { text: string; data: unknown }) {
-  if (callback) await callback({ text: result.text });
-  return { success: true, text: result.text, data: result.data as ProviderDataRecord };
-}
-function action(operation: "find" | "read" | "search" | "actions", name: string, parse: (args: Record<string, unknown>) => FindMeetingsArgs | ReadMeetingArgs | TranscriptSearchArgs | ListMeetingActionsArgs | null): Action {
-  return { name, description: "Read bounded private meeting metadata or evidence under delegated access.", similes: [name.toLowerCase()], examples: [],
-    validate: async (_runtime, message, _state, options) => parse(rawArgs(message, options)) !== null,
-    handler: async (runtime, message, _state, options, callback) => {
-      const args = parse(rawArgs(message, options)); if (!args) throw new ToolError("invalid meeting arguments", 400, "invalid_args");
-      const context = retrievalContext(options); const { registry, reader } = toolContext(runtime, message);
-      const reference = scopeReference(registry, message, args, context, operation);
-      try {
-        const result = operation === "find" ? await findMeetings(reader, { ...args as FindMeetingsArgs, ...(reference ? { meetingRef: reference } : {}) }, context.timeZone, context)
-          : operation === "read" ? reference ? await readMeeting(reader, { ...args as ReadMeetingArgs, meetingRef: reference }, context) : (() => { throw new ToolError("select a meeting first", 409, "meeting_selection_required"); })()
-          : operation === "search" ? await searchTranscripts(reader, { ...args as TranscriptSearchArgs, ...(reference ? { meetingRef: reference } : {}) }, context.timeZone, context)
-          : await listMeetingActions(reader, args as ListMeetingActionsArgs, context.timeZone, context);
-        reader.assertAccess?.();
-        const first = result.data.outcomes[0]; const discovery = result.data.discovery;
-        if (context.retrievalMode === "single" && first) {
-          const proven = reference || (discovery?.countKind === "exact" && discovery.matchedCount === 1) || ((args as FindMeetingsArgs).selectFirst && discovery?.orderProven);
-          if (proven) registry.selectMeeting(message.entityId, message.roomId, first.meetingRef);
-          else registry.setSelection?.(message.entityId, message.roomId, { state: "ambiguous" });
-        } else if (context.retrievalMode === undefined && first && (operation === "read" || (operation === "find" && (discovery?.matchedCount === 1 || (args as FindMeetingsArgs).selectFirst)) || (operation === "search" && result.data.matches.length === 1))) registry.selectMeeting(message.entityId, message.roomId, operation === "search" ? result.data.matches[0]!.meetingRef : first.meetingRef);
-        return finish(callback, result);
-      } catch (error) {
-        if (isAccessError(error) || (error as { code?: string }).code === "meeting_not_found") registry.setSelection?.(message.entityId, message.roomId, { state: "none" });
-        throw error;
-      }
+export async function findMeetings(reader: TranscriptReader, args: CatalogPageRequest, context: RetrievalContext = {}) { return {text:'',data:await reader.pageMetadata(args,context)}; }
+export async function readMeeting(reader: TranscriptReader, args: ExactReadRequest, context: RetrievalContext = {}) { return {text:'',data:await reader.readEvidence(args,context)}; }
+function action(operation: 'find'|'read', name: string): Action {
+  return {name,description:'Authorized version 3 metadata pages or exact immutable evidence reads.',similes:[],examples:[],
+    validate:async()=>true,
+    handler:async(runtime,message,_state,options)=>{
+      const input=options as {args?:Record<string,unknown>;context?:RetrievalContext}|undefined;
+      if(input?.args?.contractVersion!==3)throw new ToolError('upgrade required',426,'upgrade_required');
+      const args=operation==='find'?parseFindMeetingsArgs(input.args):parseReadMeetingArgs(input.args);
+      if(!args)throw new ToolError('invalid meeting arguments',400,'invalid_args');
+      const context=input?.context??{};checkContext(context);const reader=toolReader(runtime,message);
+      const result=operation==='find'?await findMeetings(reader,args as CatalogPageRequest,context):await readMeeting(reader,args as ExactReadRequest,context);
+      checkContext(context);reader.assertAccess?.();
+      return {success:true,text:'',data:result.data as unknown as ProviderDataRecord};
     },
   };
 }
-export const tinycloudFindMeetingsAction = action("find", "TINYCLOUD_FIND_MEETINGS", parseFindMeetingsArgs);
-export const tinycloudReadMeetingAction = action("read", "TINYCLOUD_READ_MEETING", parseReadMeetingArgs);
-export const tinycloudSearchTranscriptsAction = action("search", "TINYCLOUD_SEARCH_TRANSCRIPTS", parseTranscriptSearchArgs);
-export const tinycloudListMeetingActionsAction = action("actions", "TINYCLOUD_LIST_MEETING_ACTIONS", parseListMeetingActionsArgs);
-export const tinycloudSearchTranscriptsPlugin: Plugin = { name: "tinycloud-meeting-tools", description: "Bounded read-only delegated TinyCloud meeting discovery and evidence tools.", actions: [tinycloudFindMeetingsAction, tinycloudReadMeetingAction, tinycloudSearchTranscriptsAction, tinycloudListMeetingActionsAction] };
+const retired = (name:string):Action => ({name,description:'Retired aggregate tool; use version 3 metadata pages and exact reads.',similes:[],examples:[],validate:async()=>true,handler:async()=>{throw new ToolError('upgrade required',426,'upgrade_required');}});
+export const tinycloudFindMeetingsAction=action('find','TINYCLOUD_FIND_MEETINGS');
+export const tinycloudReadMeetingAction=action('read','TINYCLOUD_READ_MEETING');
+export const tinycloudSearchTranscriptsAction=retired('TINYCLOUD_SEARCH_TRANSCRIPTS');
+export const tinycloudListMeetingActionsAction=retired('TINYCLOUD_LIST_MEETING_ACTIONS');
+export const tinycloudSearchTranscriptsPlugin:Plugin={name:'tinycloud-meeting-tools',description:'Delegated exact meeting evidence and metadata pages.',actions:[tinycloudFindMeetingsAction,tinycloudReadMeetingAction,tinycloudSearchTranscriptsAction,tinycloudListMeetingActionsAction]};

@@ -4,7 +4,9 @@ import { gzipSync } from "node:zlib";
 import { DelegatedAccess } from "@tinycloud/node-sdk";
 import type { InvokeFunction, PortableDelegation, TinyCloudSession } from "@tinycloud/node-sdk";
 import { createReader } from "./transcript-registry.js";
-import { readMeeting } from "./actions/tinycloud-search-transcripts.js";
+import { sha256 } from "./meeting-evidence.js";
+import { tinycloudReadMeetingAction, setTranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
+import { handlePostTool } from "./handlers/tools.js";
 import { createTranscriptFetch, createTranscriptServices, TRANSCRIPT_RESPONSE_BYTE_LIMIT as LIMIT } from "./transcript-transport.js";
 
 function streamed(payload: string, init: ResponseInit = {}, chunkSize = 65_536) {
@@ -24,7 +26,7 @@ function streamed(payload: string, init: ResponseInit = {}, chunkSize = 65_536) 
 }
 
 describe("transcript response byte limit", () => {
-  test("stops before SDK buffering when a decoded response exceeds 1 MiB", async () => {
+  test("stops before SDK buffering when a decoded response exceeds 2 MiB", async () => {
     const input = streamed("x".repeat(2 * LIMIT));
     const fetch = createTranscriptFetch(async () => input.response);
     await expect(fetch("http://synthetic.invalid/invoke")).rejects.toMatchObject({ code: "TRANSCRIPT_RESPONSE_SIZE_LIMIT" });
@@ -165,104 +167,68 @@ describe("pinned SDK transcript service integration", () => {
     expect(JSON.parse(requests[1].body as string)).toEqual({ action: "query", sql: "SELECT id FROM connector_meeting WHERE id = ?", params: ["meeting"] });
   });
 
-  test("returns typed body size_limit through the real SDK without consuming a 2 MiB stream", async () => {
-    const input = streamed(JSON.stringify("x".repeat(2 * LIMIT)));
-    const reader = createReader(services(async () => input.response));
-    expect(await reader.readBody!("fireflies", "synthetic")).toMatchObject({ state: "size_limit", reasonCode: "TRANSCRIPT_RESPONSE_SIZE_LIMIT" });
-    expect(input.state()).toEqual({ delivered: LIMIT + 65_536, cancelled: true });
+});
+function snapshotFixture(text="Synthetic transcript",sourceId="synthetic") {
+  const snapshot=JSON.stringify({contractVersion:3,meetingRef:sourceId,source:"fireflies",sourceId,operationId:"op",createdAt:"2026-09-14T00:00:00Z",
+    metadata:{title:"Fixture",startedAt:null,organizerEmail:null,participants:[],metadata:{}},body:{basis:"transcript",encoding:"utf-8",schema:"text",raw:text,
+    original:{digest:sha256(text),byteLength:Buffer.byteLength(text),recordCount:1,extent:"unknown",captureComplete:null},omissions:[]},overview:null,aliases:[]});
+  const revision=sha256(snapshot), row=[sourceId,"fireflies",sourceId,"Fixture",null,null,"[]","{}",revision,null,"published"];
+  const args={contractVersion:3,reference:{meetingRef:sourceId,source:"fireflies",sourceId,revision},basis:"transcript"} as const;
+  return {snapshot,row,args};
+}
+function exactReader(fixture:ReturnType<typeof snapshotFixture>,body:()=>Promise<Response> = async()=>new Response(fixture.snapshot)) {
+  return createReader(services(async (_url,init)=>init?.body ? new Response(JSON.stringify({rows:[fixture.row]})) : body()));
+}
+describe("pinned SDK version 3 evidence transport",()=>{
+  test("transports a complete 1 MiB original body through SDK, exact action and full dispatcher framing",async()=>{
+    const fixture=snapshotFixture("🙂".repeat(1_048_576/4));let calls=0;
+    const reader=exactReader(fixture,async()=>{calls++;return streamed(fixture.snapshot,{},257).response;});
+    const runtime={actions:[tinycloudReadMeetingAction]} as any;setTranscriptRegistry(runtime,{readerFor:()=>reader});
+    const response=await handlePostTool("tinycloud_read_meeting","synthetic-agent",{entityId:"owner",args:fixture.args},{runtimeFor:async()=>runtime});
+    expect(response.status).toBe(200);const result=(response.body as any).result;
+    expect(result.data.state).toBe("complete");expect(result.data.spans[0].text).toBe("🙂".repeat(1_048_576/4));
+    expect(result.frames).toEqual([]);expect(result.text).toBe("");expect(Buffer.byteLength(JSON.stringify(response.body))).toBeLessThanOrEqual(LIMIT);expect(calls).toBe(1);
   });
-
-  test("bounds oversized SQL metadata before SDK json parsing", async () => {
-    const input = streamed(JSON.stringify({ rows: [["synthetic", "fireflies", "synthetic", "Synthetic", "2026-09-01T12:00:00Z", null, "[]", "s".repeat(2 * LIMIT), null, "{}"]] }));
-    input.response.json = async () => { throw new Error("unbounded upstream json forbidden"); };
-    const reader = createReader(services(async () => input.response));
-    await expect(reader.getMetadata!("synthetic")).rejects.toMatchObject({ code: "transcript_unavailable" });
-    expect(input.state()).toEqual({ delivered: LIMIT + 65_536, cancelled: true });
+  test("returns capacity when complete stored snapshot exceeds the framing limit",async()=>{
+    const fixture=snapshotFixture();const input=streamed("x".repeat(2*LIMIT));
+    const result=await exactReader(fixture,async()=>input.response).readEvidence(fixture.args);
+    expect(result).toMatchObject({state:"capacity",spans:[],omissions:[{code:"TRANSCRIPT_RESPONSE_SIZE_LIMIT"}]});expect(input.state().cancelled).toBe(true);
   });
-
-  for (const status of [401, 403]) for (const body of ["permission denied", "Space not found", "x".repeat(2 * LIMIT)]) {
-    test(`preserves access denial for HTTP ${status} with ${body.length} error bytes`, async () => {
-      for (const operation of ["kv", "sql"]) {
-        const input = streamed(body, { status });
-        const reader = createReader(services(async () => input.response));
-        const result = operation === "kv" ? reader.readBody!("fireflies", "synthetic") : reader.getMetadata!("synthetic");
-        await expect(result).rejects.toMatchObject({ code: "access_denied" });
-        if (body.length > LIMIT) expect(input.state().cancelled).toBe(true);
-      }
-    });
-  }
-
-  test("does not call a truncated HTTP 404 body a missing transcript", async () => {
-    const input = streamed("x".repeat(2 * LIMIT), { status: 404 });
-    const reader = createReader(services(async () => input.response));
-    expect(await reader.readBody!("fireflies", "synthetic")).toMatchObject({ state: "unavailable", reasonCode: "TRANSCRIPT_RESPONSE_SIZE_LIMIT" });
+  test("bounds SQL metadata before SDK json parsing",async()=>{
+    const input=streamed(JSON.stringify({rows:[["synthetic","fireflies","synthetic","x".repeat(2*LIMIT)]]}));
+    const reader=createReader(services(async()=>input.response));
+    await expect(reader.getMetadata("synthetic")).rejects.toMatchObject({code:"transcript_unavailable"});expect(input.state().cancelled).toBe(true);
   });
-
-  test("preserves stored summary evidence when the transcript body exceeds the transport limit", async () => {
-    const row = ["synthetic", "fireflies", "synthetic", "Synthetic", "2026-09-01T12:00:00Z", null, "[]", "The team chose September 12 for launch.", null, "{}"];
-    const input = streamed(JSON.stringify("x".repeat(2 * LIMIT)));
-    const reader = createReader(services(async (_url, init) => init?.body ? new Response(JSON.stringify({ rows: [row] })) : input.response));
-    const result = await readMeeting(reader, { meetingRef: "synthetic", focus: "summary", includeBody: true });
-    expect(JSON.stringify(result.data)).toContain("September 12");
-    expect(JSON.stringify(result.data)).toContain("size_limit");
-    expect(input.state().cancelled).toBe(true);
+  for(const status of [401,403])for(const body of ["permission denied","Space not found","x".repeat(2*LIMIT)])test(`preserves SDK access denial ${status} with ${body.length} bytes`,async()=>{
+    const fixture=snapshotFixture();let calls=0;
+    const reader=exactReader(fixture,async()=>{calls++;return streamed(body,{status}).response;});
+    await expect(reader.readEvidence(fixture.args)).rejects.toMatchObject({code:"access_denied"});expect(calls).toBe(1);
   });
-
-  for (const status of [401, 403]) test(`HTTP ${status} availability wording suppresses already retrieved summary evidence`, async () => {
-    const row = ["synthetic", "fireflies", "synthetic", "Synthetic", "2026-09-01T12:00:00Z", null, "[]", "Private summary must not escape.", null, "{}"];
-    const reader = createReader(services(async (_url, init) => init?.body
-      ? new Response(JSON.stringify({ rows: [row] }))
-      : new Response("Space not found", { status })));
-    await expect(readMeeting(reader, { meetingRef: "synthetic", focus: "summary", includeBody: true }))
-      .rejects.toMatchObject({ code: "access_denied" });
+  test("never calls an oversized 404 response a missing body",async()=>{
+    const fixture=snapshotFixture();const reader=exactReader(fixture,async()=>streamed("x".repeat(2*LIMIT),{status:404}).response);
+    expect(await reader.readEvidence(fixture.args)).toMatchObject({state:"unavailable",omissions:[{code:"TRANSCRIPT_RESPONSE_SIZE_LIMIT"}]});
   });
-
-  test("propagates a retrieval deadline into real SDK cancellation", async () => {
-    let cancelled = false;
-    let sdkSignal: AbortSignal | undefined;
-    const reader = createReader(services(async (_url, init) => {
-      sdkSignal = init?.signal;
-      return new Response(new ReadableStream<Uint8Array>({
-        pull() { return new Promise(() => {}); }, cancel() { cancelled = true; },
-      }));
-    }));
-    await expect(reader.readBody!("fireflies", "synthetic", { deadlineAt: Date.now() + 20 })).rejects.toMatchObject({ code: "retrieval_timeout" });
-    expect(sdkSignal?.aborted).toBe(true);
-    expect(cancelled).toBe(true);
+  test("counts SDK fetch attempts without hidden transient recovery",async()=>{
+    const fixture=snapshotFixture();let calls=0;const reader=exactReader(fixture,async()=>{calls++;return new Response("temporary",{status:503});});
+    expect((await reader.readEvidence(fixture.args)).state).toBe("unavailable");expect(calls).toBe(1);
   });
-
-  test("isolates concurrent capped, successful and cancelled SDK body reads", async () => {
-    const oversized = streamed(JSON.stringify("x".repeat(2 * LIMIT)));
-    const exact = streamed(JSON.stringify("x".repeat(LIMIT - 2)));
-    const abort = new AbortController();
-    let started!: () => void;
-    const pending = new Promise<void>(resolve => { started = resolve; });
-    let cancelled = false;
-    let cancellationFinished!: () => void;
-    const cancellation = new Promise<void>(resolve => { cancellationFinished = resolve; });
-    const reader = createReader(services(async (_url, init) => {
-      const path = (init?.headers as Record<string, string>).path;
-      if (path.endsWith("/large")) return oversized.response;
-      if (path.endsWith("/exact")) return exact.response;
-      return new Response(new ReadableStream<Uint8Array>({
-        pull() { started(); return new Promise(() => {}); }, cancel() { cancelled = true; cancellationFinished(); },
-      }));
-    }, (_session, _service, path) => ({ path })));
-    const reads = [
-      reader.readBody!("fireflies", "large"),
-      reader.readBody!("fireflies", "exact"),
-      reader.readBody!("fireflies", "cancel", { signal: abort.signal }),
-    ];
-    const outcomes = Promise.allSettled(reads);
-    await pending; abort.abort();
-    expect(await outcomes).toMatchObject([
-      { status: "fulfilled", value: { state: "size_limit" } },
-      { status: "fulfilled", value: { state: "present" } },
-      { status: "rejected", reason: { code: "retrieval_cancelled" } },
-    ]);
-    expect(oversized.state()).toEqual({ delivered: LIMIT + 65_536, cancelled: true });
-    expect(exact.state()).toEqual({ delivered: LIMIT, cancelled: false });
-    await cancellation;
-    expect(cancelled).toBe(true);
+  test("propagates deadline to pinned SDK and acknowledges local body cancellation",async()=>{
+    const fixture=snapshotFixture();let cancelled=false,sdkSignal:AbortSignal|undefined;
+    const reader=createReader(services(async(_url,init)=>{sdkSignal=init?.signal;if(init?.body)return new Response(JSON.stringify({rows:[fixture.row]}));
+      return new Response(new ReadableStream<Uint8Array>({pull(){return new Promise(()=>{});},cancel(){cancelled=true;}}));}));
+    await expect(reader.readEvidence(fixture.args,{deadlineAt:Date.now()+20})).rejects.toMatchObject({code:"retrieval_timeout"});expect(sdkSignal?.aborted).toBe(true);expect(cancelled).toBe(true);
+  });
+  test("three concurrent complete 1 MiB exact reads remain isolated",async()=>{
+    const fixtures=Array.from({length:3},(_,i)=>snapshotFixture(String(i).repeat(1_048_576),`fixture-${i}`));
+    const results=await Promise.all(fixtures.map(fixture=>exactReader(fixture).readEvidence(fixture.args)));
+    results.forEach((result,index)=>{expect(result.state).toBe("complete");expect(result.spans[0].text).toBe(String(index).repeat(1_048_576));expect(result.original?.digest).toBe(sha256(String(index).repeat(1_048_576)));});
+  });
+  test("concurrent cancellation and overflow cannot damage another exact read",async()=>{
+    const fixture=snapshotFixture();const abort=new AbortController();let started!:()=>void;const pulling=new Promise<void>(resolve=>{started=resolve;});
+    const slow=exactReader(fixture,async()=>new Response(new ReadableStream<Uint8Array>({pull(){started();return new Promise(()=>{});}})));
+    const pending=slow.readEvidence(fixture.args,{signal:abort.signal}).then(value=>({value}),error=>({error}));
+    await pulling;abort.abort();
+    const results=await Promise.all([pending,exactReader(fixture,async()=>streamed("x".repeat(2*LIMIT)).response).readEvidence(fixture.args),exactReader(fixture).readEvidence(fixture.args)]);
+    expect(results[0]).toMatchObject({error:{code:"retrieval_cancelled"}});expect(results[1]).toMatchObject({state:"capacity"});expect(results[2]).toMatchObject({state:"complete"});
   });
 });

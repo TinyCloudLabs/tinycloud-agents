@@ -23,6 +23,7 @@ import { mapDelegationError } from "../errors.js";
 import { ARTIFACTORY_APP_ID } from "../auth/app-registry.js";
 import { checkContext, MeetingRetrievalError, withinContext } from "../meeting-evidence.js";
 import type { RetrievalContext } from "../meeting-evidence.js";
+import { MEETING_ENVELOPE_BYTE_LIMIT } from "../meeting-contract.js";
 
 // App-identity gate. RUN_ARTIFACT_SKILL is registered on every production
 // runtime (runtime-host boots one plugin set per agent), so tool dispatch must
@@ -148,7 +149,7 @@ export async function handlePostTool(
         },
       },
     };
-    if ((result?.data as { contractVersion?: number } | undefined)?.contractVersion === 2 && JSON.stringify(response.body).length > 16_000) {
+    if (meetingTool && Buffer.byteLength(JSON.stringify(response.body), "utf8") > MEETING_ENVELOPE_BYTE_LIMIT) {
       throw new MeetingRetrievalError("meeting_result_size_limit", 413);
     }
     return response;

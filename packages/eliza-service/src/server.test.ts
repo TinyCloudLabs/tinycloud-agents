@@ -174,7 +174,7 @@ describe("eliza-service HTTP server", () => {
       expect((await fetch(url("/capabilities"))).status).toBe(401);
       const response = await fetch(url("/capabilities"), { headers: { Authorization: `Bearer ${TEST_SERVICE_SECRET}` } });
       expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({ meetingRetrieval: { contractVersion: 2 }, buildRevision: process.env.BUILD_REVISION });
+      expect(await response.json()).toEqual({ meetingRetrieval: { contractVersion: 3 }, buildRevision: process.env.BUILD_REVISION });
     } finally { if (saved === undefined) delete process.env.BUILD_REVISION; else process.env.BUILD_REVISION = saved; }
   });
 

@@ -5,9 +5,11 @@ import {
 } from "@tinycloud/agent-client";
 import type { PortableDelegation } from "@tinycloud/agent-client";
 import { DelegationExpiredError, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
-import type { TranscriptMetadata, TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
-import { checkContext, decodeBody, discoveryResult, MeetingRetrievalError, withinContext } from "./meeting-evidence.js";
-import type { BodyResult, MeetingSelection, RetrievalContext } from "./meeting-evidence.js";
+import type { TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
+import { checkContext, decodeSnapshotEvidence, emptyEvidence, safeMeetingRef, sha256, MeetingRetrievalError, withinContext } from "./meeting-evidence.js";
+import type { BodyResult, RetrievalContext } from "./meeting-evidence.js";
+import type { CatalogMeeting, EvidenceOmission, PublishedMeetingSnapshot } from "./meeting-contract.js";
+import { isSource, parseFindMeetingsArgs, parseReadMeetingArgs, safeSourceId } from "./actions/tinycloud-search-transcripts.js";
 import { createTranscriptNode, TranscriptResponseLimitError } from "./transcript-transport.js";
 
 const SQL_PATH = "xyz.tinycloud.tinychat/connectors";
@@ -16,8 +18,7 @@ const TTL_MS = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_TTL_MS) || 4 * 60 * 
 // node-sdk 2.6.0 activates a child session lasting at most one hour, even when
 // its portable parent is valid for days. Renew on the next read before expiry.
 const SESSION_REFRESH_MS = 50 * 60 * 1000;
-/** Bounded discovery: one row over the policy ceiling is the overflow sentinel. */
-const METADATA_ROW_LIMIT = 501;
+
 
 type Access = {
   sql: { db(name: string): { query(sql: string, params?: Array<string | number | null>, options?: { signal?: AbortSignal }): Promise<unknown> } };
@@ -45,8 +46,6 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
   private readonly entries = new Map<string, Entry>();
   private readonly pending = new Map<string, Promise<void>>();
   private readonly roomToEntity = new Map<string, string>();
-  /** Content-free follow-up state; transcript text is never retained here. */
-  private readonly selectedMeetingByRoom = new Map<string, MeetingSelection>();
 
   constructor(
     private readonly args: {
@@ -116,7 +115,7 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
         if (!entry.refresh) {
           const startedAt = Date.now();
           entry.refresh = this.activateAccess(entry.delegation).then(access => {
-            // Renewal preserves the entry and its selection. A late activation
+            // Renewal preserves the entry. A late activation
             // must never restore a revoked, replaced, evicted, or stopped entry.
             assertAccess();
             entry.access = access;
@@ -133,33 +132,6 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
     }, assertAccess, () => this.drop(entityId));
   }
 
-  selectedMeetingFor(entityId: string, roomId?: string): string | null {
-    this.readerFor(entityId, roomId);
-    if (!roomId || this.roomToEntity.get(roomId) !== entityId) return null;
-    const selection = this.selectedMeetingByRoom.get(roomId);
-    return selection?.state === "single" ? selection.meetingRef : null;
-  }
-
-  selectMeeting(entityId: string, roomId: string | undefined, meetingRef: string): void {
-    if (!roomId) return;
-    const roomOwner = this.roomToEntity.get(roomId);
-    if (roomOwner !== undefined && roomOwner !== entityId) throw new NoDelegationError(entityId);
-    if (!this.entries.has(entityId)) throw new NoDelegationError(entityId);
-    this.roomToEntity.set(roomId, entityId);
-    this.readerFor(entityId, roomId);
-    this.selectedMeetingByRoom.set(roomId, { state: "single", meetingRef });
-  }
-
-  setSelection(entityId: string, roomId: string | undefined, selection: MeetingSelection): void {
-    if (!roomId) return;
-    const owner = this.roomToEntity.get(roomId);
-    if (owner !== undefined && owner !== entityId) throw new NoDelegationError(entityId);
-    if (selection.state === "none") { this.selectedMeetingByRoom.delete(roomId); return; }
-    this.readerFor(entityId, roomId);
-    this.roomToEntity.set(roomId, entityId);
-    this.selectedMeetingByRoom.set(roomId, selection);
-  }
-
   /** True only while this entity has live, unexpired activated access. */
   has(entityId: string): boolean {
     const entry = this.entries.get(entityId);
@@ -171,7 +143,6 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
   async stop(): Promise<void> {
     this.entries.clear();
     this.roomToEntity.clear();
-    this.selectedMeetingByRoom.clear();
     this.pending.clear();
   }
 
@@ -184,7 +155,6 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
     if (this.entries.size >= (this.args.maxEntries ?? MAX_ENTRIES)) this.evictLru();
     this.entries.set(entityId, { access, delegation, refreshAt: startedAt + SESSION_REFRESH_MS, expiry, lastUsed: Date.now(), roomId });
     if (roomId) {
-      this.selectedMeetingByRoom.delete(roomId);
       this.roomToEntity.set(roomId, entityId);
     }
   }
@@ -203,7 +173,6 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
     for (const [room, owner] of this.roomToEntity) {
       if (owner !== entityId) continue;
       this.roomToEntity.delete(room);
-      this.selectedMeetingByRoom.delete(room);
     }
   }
 
@@ -213,27 +182,21 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
   }
 }
 
-const COLUMNS = "id, source, source_id, title, started_at, organizer_email, participants, summary_overview, summary_action_items, metadata";
-function decodeMetadata(row: unknown): TranscriptMetadata | null {
+const COLUMNS = "id, source, source_id, title, started_at, organizer_email, participants, metadata, head_revision, head_snapshot_key, publication_state";
+function decodeMetadata(row: unknown): CatalogMeeting | null {
   if (!Array.isArray(row)) return null;
-  const [meetingRef, source, sourceId, title, startedAt, organizerEmail, participants, summaryOverview, summaryActionItems, metadata] = row;
-  if (typeof meetingRef !== "string" || !safeMeetingRef(meetingRef) || !isSource(source) || typeof sourceId !== "string" || !safeSegment(sourceId)) return null;
-  const parsed = parseParticipants(participants);
-  let provenance: unknown = metadata;
-  if (typeof provenance === "string") { try { provenance = JSON.parse(provenance); } catch { provenance = undefined; } }
-  // Only keep existing artifact type markers, never opaque provider metadata.
-  const known: Record<string, unknown> = {};
-  if (provenance && typeof provenance === "object") for (const key of ["artifactType", "artifact_type", "type", "kind", "documentType", "document_type", "notes_kind", "notes_association"]) {
-    const value = (provenance as Record<string, unknown>)[key]; if (typeof value === "string" && value.length < 100) known[key] = value;
-  }
-  const transcriptCount = provenance && typeof provenance === "object" ? (provenance as Record<string, unknown>).transcript_count : undefined;
-  if (typeof transcriptCount === "number" && Number.isInteger(transcriptCount) && transcriptCount >= 0) known.transcript_count = transcriptCount;
-  return { meetingRef, source, sourceId, title: typeof title === "string" ? title : null,
-    startedAt: typeof startedAt === "string" && Number.isFinite(Date.parse(startedAt)) ? startedAt : null,
-    participantNames: parsed.names, participantEmails: parsed.emails, metadataLimited: parsed.limited, organizerEmail: typeof organizerEmail === "string" ? organizerEmail : null,
-    summaryOverview: typeof summaryOverview === "string" ? summaryOverview : null, summaryActionItems: typeof summaryActionItems === "string" ? summaryActionItems : null,
-    ...(Object.keys(known).length ? { metadata: known } : {}),
-  };
+  const [meetingRef,source,sourceId,title,startedAt,organizerEmail,rawParticipants,rawMetadata,revision,_key,state] = row;
+  if (!safeMeetingRef(meetingRef) || !isSource(source) || !safeSourceId(sourceId) || state === "deleted") return null;
+  let participants: unknown = rawParticipants, metadata: unknown = rawMetadata;
+  try { if (typeof participants === "string") participants = JSON.parse(participants); if (typeof metadata === "string") metadata=JSON.parse(metadata); } catch { return null; }
+  if (!Array.isArray(participants)) return null;
+  const validRevision = typeof revision === "string" && /^[a-f0-9]{64}$/.test(revision);
+  return {meetingRef,source,sourceId,revision:validRevision?revision:null,
+    readiness:validRevision && ["published","reserved"].includes(state) ? "published" : state === "unavailable" ? "unavailable" : "unverified",
+    title:typeof title === "string"?title:null,startedAt:typeof startedAt === "string"?startedAt:null,
+    organizerEmail:typeof organizerEmail === "string"?organizerEmail:null,
+    participants:participants.flatMap(item => item && typeof item === "object" ? [{...(typeof item.name === "string"?{name:item.name}:typeof item.displayName === "string"?{name:item.displayName}:{}),...(typeof item.email === "string"?{email:item.email}:{})}] : []),
+    basis:metadata && typeof metadata === "object" && ((metadata as Record<string,unknown>).artifactType === "notes" || (metadata as Record<string,unknown>).basis === "notes") ? "notes" : "transcript"};
 }
 /** Pinned SDK 2.6.0 preserves HTTP error details, but KV_NOT_FOUND alone is ambiguous. */
 export function classifyBodyFailure(error: unknown): BodyResult {
@@ -280,74 +243,45 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     }
     return response.data.rows;
   };
-  const readBody = async (source: TranscriptMetadata["source"], sourceId: string, context: RetrievalContext = {}): Promise<BodyResult> => {
-    if (!isSource(source) || !safeSegment(sourceId)) throw new MeetingRetrievalError("invalid_stored_metadata");
-    assertAccess();
-    // Transcript-only transport caps decoded bytes before SDK buffering. Retain
-    // the decoded-value check for injected readers and UTF-8 replacement growth.
-    const response = await withinContext(signal => withAccess(signal, active => active.kv.get(`${SQL_PATH}/${source}/transcript/${sourceId}`, { prefix: "", raw: true, signal })), context) as { ok?: boolean; error?: unknown; data?: { data?: unknown } };
-    assertAccess();
-    const body = response?.ok === true ? decodeBody(response.data?.data) : classifyBodyFailure(response?.error);
-    enforceAccess(body); return body;
-  };
   return {
     assertAccess,
-    async listMetadata() {
-      const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) DESC, id ASC LIMIT ${METADATA_ROW_LIMIT}`);
-      return rows.flatMap(row => { const decoded = decodeMetadata(row); return decoded ? [decoded] : []; });
-    },
     async getMetadata(reference, context = {}) {
-      if (!safeMeetingRef(reference)) throw new MeetingRetrievalError("invalid_args", 400);
+      if (!safeMeetingRef(reference)) throw new MeetingRetrievalError("invalid_args",400);
       const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting WHERE id = ? LIMIT 1`, [reference], context);
-      // Check identity even when a faulty upstream ignores its predicate.
-      return rows.map(decodeMetadata).find(row => row?.meetingRef === reference) ?? null;
+      return rows.map(decodeMetadata).find(row=>row?.meetingRef===reference)??null;
     },
-    async discoverMetadata(args, context = {}) {
-      const clauses: string[] = []; const params: Array<string | number | null> = [];
-      if (args.source) { clauses.push("source = ?"); params.push(args.source); }
-      // Conservative UTC superset for every IANA offset, followed by exact local-day checks.
-      if (args.from) { clauses.push("julianday(started_at) >= julianday(?)"); params.push(new Date(Date.parse(args.from) - 86_400_000).toISOString()); }
-      if (args.to) { clauses.push("julianday(started_at) < julianday(?)"); params.push(new Date(Date.parse(args.to) + 2 * 86_400_000).toISOString()); }
-      const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) ${args.sort === "oldest" ? "ASC" : "DESC"}, id ASC LIMIT ${METADATA_ROW_LIMIT}`, params, context);
-      const decoded = rows.slice(0, 500).flatMap(row => { const value = decodeMetadata(row); return value ? [value] : []; });
-      return discoveryResult(decoded, rows.length, args, context);
+    async pageMetadata(args, context = {}) {
+      if (!parseFindMeetingsArgs(args as unknown as Record<string,unknown>)) throw new MeetingRetrievalError("invalid_args",400);
+      const clauses = ["(publication_state IS NULL OR publication_state != 'deleted')"], params:Array<string|number|null>=[];
+      if(args.after){clauses.push("id > ?");params.push(args.after);}
+      if(args.filters?.source){clauses.push("source = ?");params.push(args.filters.source);}
+      const raw = await query(`SELECT ${COLUMNS} FROM connector_meeting WHERE ${clauses.join(" AND ")} ORDER BY id ASC LIMIT 101`,params,context);
+      const examined=raw.slice(0,100), omissions:EvidenceOmission[]=[];
+      const rows=examined.flatMap((row,index)=>{const decoded=decodeMetadata(row);if(decoded)return[decoded];omissions.push({code:"invalid_catalog_record",recordIndex:index});return[];});
+      const cursor=examined.at(-1)?.[0];
+      if(examined.length && !safeMeetingRef(cursor))throw new MeetingRetrievalError("invalid_catalog_cursor");
+      return {contractVersion:3,kind:"page",rows,nextCursor:raw.length>100?cursor as string:null,exhausted:raw.length<=100,
+        examinedRows:examined.length,observedAt:new Date().toISOString(),scope:"observed",omissions};
     },
-    readBody,
-    async getTranscript(source, sourceId) {
-      const body = await readBody(source, sourceId);
-      if (body.state === "missing" || body.state === "empty") return null;
-      if (body.state !== "present") throw new MeetingRetrievalError(body.reasonCode ?? body.state);
-      return body.value;
+    async readEvidence(args, context = {}) {
+      if(!parseReadMeetingArgs(args as unknown as Record<string,unknown>))throw new MeetingRetrievalError("invalid_args",400);
+      const {reference,basis}=args;
+      const metadata=await this.getMetadata(reference.meetingRef,context);
+      if(!metadata || metadata.source!==reference.source || metadata.sourceId!==reference.sourceId || metadata.readiness!=="published")return emptyEvidence(reference,basis,"unavailable","meeting_unavailable");
+      const key=`${SQL_PATH}/${reference.source}/snapshot/${encodeURIComponent(reference.sourceId)}/${reference.revision}`;
+      const response=await withinContext(signal=>withAccess(signal,active=>active.kv.get(key,{prefix:"",raw:true,signal})),context) as {ok?:boolean;error?:unknown;data?:{data?:unknown}};
+      assertAccess();
+      if(response?.ok!==true){const failure=classifyBodyFailure(response?.error);enforceAccess(failure);return emptyEvidence(reference,basis,failure.state==="size_limit"?"capacity":"unavailable",failure.state==="missing"?"revision_unavailable":failure.reasonCode??failure.state);}
+      const raw=response.data?.data;
+      if(typeof raw!=="string")return emptyEvidence(reference,basis,"unavailable","invalid_snapshot_encoding");
+      if(sha256(raw)!==reference.revision)return emptyEvidence(reference,basis,"unavailable","snapshot_digest_mismatch");
+      let snapshot:PublishedMeetingSnapshot;
+      try{snapshot=JSON.parse(raw);}catch{return emptyEvidence(reference,basis,"unavailable","invalid_snapshot_json");}
+      const result=decodeSnapshotEvidence(snapshot,reference,basis);
+      // A delete/identity replacement during KV I/O cannot release its former content.
+      const current=await this.getMetadata(reference.meetingRef,context);
+      if(!current || current.source!==reference.source || current.sourceId!==reference.sourceId || current.readiness!=="published")return emptyEvidence(reference,basis,"unavailable","meeting_unavailable");
+      assertAccess();return result;
     },
   };
-}
-
-function isSource(value: unknown): value is TranscriptMetadata["source"] {
-  return value === "fireflies" || value === "google-meet" || value === "tinycloud-transcriber";
-}
-
-function safeSegment(value: string): boolean {
-  return value.length > 0 && value.length <= 512 && !value.includes("/") && !value.includes("\\") && !value.includes("..");
-}
-
-function safeMeetingRef(value: string): boolean {
-  return value.length > 0 && value.length <= 128 && /^[A-Za-z0-9._:-]+$/.test(value) && !value.includes("..");
-}
-
-function parseParticipants(value: unknown): { names: string[]; emails: string[]; limited: boolean } {
-  let parsed = value;
-  if (typeof value === "string") {
-    try { parsed = JSON.parse(value) as unknown; } catch { return { names: [], emails: [], limited: true }; }
-  }
-  if (!Array.isArray(parsed)) return { names: [], emails: [], limited: true };
-  const names: string[] = [];
-  const emails: string[] = [];
-  for (const entry of parsed.slice(0, 100)) {
-    if (!entry || typeof entry !== "object") continue;
-    const participant = entry as { name?: unknown; email?: unknown; displayName?: unknown };
-    const name = typeof participant.name === "string" ? participant.name : participant.displayName;
-    if (typeof name === "string" && name.length <= 160) names.push(name);
-    if (typeof participant.email === "string" && participant.email.length <= 254) emails.push(participant.email);
-  }
-  return { names: [...new Set(names)], emails: [...new Set(emails)], limited: parsed.length > 100 };
 }
