@@ -50,6 +50,7 @@ export function buildSynthesisMessages(input: {
       "CITATIONS ARE REQUIRED OUTPUT SYNTAX: copy the exact supplied bracketed meeting citation immediately after the claim it supports, including attribution and timestamps. " +
       "Metadata supports titles, dates and attendance only; substantive meeting discussion requires retained content evidence. " +
       "Do not infer decisions, assigned actions or owners from evidence that does not state them. Preserve explicit test or synthetic designations when the evidence states them; never infer them from a title. " +
+      "Recorded actions establish assignments or plans only; never claim completion unless retained evidence explicitly states it. " +
       "Public facts cite their actual returned URL beside the claim. Public sources cannot replace unread or denied private facts. Keep meeting labels and public URLs distinct. " +
       "Stored overviews and excerpts do not establish full transcript coverage. Leave coverage counts/statuses to the deterministic section appended by the service; do not write your own coverage section or claim all meetings were read or summarized. " +
       "Citations establish structural provenance, not semantic support for every claim. Say when evidence is insufficient. Never expose storage references, tool objects or grant/session identifiers. " +
@@ -95,15 +96,36 @@ export function validateMeetingAnswer(content: string, evidence: PackedMeetingEv
 }
 
 function coverageConflict(text: string, evidence: PackedMeetingEvidence): boolean {
-  const read = evidence.meetings.filter(meeting => meeting.state === "read").length;
+  // Check surface claims only, not semantic entailment. Markdown and common small
+  // number words must not hide the same detectable claim; returned prose is unchanged.
+  const numbers = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"];
+  const normalized = text.replace(/[*_`~]/g, "").replace(/\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/gi, word => String(numbers.indexOf(word.toLowerCase())));
+  const usable = evidence.meetings.filter(meeting => meeting.state === "read" && meeting.coverage.support !== "none" && meeting.evidence.some(item => item.kind !== "metadata" && item.text.trim()));
+  const read = usable.length;
   const incomplete = read !== evidence.meetings.length || evidence.discoveries.some(({ discovery: d }) => d.scanLimited || d.countKind === "lower_bound" || d.matchedCount > d.returnedCount || d.omittedMeetingRefs.length > 0);
-  if (incomplete && /\b(?:read\s+all\s+(?:(?:the|\d+)\s+)?meetings|all\s+(?:(?:the|\d+)\s+)?meetings\s+(?:were\s+)?read)\b/i.test(text)) return true;
-  const counts = [...text.matchAll(/\bread\s+(?:all\s+)?(\d+)\s+meetings\b/gi), ...text.matchAll(/\b(\d+)\s+meetings\s+(?:were\s+)?read\b/gi)];
-  if (counts.some(match => Number(match[1]) !== read)) return true;
-  for (const meeting of evidence.meetings) {
-    if (meeting.state === "read") continue;
-    const pattern = new RegExp(`\\b${meeting.id}\\b\\]?\\s+(?:was\\s+)?(?:read|summarized)\\b`, "i");
-    if (pattern.test(text)) return true;
+  const partial = incomplete || evidence.meetings.some(meeting => meeting.body.state !== "present" || meeting.body.partialDecoding || meeting.coverage.support !== "sufficient"
+    || meeting.coverage.omittedEvidenceCount > 0 || meeting.coverage.omissionReasons.length > 0 || meeting.evidence.some(item => item.truncated));
+  const records = "(?:(?:discovered|returned|matching|selected)\\s+)?(?:meetings?(?:\\s+records?)?|records?)";
+  const scope = "(?:\\s+(?:for|in|during)\\s+(?:this|the|that)\\s+(?:period|interval|week|month|scan))?";
+  const allRead = new RegExp(`\\b(?:read\\s+all\\s+(?:(?:the|\\d+)\\s+)?${records}|all\\s+(?:(?:the|\\d+)\\s+)?${records}${scope}\\s+(?:were\\s+|have\\s+been\\s+)?read)\\b`, "gi");
+  const readCounts = [new RegExp(`\\bread\\s+(?:all\\s+)?(\\d+)\\s+${records}\\b`, "gi"), new RegExp(`\\b(\\d+)\\s+${records}${scope}\\s+(?:were\\s+|have\\s+been\\s+)?read\\b`, "gi")];
+  // Negation and retained-evidence qualifiers apply to their own clause; a caveat
+  // elsewhere in the answer cannot license a contradictory global claim.
+  for (const clause of normalized.split(/[.!?;\r\n]+/)) {
+    const affirmed = (match: RegExpMatchArray) => !/\b(?:not|never|cannot|can't|couldn't|didn't|don't|doesn't|isn't|aren't|wasn't|weren't|without)(?:\s+\w+){0,3}\s*$/i.test(clause.slice(Math.max(0, match.index! - 80), match.index));
+    if (incomplete && [...clause.matchAll(allRead)].some(affirmed)) return true;
+    if (readCounts.some(pattern => [...clause.matchAll(pattern)].some(match => Number(match[1]) > read && affirmed(match)))) return true;
+    for (const meeting of evidence.meetings) {
+      if (usable.includes(meeting)) continue;
+      const pattern = new RegExp(`\\b${meeting.id}\\b\\]?\\s+(?:was\\s+)?(?:read|summarized)\\b`, "gi");
+      if ([...clause.matchAll(pattern)].some(affirmed)) return true;
+    }
+    if (!partial) continue;
+    const completeCoverage = /\b(?:complete|full)\s+(?:(?:transcript|meeting)\s+)?coverage\b|\bcoverage(?:\s+for\s+(?:this|that|the)\s+meeting)?\s+is\s+(?:complete|full)\b/gi;
+    if ([...clause.matchAll(completeCoverage)].some(affirmed)) return true;
+    const qualified = /\b(?:in|from|within|based on|according to)\s+(?:the\s+)?(?:retained|supplied|available)\s+(?:meeting\s+)?(?:evidence|excerpts?|notes|content)\b/i.test(clause);
+    const exhaustiveDecision = /\bonly\s+(?:explicit\s+)?decisions?\b|\bno\s+other\s+(?:meeting\s+evidence\s+(?:states?|records?|contains?)\s+(?:a\s+)?)?decisions?\b/gi;
+    if (!qualified && [...clause.matchAll(exhaustiveDecision)].some(affirmed)) return true;
   }
   return false;
 }
@@ -112,7 +134,9 @@ function coverageConflict(text: string, evidence: PackedMeetingEvidence): boolea
 export function buildCoverage(evidence: PackedMeetingEvidence, citedMeetingIds: readonly string[] = []): string {
   const rows = evidence.meetings.map(meeting => {
     const read = meeting.state === "read";
-    let status = read ? citedMeetingIds.includes(meeting.id) ? "Content was read; this answer cites this record" : "Content was read, but this answer does not cite it"
+    const usable = meeting.coverage.support !== "none" && meeting.evidence.some(item => item.kind !== "metadata" && item.text.trim());
+    let status = read ? !usable ? "Read was attempted; no usable content was retained for this answer"
+      : citedMeetingIds.includes(meeting.id) ? "Content was read; this answer cites this record" : "Content was read, but this answer does not cite it"
       : meeting.state === "metadata" || meeting.state === "not_read" ? "Discovered; content was not read"
       : meeting.state === "meeting_not_found" ? "The meeting was not found when read"
       : meeting.state === "access_denied" ? "Access was denied"
@@ -124,7 +148,6 @@ export function buildCoverage(evidence: PackedMeetingEvidence, citedMeetingIds: 
     };
     status += `. ${body[meeting.body.state] ?? "Body state was unavailable"}`;
     if (meeting.coverage.omittedEvidenceCount > 0 || meeting.coverage.omissionReasons.length > 0 || meeting.evidence.some(item => item.truncated)) status += ". Evidence was omitted or shortened";
-    if (read && !meeting.evidence.some(item => item.kind !== "metadata" && item.text.trim())) status += ". No content evidence was retained for this answer";
     return `- ${meeting.id} — ${status}.`;
   });
   for (const [index, receipt] of evidence.discoveries.entries()) {
