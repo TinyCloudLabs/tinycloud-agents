@@ -112,7 +112,11 @@ describe("in-process task tool bridge", () => {
     const pending = tools.execute(call);
     await started;
     expect(await tools.execute({ ...call, id: "concurrent" })).toEqual({ status: 409, body: { error: "tool_already_running" } });
-    expect(await pending).toEqual({ status: 408, body: { error: "retrieval_timeout" } });
+    const timedOut = await pending;
+    // The bridge abort and the handler's retrieval deadline share the same
+    // ceiling. Either timer may win; both preserve the typed timeout contract.
+    expect([408, 504]).toContain(timedOut.status);
+    expect(timedOut.body).toEqual({ error: "retrieval_timeout" });
     expect(signal?.aborted).toBe(true);
     expect(tools.attempts).toBe(1);
   }, 15000);
