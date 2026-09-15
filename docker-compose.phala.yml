@@ -17,8 +17,8 @@
 # container is effectively stateless and safe to restart — there is no local
 # SQLite file to mount. The single-writer-SQLite constraint lives on the node.
 # The only persistent artifacts are: (1) the ingress TLS certs (named volume
-# below) and (2) the agent key file, which is provided as a Phala secret/mounted
-# file — NOT a data volume. See DEPLOY.md.
+# below) and (2) the agent key file, materialized by the entrypoint from the
+# encrypted TINYCLOUD_AGENT_KEY environment value. See DEPLOY.md.
 services:
   eliza-service:
     image: ${ELIZA_SERVICE_IMAGE:-ghcr.io/tinycloudlabs/eliza-service:latest}
@@ -41,6 +41,10 @@ services:
       TINYCLOUD_HOST: ${TINYCLOUD_HOST:-https://tee.node.tinycloud.xyz}
       # ── Tools (REQUIRED for web_search) ──
       TAVILY_API_KEY: ${TAVILY_API_KEY}
+      # ── TinyChat tasks (disabled without both key and model map) ──
+      REDPILL_API_KEY: ${REDPILL_API_KEY:-}
+      REDPILL_BASE_URL: ${REDPILL_BASE_URL:-https://api.redpill.ai/v1}
+      ELIZA_TASK_MODELS_JSON: ${ELIZA_TASK_MODELS_JSON:-}
       # ── Server bind (defaults baked into the image) ──
       PORT: "3000"
       HOST: "0.0.0.0"

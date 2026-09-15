@@ -1,13 +1,17 @@
 import { KVService, NodeWasmBindings, SQLService, ServiceContext, TinyCloudNode } from "@tinycloud/node-sdk";
 import type { DelegatedAccess, FetchFunction, IWasmBindings, PortableDelegation } from "@tinycloud/node-sdk";
+import { disableLocalAccountWrites } from "./local-validation-node.js";
 
 export const TRANSCRIPT_RESPONSE_BYTE_LIMIT = 1_048_576;
 export type TranscriptFetch = (url: string, init?: Parameters<FetchFunction>[1]) => Promise<Response>;
 
 /** Keep activation unchanged and replace only the delegated storage services. */
-export function createTranscriptNode(args: { privateKey: string; host: string }) {
+export function createTranscriptNode(args: { privateKey: string; host: string; localValidation?: boolean }) {
   const bindings = new NodeWasmBindings();
-  const node = new TinyCloudNode({ ...args, wasmBindings: bindings });
+  const node = new TinyCloudNode({ privateKey: args.privateKey, host: args.host, wasmBindings: bindings,
+    ...(args.localValidation ? { autoCreateSpace: false } : {}),
+  });
+  if (args.localValidation) disableLocalAccountWrites(node);
   return {
     signIn: () => node.signIn(),
     async useDelegation(delegation: PortableDelegation) {

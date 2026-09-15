@@ -10,6 +10,7 @@
 
 import type { Action, Content, Memory, Plugin } from "@elizaos/core";
 import { ToolError } from "../handlers/tools.js";
+import { checkContext, withinContext, type RetrievalContext } from "../meeting-evidence.js";
 
 const TAVILY_ENDPOINT = "https://api.tavily.com/search";
 const MAX_RESULTS = 5;
@@ -66,27 +67,44 @@ export const webSearchAction: Action = {
       throw new ToolError("web_search: TAVILY_API_KEY not configured", 500, "tool_misconfigured");
     }
 
-    let res: Response;
-    try {
-      res = await fetch(TAVILY_ENDPOINT, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          api_key: apiKey,
-          query,
-          max_results: MAX_RESULTS,
-          include_answer: true,
-          search_depth: "basic",
-        }),
-      });
-    } catch {
-      throw new ToolError("web_search: upstream request failed", 502, "tool_upstream_error");
-    }
-    if (!res.ok) {
-      throw new ToolError(`web_search: tavily responded ${res.status}`, 502, "tool_upstream_error");
-    }
-
-    const data = (await res.json()) as TavilyResponse;
+    const context = (options as { context?: RetrievalContext } | undefined)?.context ?? {};
+    const data = await withinContext(async signal => {
+      let response: Response | undefined;
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      const cancel = () => { void (reader ? reader.cancel() : response?.body?.cancel())?.catch(() => {}); };
+      signal?.addEventListener("abort", cancel, { once: true });
+      try {
+        try {
+          response = await fetch(TAVILY_ENDPOINT, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ api_key: apiKey, query, max_results: MAX_RESULTS, include_answer: true, search_depth: "basic" }),
+            signal,
+          });
+        } catch {
+          checkContext({ ...context, signal });
+          throw new ToolError("web_search: upstream request failed", 502, "tool_upstream_error");
+        }
+        // A fetch implementation can resolve after the operation already aborted.
+        if (signal?.aborted) cancel();
+        checkContext({ ...context, signal });
+        if (!response.ok || !response.body) throw new ToolError("web_search: upstream response failed", 502, "tool_upstream_error");
+        reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let text = "";
+        for (;;) {
+          const next = await reader.read();
+          checkContext({ ...context, signal });
+          if (next.done) break;
+          text += decoder.decode(next.value, { stream: true });
+        }
+        return JSON.parse(text + decoder.decode()) as TavilyResponse;
+      } finally {
+        signal?.removeEventListener("abort", cancel);
+        cancel();
+        reader?.releaseLock();
+      }
+    }, context);
     const text = summarize(data);
     const content: Content = { text };
     if (callback) await callback(content);
