@@ -2,6 +2,8 @@ import type { Plugin } from "@elizaos/core";
 import { RuntimeHost } from "./runtime-host.js";
 import { SessionStore } from "./session-store.js";
 import { startElizaService } from "./server.js";
+import { createLocalValidationHost, localValidationFromEnv } from "./local-validation-host.js";
+import { taskConfigFromEnv } from "./tasks/contract.js";
 
 export { RuntimeHost, bootStubRuntime } from "./runtime-host.js";
 export { createElizaServiceFetch, startElizaService } from "./server.js";
@@ -9,17 +11,24 @@ export type { ElizaServiceHost, ElizaServiceOptions, StartElizaServiceOptions } 
 export { SessionStore } from "./session-store.js";
 
 export async function main(): Promise<void> {
-  const sqlPlugin = await loadSqlPlugin();
-  const runtimeHost = new RuntimeHost({
-    agentKeyFile: process.env.TINYCLOUD_AGENT_KEY_FILE,
-    host: process.env.TINYCLOUD_HOST,
-    sqlPlugin,
-  });
-  await runtimeHost.init();
+  const tasks = taskConfigFromEnv();
+  const localValidation = localValidationFromEnv(process.env);
+  const runtimeHost = localValidation
+    ? await createLocalValidationHost({
+      agentKeyFile: process.env.TINYCLOUD_AGENT_KEY_FILE ?? "",
+      host: process.env.TINYCLOUD_HOST ?? "https://node.tinycloud.xyz",
+    })
+    : new RuntimeHost({
+      agentKeyFile: process.env.TINYCLOUD_AGENT_KEY_FILE,
+      host: process.env.TINYCLOUD_HOST,
+      sqlPlugin: await loadSqlPlugin(),
+    });
+  if (runtimeHost instanceof RuntimeHost) await runtimeHost.init();
 
   const server = startElizaService({
     host: runtimeHost,
     sessions: new SessionStore(),
+    tasks,
     hostname: process.env.HOST ?? process.env.TINYCLOUD_ELIZA_SERVICE_HOST ?? "0.0.0.0",
     port: readPort(process.env.PORT ?? process.env.TINYCLOUD_ELIZA_SERVICE_PORT),
   });

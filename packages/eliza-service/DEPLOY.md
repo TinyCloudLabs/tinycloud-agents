@@ -154,3 +154,50 @@ env:
 
 Redeploy tinychat's CVM so it picks up the new env, then run a tinychat chat turn
 end-to-end to confirm the delegation + memory round-trip.
+
+## Local TinyChat tasks
+
+The authenticated `/capabilities` response includes `chatTasks` version 1. With
+`REDPILL_API_KEY`, the approved `REDPILL_BASE_URL` (default
+`https://api.redpill.ai/v1`), and `ELIZA_TASK_MODELS_JSON` configured, TinyChat can
+submit `/tasks` and cancel through `/tasks/:executionId/cancel`. The model map is
+a JSON object from exact approved model ID to its context-token ceiling. It does
+not load model configuration or credentials from requests. Missing configuration
+leaves tasks disabled with HTTP 503; malformed configured values reject startup.
+
+The local task runner owns ordinary provider answers and sequential read-only
+meeting/public-web tools. Ordinary eligible text streams; private selection
+makes buffering irreversible. Reported usage survives later failures, and
+cancellation settles without waiting for an uncooperative provider. Keep general
+rollout gated on the end-to-end acceptance checks.
+
+A task allows at most four ordinary provider requests and sixteen tool attempts,
+including at most one transient retry per normalized tool/arguments key. Private
+answer rounds use clean context containing only the latest question, resolved
+calendar scope, current-run meeting evidence and separate public sources. Before
+the fourth request, a clean round may advertise **only admitted `web_search`** to
+fetch missing public sources; it never reopens private tools or includes account
+memory/history. A valid answer without a tool call finishes that round immediately.
+Thus a private answer can finish in three requests, while discovery → read → web
+lookup → answer fits within four. The fourth request and the optional single
+citation repair are strictly no-tools. Repair receives validation codes and fresh
+evidence, never the rejected draft; all attempts contribute to aggregate usage.
+
+Missing calendar context is checked after the provider selects an admitted private
+tool and before its dispatch. Clarification accounts for that provider request;
+ordinary questions that quote relative meeting dates continue normally.
+
+Active runs and content-free execution tombstones remain in one service process.
+The registry holds at most 1,000 remembered runs, rejects excess admission, and
+retains terminal IDs through the effective deadline plus 2 seconds. Task execution
+is capped at 300 seconds. Cancellation requires the same app/agent/entity owner.
+There is no persistent replay or cross-process exactly-once guarantee.
+An overlapping task for the same app, agent and room is rejected with HTTP 409
+until the active task settles, including a request from a different entity.
+
+For read-only local validation, set `ELIZA_LOCAL_VALIDATION=true`,
+`NODE_ENV=development`, and a loopback `HOST`, then run `bun src/index.ts` from this
+package using the pinned workspace toolchain. This mode retains signed delegation
+activation and the real transcript tools, and bypasses native memory schema and
+message/evaluator paths. Normal startup retains the existing runtime. Keep test
+chat history, account-memory extraction and billing isolated in TinyChat as well.

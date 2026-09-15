@@ -10,6 +10,8 @@ import { handlePostTool, isToolAllowedForApp, type PostToolBody } from "./handle
 import type { SessionStore } from "./session-store.js";
 import { checkServiceAuth } from "./auth/service-auth.js";
 import { defaultRateLimiter } from "./rate-limit.js";
+import { TaskHandler } from "./handlers/tasks.js";
+import type { TaskConfig } from "./tasks/contract.js";
 
 interface BunServer {
   hostname: string;
@@ -32,6 +34,7 @@ export type ElizaServiceHost = SessionHandlerHost
 export interface ElizaServiceOptions {
   host: ElizaServiceHost;
   sessions: SessionStore;
+  tasks?: TaskConfig;
 }
 
 export interface StartElizaServiceOptions extends ElizaServiceOptions {
@@ -55,6 +58,7 @@ export function startElizaService(opts: StartElizaServiceOptions): BunServer {
 }
 
 export function createElizaServiceFetch(opts: ElizaServiceOptions) {
+  const tasks = new TaskHandler(opts.tasks, opts.host);
   return async (request: Request): Promise<Response> => {
     try {
       const url = new URL(request.url);
@@ -67,7 +71,20 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
         const auth = checkServiceAuth(request);
         if (!auth.ok) return auth.response;
         const revision = process.env.BUILD_REVISION ?? process.env.GIT_SHA;
-        return json(200, { meetingRetrieval: { contractVersion: 2 }, buildRevision: revision && /^[a-f0-9]{40,64}$/i.test(revision) ? revision : "unknown" });
+        return json(200, { meetingRetrieval: { contractVersion: 2 }, buildRevision: revision && /^[a-f0-9]{40,64}$/i.test(revision) ? revision : "unknown", chatTasks: tasks.capabilities(auth.resolved) });
+      }
+
+      if (request.method === "POST" && url.pathname === "/tasks") {
+        const auth = checkServiceAuth(request);
+        if (!auth.ok) return auth.response;
+        return tasks.post(request, auth.resolved);
+      }
+
+      const cancelTask = /^\/tasks\/([^/]+)\/cancel$/.exec(url.pathname);
+      if (request.method === "POST" && cancelTask) {
+        const auth = checkServiceAuth(request);
+        if (!auth.ok) return auth.response;
+        return tasks.cancel(request, auth.resolved, cancelTask[1]);
       }
 
       if (request.method === "POST" && url.pathname === "/sessions") {
