@@ -33,7 +33,8 @@ by TinyCloud delegated memory.
 From the repo root (`tinycloud-agents/`):
 
 ```bash
-docker build --build-arg BUILD_REVISION="$(git rev-parse HEAD)" -f packages/eliza-service/Dockerfile -t ghcr.io/tinycloudlabs/eliza-service:latest .
+ELIZA_REVISION=$(git rev-parse HEAD)
+docker build --platform linux/amd64 --build-arg BUILD_REVISION="$ELIZA_REVISION" -f packages/eliza-service/Dockerfile -t "ghcr.io/tinycloudlabs/eliza-service:$ELIZA_REVISION" .
 ```
 
 (`--platform linux/amd64` if building on Apple Silicon for an amd64 CVM.)
@@ -58,7 +59,7 @@ enabling the new controller; no SDK upgrade is bundled here.
 
 ```bash
 echo "$GITHUB_PAT" | docker login ghcr.io -u <github-user> --password-stdin
-docker push ghcr.io/tinycloudlabs/eliza-service:latest
+docker push "ghcr.io/tinycloudlabs/eliza-service:$ELIZA_REVISION"
 ```
 
 Make the GHCR **package** public (or grant the CVM pull access). Note: package
@@ -73,17 +74,20 @@ Tag/push the org's dstack-ingress image under that name, or override
 
 ```dotenv
 # image
-ELIZA_SERVICE_IMAGE=ghcr.io/tinycloudlabs/eliza-service:latest
+ELIZA_SERVICE_IMAGE=ghcr.io/tinycloudlabs/eliza-service@sha256:<pushed digest>
 ELIZA_INGRESS_IMAGE=ghcr.io/tinycloudlabs/eliza-service:ingress-latest
 
 # service
 ELIZA_SERVICE_SECRET=<must match tinychat backend's ELIZA_SERVICE_SECRET>
+TINYCLOUD_AGENT_KEY=<existing production agent private key>
 TINYCLOUD_AGENT_KEY_FILE=/run/secrets/agent.key
 TINYCLOUD_HOST=https://tee.node.tinycloud.xyz
 TAVILY_API_KEY=<tavily key>
 
-# agent key source (bind-mount form; OR use a Phala secret — see step 4)
-AGENT_KEY_HOST_PATH=./.tinycloud/agent.key
+# tasks remain disabled until both the key and model map are configured
+REDPILL_API_KEY=<approved existing RedPill key>
+REDPILL_BASE_URL=https://api.redpill.ai/v1
+ELIZA_TASK_MODELS_JSON={"moonshotai/kimi-k3":1048576,"z-ai/glm-5.3":1048576,"z-ai/glm-5.2":1048576,"qwen/qwen3.6-35b-a3b":262144}
 
 # ingress / DNS (Cloudflare)
 PHALA_INGRESS_DOMAIN=eliza.tinycloud.xyz
@@ -95,15 +99,12 @@ CERTBOT_EMAIL=<ops email>
 ## 4. Provide the agent key (REQUIRED, never committed)
 
 The agent DID is derived from this key and **must match tinychat's `AGENT_DID`**.
-Two ways to supply it:
-
-- **(A) Phala secret (preferred):** upload the key as a CVM secret mounted at
-  `/run/secrets/agent.key`, leave `TINYCLOUD_AGENT_KEY_FILE=/run/secrets/agent.key`,
-  and comment out the `volumes:` bind-mount in `docker-compose.phala.yml`.
-- **(B) Bind-mount:** keep the compose `volumes:` entry and set
-  `AGENT_KEY_HOST_PATH` to the key path on the CVM host.
-
-The file content is a hex Ethereum private key (with or without `0x`).
+The current compose forwards the encrypted `TINYCLOUD_AGENT_KEY` environment
+value. `docker-entrypoint.sh` materializes it as a mode-600 file at
+`TINYCLOUD_AGENT_KEY_FILE` (default `/run/secrets/agent.key`). The value is a hex
+Ethereum private key (with or without `0x`). Preserve the existing production
+key when updating a CVM; never copy a local validation identity into deployment.
+A bind-mounted key is an alternative for local Docker only.
 
 ## 5. Create the CVM
 
@@ -117,6 +118,29 @@ phala cvms create \
 > Use `phala cvms create` to bootstrap a NEW CVM. For subsequent rollouts of a
 > new image, use the Phala update/deploy flow rather than re-creating.
 
+### Updating an existing service
+
+Resolve the existing CVM and its current composition through established operator
+access. Save its immutable application image/digest and composition for rollback,
+then update only the application image and required environment forwarding. Keep
+the current ingress, identity, service credential, storage host and other settings.
+Do not substitute this bootstrap example for a deployed composition with different
+ingress or routing.
+
+Supply the full preserved environment through the existing encrypted-env update
+path, adding `REDPILL_API_KEY`, `REDPILL_BASE_URL` and `ELIZA_TASK_MODELS_JSON`.
+All three names must also reach the CVM's `allowed_envs`. An env file alone does
+not add allowed names on an existing CVM. The supported Phala env update accepts
+`encrypted_env` and `env_keys`; when it returns `precondition_required`, retry
+with the returned `compose_hash`. Preserve existing allowed names and all existing
+values, then verify the resulting names and running service. Do not log plaintext
+secrets or commit the env file. No GitHub deployment workflow is installed here.
+
+Verify the model map against TinyChat's offered catalog and current approved
+provider model IDs before rollout. The sample includes four offered models;
+release validation is limited to Kimi K3 and GLM 5.3. Configuring fewer service
+models than TinyChat offers causes explicit rejection for unsupported selections.
+
 ## 6. Verify
 
 ```bash
@@ -129,12 +153,10 @@ curl -s https://eliza.tinycloud.xyz/health
 
 ## Operator decisions (3 things only you can set)
 
-1. **Agent identity / DID.** Prod MUST boot with a key whose DID matches the DID
-   that tinychat users delegate to (`AGENT_DID` in tinychat). The **local dev**
-   key resolves to `did:pkh:eip155:1:0x83cD9777d4128012F878376aCbd6a092DcdDE01c`
-   — decide whether prod reuses this identity or uses a fresh prod key, then set
-   tinychat's `AGENT_DID` to whatever the prod `/health` reports. They must be
-   byte-identical or every delegation will target the wrong agent.
+1. **Agent identity / DID.** Existing-service updates preserve the production
+   key and TinyChat's `AGENT_DID`; verify `/health` still matches that expected
+   DID. Identity selection is only a new-service bootstrap decision. Do not
+   replace the key or change delegation targets during an application rollout.
 2. **SQLite persistence.** None required — the CVM is stateless (durable memory is
    on the node). Do not add a memory data volume. (Only the ingress cert volume
    exists.)
@@ -155,7 +177,7 @@ env:
 Redeploy tinychat's CVM so it picks up the new env, then run a tinychat chat turn
 end-to-end to confirm the delegation + memory round-trip.
 
-## Local TinyChat tasks
+## TinyChat tasks and rollout
 
 The authenticated `/capabilities` response includes `chatTasks` version 1. With
 `REDPILL_API_KEY`, the approved `REDPILL_BASE_URL` (default
@@ -170,6 +192,21 @@ meeting/public-web tools. Ordinary eligible text streams; private selection
 makes buffering irreversible. Reported usage survives later failures, and
 cancellation settles without waiting for an uncooperative provider. Keep general
 rollout gated on the end-to-end acceptance checks.
+
+Deploy the compatible service before enabling TinyChat's `ELIZA_TASKS_ENABLED`.
+Keep that flag `false` for the initial backend deployment. Before a canary, set
+a nonempty explicit `ELIZA_TASKS_TEST_ACCOUNTS` list; enabled with an empty list
+admits all authenticated accounts. Backend flags are read at startup, so use the
+normal deployment/restart path for changes. Preserve backend RedPill credentials
+and the legacy meeting settings for ordinary chat and rollback.
+
+Authenticate `GET /capabilities` and check the immutable `buildRevision`,
+`chatTasks.version: 1`, `enabled: true`, `cancellation: true`,
+`providerProfile: "tinychat-redpill"`, and the complete configured model list.
+Keep local-validation flags unset/false in production. Verify task and cancel
+reach the same service process and deployed stream timeouts allow the 300-second
+task budget. Roll back routing by disabling the backend task flag first; retain
+the compatible service until in-flight tasks finish or cancel.
 
 A task allows at most four ordinary provider requests and sixteen tool attempts,
 including at most one transient retry per normalized tool/arguments key. Private
