@@ -19,6 +19,8 @@
 //   DelegationExpiredError -> 409 { error: "delegation_expired" }
 
 import type { Content, HandlerCallback, IAgentRuntime, Memory, UUID } from "@elizaos/core";
+import { withPrivateAccess } from "@tinycloud/eliza-plugin-memory";
+import { withAbort } from "../tasks/provider.js";
 import { mapDelegationError } from "../errors.js";
 
 /**
@@ -82,8 +84,12 @@ export async function handlePostMessages(
   body: PostMessagesBody,
   host: MessageHandlerHost,
   writer: SseWriter,
+  transport: { signal?: AbortSignal; access?: { isCurrent(): boolean; isActive(): boolean } } = {},
 ): Promise<ErrorResult | OkResult> {
   const { agentId, entityId, roomId, text } = body;
+  const allowed = () => !transport.signal?.aborted && (!transport.access || (transport.access.isCurrent() && transport.access.isActive()));
+  const denied = (): ErrorResult => ({ type: "error", status: 409, body: { error: "delegation_required" } });
+  if (!allowed()) return denied();
 
   // Pre-flight: check delegation BEFORE opening the SSE stream.
   // T1: registry errors are swallowed by composeState in the message pipeline, so
@@ -97,7 +103,9 @@ export async function handlePostMessages(
     throw err;
   }
 
+  if (!allowed()) return denied();
   const runtime = await host.runtimeFor(agentId);
+  if (!allowed()) return denied();
   if (!runtime.messageService) {
     throw new Error(
       `handlePostMessages: no messageService on runtime for agentId ${agentId}`,
@@ -117,15 +125,31 @@ export async function handlePostMessages(
 
   // Callback: each content chunk from the pipeline writes one SSE data frame.
   const callback: HandlerCallback = async (content: Content): Promise<Memory[]> => {
-    writer.write(`data: ${JSON.stringify(content)}\n\n`);
+    if (allowed()) writer.write(`data: ${JSON.stringify(content)}\n\n`);
     return [];
   };
 
-  await runtime.messageService.handleMessage(runtime, message, callback);
-
-  // Terminate the SSE stream.
-  writer.write("data: [DONE]\n\n");
-  writer.close();
-
+  // Eliza caches compose/action state by message ID. Never clear shared runtime
+  // state, persisted history, or another account's message state.
+  const stateCache = (runtime as IAgentRuntime & { stateCache?: Map<string, unknown> }).stateCache;
+  const cleanup = () => {
+    if (message.id) { stateCache?.delete(message.id); stateCache?.delete(`${message.id}_action_results`); }
+  };
+  transport.signal?.addEventListener("abort", cleanup, { once: true });
+  try {
+    if (!allowed()) return denied();
+    const pipeline = withPrivateAccess(allowed, () => runtime.messageService!.handleMessage(runtime, message, callback, { abortSignal: transport.signal }));
+    // An uncooperative pipeline can settle after the response is cancelled.
+    // Retain this cleanup until its own completion so late cache writes vanish.
+    const work = pipeline.finally(cleanup);
+    if (transport.signal) await withAbort(work, transport.signal); else await work;
+    if (allowed()) writer.write("data: [DONE]\n\n");
+  } catch (error) {
+    if (allowed()) throw error;
+  } finally {
+    cleanup();
+    transport.signal?.removeEventListener("abort", cleanup);
+    writer.close();
+  }
   return { type: "ok" };
 }

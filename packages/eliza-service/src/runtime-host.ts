@@ -215,10 +215,25 @@ export class RuntimeHost {
     // delegation_required/delegation_expired.
   }
 
-  async registerTranscriptDelegation(agentId: string, entityId: string, serializedDelegation: string, roomId?: string): Promise<void> {
+  async registerTranscriptDelegation(agentId: string, entityId: string, serializedDelegation: string, roomId?: string, isCurrent?: () => boolean, canUse?: () => boolean): Promise<void> {
     const registry = (await this._bootOnce(agentId as UUID)).transcriptRegistry;
     if (!registry) throw new Error("RuntimeHost: transcript registry unavailable");
-    await registry.register(entityId, serializedDelegation, roomId);
+    if (isCurrent && !isCurrent()) throw new Error("RuntimeHost: access changed");
+    await registry.register(entityId, serializedDelegation, roomId, isCurrent, canUse);
+  }
+
+  privateAccessAvailable(agentId: string, entityId: string): boolean {
+    const booted = this._runtimes.get(agentId);
+    return !!booted?.storageService?.hasDelegation(entityId) && !!booted.transcriptRegistry?.has(entityId);
+  }
+
+  disconnectEntity(agentId: string, entityId: string): Promise<void> {
+    // No await or lazy boot before detachment. A pending boot has no grants;
+    // its activation caller must still own its session revision after boot.
+    const booted = this._runtimes.get(agentId);
+    if (!booted) return Promise.resolve();
+    booted.transcriptRegistry?.revoke(entityId);
+    return booted.storageService?.disconnectEntity(entityId) ?? Promise.resolve();
   }
 
   /**

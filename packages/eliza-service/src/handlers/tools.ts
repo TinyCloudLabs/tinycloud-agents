@@ -18,6 +18,7 @@
 //   anything else                      -> 502 { error: "tool_failed" }
 
 import type { Action, Content, HandlerCallback, IAgentRuntime, Memory, UUID } from "@elizaos/core";
+import { withPrivateAccess } from "@tinycloud/eliza-plugin-memory";
 import { RUN_ARTIFACT_SKILL } from "@tinycloud/agent-client";
 import { mapDelegationError } from "../errors.js";
 import { ARTIFACTORY_APP_ID } from "../auth/app-registry.js";
@@ -42,6 +43,7 @@ export function isToolAllowedForApp(toolName: string, appId: string): boolean {
 /** Minimal host interface consumed by the tools handler; RuntimeHost satisfies it. */
 export interface ToolHandlerHost {
   runtimeFor(agentId: string): Promise<IAgentRuntime>;
+  privateAccessAvailable?(agentId: string, entityId: string): boolean;
 }
 
 export interface PostToolBody {
@@ -52,6 +54,7 @@ export interface PostToolBody {
    */
   entityId?: string;
   roomId?: string;
+  accessRevision?: string;
   /** Tool arguments, e.g. { query } for web search. */
   args?: Record<string, unknown>;
   /** Server-validated, non-authority context used for local-calendar filtering. */
@@ -91,9 +94,14 @@ export async function handlePostTool(
   agentId: string,
   body: PostToolBody,
   host: ToolHandlerHost,
-  transport: { signal?: AbortSignal } = {},
+  transport: { signal?: AbortSignal; access?: { isCurrent(): boolean; isActive(): boolean } } = {},
 ): Promise<ToolResult> {
+  const privateTool = toolName.toLowerCase() !== "web_search";
+  const allowed = () => !transport.access || (transport.access.isCurrent() && (!privateTool || transport.access.isActive()));
+  const denied = () => ({ status: 409, body: { error: "delegation_required" } });
+  if (!allowed()) return denied();
   const runtime = await host.runtimeFor(agentId);
+  if (!allowed()) return denied();
   const actions: Action[] = runtime.actions ?? [];
   const action = actions.find((a) => a.name.toLowerCase() === toolName.toLowerCase());
   if (!action) {
@@ -118,20 +126,22 @@ export async function handlePostTool(
     ...(meetingTool ? { deadlineAt: Math.min(typeof body.context?.deadlineAt === "number" ? body.context.deadlineAt : Infinity, Date.now() + 10_000) } : {}) };
   const callback: HandlerCallback = async (content: Content) => {
     checkContext(context);
+    if (!allowed()) throw new ToolError("Private access changed", 409, "delegation_required");
     frames.push(content);
     return [];
   };
 
   try {
-    const result = await withinContext(signal => action.handler(
+    const result = await withinContext(signal => withPrivateAccess(() => allowed() && !signal?.aborted, () => action.handler(
       runtime,
       message,
       undefined,
       { args: body.args ?? {}, context: { ...context, signal, ...(meetingTool ? { deadlineAt: context.deadlineAt! - 50 } : {}) } },
       callback,
       [],
-    ), context);
+    )), context);
 
+    if (!allowed()) return denied();
     const text =
       frames.map((f) => f.text ?? "").filter(Boolean).join("\n") ||
       (typeof result?.text === "string" ? result.text : "");

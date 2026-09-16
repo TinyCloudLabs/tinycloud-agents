@@ -1,3 +1,4 @@
+import type { SessionStore, SessionLease, SessionScope } from "../session-store.js";
 import type { ResolvedApp } from "../auth/service-auth.js";
 import { TINYCHAT_APP_ID } from "../auth/app-registry.js";
 import { ACCOUNTING_GRACE_MS, TASK_BODY_BYTES, TASK_FRAME_BYTES, TaskError, assertTaskConfig, entityUuid, fields, object, uuid, validateTask, type TaskConfig, type TaskRequest } from "../tasks/contract.js";
@@ -7,14 +8,14 @@ import { TaskTools } from "../tasks/tools.js";
 import type { ToolHandlerHost } from "./tools.js";
 
 type CancelReason = "client_cancelled" | "turn_timeout" | "transport_failed";
-interface Registration { abort: AbortController; terminal: boolean; expiresAt: number; roomKey?: string; reason?: CancelReason }
+interface Registration { entityKey: string; lease?: SessionLease; abort: AbortController; terminal: boolean; expiresAt: number; roomKey?: string; reason?: CancelReason }
 const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 /** One service process owns active IDs and content-free terminal tombstones. */
 export class TaskHandler {
   private readonly registrations = new Map<string, Registration>();
   private readonly activeRooms = new Set<string>();
-  constructor(private readonly config?: TaskConfig, private readonly host?: ToolHandlerHost) { if (config) assertTaskConfig(config); }
+  constructor(private readonly config?: TaskConfig, private readonly host?: ToolHandlerHost, private readonly sessions?: SessionStore) { if (config) assertTaskConfig(config); }
 
   capabilities(app: ResolvedApp) {
     const enabled = app.appId === TINYCHAT_APP_ID && this.config !== undefined;
@@ -39,10 +40,13 @@ export class TaskHandler {
       // Serialize overlapping room work, including attempts from another entity.
       const roomKey = body.roomId ? JSON.stringify([app.appId, app.agentId, body.roomId]) : undefined;
       if (roomKey && this.activeRooms.has(roomKey)) return json(409, { error: "room_busy" });
-      const registration: Registration = { abort: new AbortController(), terminal: false, expiresAt: deadlineAt + ACCOUNTING_GRACE_MS, roomKey };
+      const lease = this.sessions?.lease(app, body.entityId);
+      const active = lease ? lease.active && lease.isActive() && this.host?.privateAccessAvailable?.(app.agentId, body.entityId) === true && (body.accessRevision === undefined || body.accessRevision === lease.revision) : false;
+      const admitted = { ...body, allowedTools: body.allowedTools.filter(name => name === "web_search" || active) };
+      const registration: Registration = { entityKey: JSON.stringify([app.appId, app.agentId, body.entityId]), lease, abort: new AbortController(), terminal: false, expiresAt: deadlineAt + ACCOUNTING_GRACE_MS, roomKey };
       this.registrations.set(key, registration);
       if (roomKey) this.activeRooms.add(roomKey);
-      return this.stream(request, app, { ...body, deadlineAt, roomId: body.roomId ?? `task:${body.executionId}` }, registration, duration);
+      return this.stream(request, app, { ...admitted, deadlineAt, roomId: body.roomId ?? `task:${body.executionId}` }, registration, duration);
     } catch (error) {
       return json(error instanceof TaskError ? error.status : 400, { error: error instanceof TaskError ? error.code : "invalid_task" });
     }
@@ -59,6 +63,11 @@ export class TaskHandler {
       this.abort(registration, body.reason as CancelReason);
       return json(200, { version: 1, executionId, cancelled: true });
     } catch (error) { return json(400, { error: error instanceof TaskError ? error.code : "invalid_cancel" }); }
+  }
+
+  cancelEntity(scope: SessionScope, entityId: string): void {
+    const key = JSON.stringify([scope.appId, scope.agentId, entityId]);
+    for (const entry of this.registrations.values()) if (entry.entityKey === key) this.abort(entry, "client_cancelled");
   }
 
   private key(app: ResolvedApp, entityId: string, executionId: string): string {
@@ -84,6 +93,7 @@ export class TaskHandler {
       start: controller => {
         const send = (type: string, payload: object) => {
           if (closed) throw new TaskError("task_cancelled");
+          if (type !== "usage" && type !== "final" && entry.lease && !entry.lease.isCurrent()) throw new TaskError("task_cancelled");
           const frame = encoder.encode(`data: ${JSON.stringify({ type, executionId: body.executionId, seq: ++seq, ...payload })}\n\n`);
           if (frame.byteLength > TASK_FRAME_BYTES) throw new TaskError("result_size_limit");
           // Leave final accounting room even when content delivery saturates the queue.
@@ -104,7 +114,7 @@ export class TaskHandler {
             const tools = new TaskTools({
               host: this.host ?? { runtimeFor: async () => { throw new TaskError("task_tools_unavailable"); } },
               app, entityId: body.entityId, roomId: body.roomId!, allowedTools: body.allowedTools,
-              deadlineAt: body.deadlineAt, signal: entry.abort.signal, calendar: body.calendar,
+              access: entry.lease, deadlineAt: body.deadlineAt, signal: entry.abort.signal, calendar: body.calendar,
               onActivity: event => send("activity", event),
             });
             terminal = await runTask(body, this.config!, entry.abort.signal, usage, text => send("content_delta", { text }), {
@@ -131,7 +141,7 @@ export class TaskHandler {
       },
       cancel: () => { closed = true; this.abort(entry, "transport_failed"); },
     }, { highWaterMark: 262_144, size: chunk => chunk!.byteLength });
-    return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
+    return new Response(fenceTaskStream(stream, entry.lease), { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
   }
 }
 
@@ -157,4 +167,31 @@ async function readBody(request: Request, limit: number): Promise<unknown> {
     try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
     catch { throw new TaskError("malformed_json"); }
   } finally { void reader.cancel().catch(() => {}); reader.releaseLock(); }
+}
+
+/** Read-side fence also removes frames queued before disconnect but not delivered. */
+function fenceTaskStream(source: ReadableStream<Uint8Array>, lease?: SessionLease): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  const encoder = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) { controller.close(); return; }
+        if (lease && !lease.isCurrent()) {
+          const frame = new TextDecoder().decode(next.value);
+          if (!frame.startsWith("data: ")) continue;
+          const event = JSON.parse(frame.slice(6));
+          if (event.type === "final") {
+            const { answer, evidence, finalProviderCompletionId, ...accounting } = event;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ ...accounting, outcome: "cancelled", code: "task_cancelled", answerIsProviderVerbatim: false })}\n\n`));
+            return;
+          }
+          if (event.type !== "usage" && event.type !== "accepted") continue;
+        }
+        controller.enqueue(next.value); return;
+      }
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  }, { highWaterMark: 0 });
 }

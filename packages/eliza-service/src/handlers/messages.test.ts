@@ -289,3 +289,28 @@ describe("handlePostMessages — non-delegation errors", () => {
     );
   });
 });
+
+it("disconnect fences legacy callbacks and clears only the affected message state again after late completion", async () => {
+  const controller = new AbortController(); let current = true;
+  let release!: () => void, messageId = "";
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const stateCache = new Map<string, unknown>([["other-account", { text: "preserved" }]]);
+  const runtime = { stateCache, messageService: { async handleMessage(_runtime: unknown, message: Memory, callback: (content: Content) => Promise<Memory[]>) {
+    messageId = message.id!;
+    stateCache.set(messageId, { text: "private cached" });
+    stateCache.set(`${messageId}_action_results`, { text: "private action" });
+    await pending;
+    stateCache.set(messageId, { text: "late private cache" });
+    await callback({ text: "late private answer" });
+  } } } as unknown as IAgentRuntime;
+  const writer = new CapturingWriter();
+  const work = handlePostMessages(DEFAULT_BODY, { preflight: async () => {}, runtimeFor: async () => runtime }, writer, { signal: controller.signal, access: { isCurrent: () => current, isActive: () => current } } as any);
+  await new Promise(resolve => setTimeout(resolve, 0)); current = false; controller.abort();
+  expect(stateCache.has(messageId)).toBe(false);
+  expect(stateCache.has(`${messageId}_action_results`)).toBe(false);
+  release(); await work;
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(writer.frames.join("")).not.toContain("late private answer");
+  expect(stateCache.has(messageId)).toBe(false);
+  expect(stateCache.get("other-account")).toEqual({ text: "preserved" });
+});

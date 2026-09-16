@@ -16,6 +16,7 @@ import type { PortableDelegation } from "@tinycloud/agent-client";
 import { handleGetSessions, handlePostSessions } from "./handlers/sessions.js";
 import type { SessionHandlerHost } from "./handlers/sessions.js";
 import { SessionStore } from "./session-store.js";
+import * as sessions from "./handlers/sessions.js";
 import { TranscriptAccessRegistry } from "./transcript-registry.js";
 import type { TranscriptNode } from "./transcript-registry.js";
 import {
@@ -586,5 +587,98 @@ describe("GET /sessions reports both grants", () => {
     store.set("entity-a", { ...record!, serializedTranscriptDelegation: transcriptGrant({ expiryMs: -1_000 }) });
     const got = await handleGetSessions("entity-a", host, store);
     expect(got.body).toMatchObject({ status: "expired", transcriptStatus: "expired" });
+  });
+});
+
+const accessScope = { appId: "tinychat", agentId: AGENT_ID };
+function lifecycleSlice() {
+  const slice = makeSlice();
+  let memory: { serialized: string; canUse: () => boolean } | undefined;
+  let failTranscript = false;
+  let pauseMemory: Promise<void> | undefined;
+  const host: SessionHandlerHost = {
+    ...slice.host,
+    async storageFor() {
+      return {
+        async registerDelegation(_entity, serialized, _room, isCurrent = () => true, canUse = () => true) {
+          if (pauseMemory) await pauseMemory;
+          if (!isCurrent()) throw new Error("stale access");
+          memory = { serialized, canUse };
+        },
+      };
+    },
+    async registerTranscriptDelegation(agent, entity, serialized, room, isCurrent, canUse) {
+      if (failTranscript) throw new Error("synthetic activation failure");
+      await slice.registry.register(entity, serialized, room, isCurrent, canUse);
+    },
+    disconnectEntity(_agent, entity) {
+      memory = undefined;
+      slice.registry.revoke(entity);
+      return Promise.resolve();
+    },
+    privateAccessAvailable(_agent, entity) { return !!memory && slice.registry.has(entity); },
+  };
+  const body = (revision = slice.store.snapshot(accessScope, "entity-a").revision) => ({
+    agentId: AGENT_ID, entityId: "entity-a", revision,
+    session: { version: 2 as const, delegations: { memory: memoryGrant(), transcripts: transcriptGrant() } },
+  });
+  return { ...slice, host, body, memory: () => memory, fail: (value: boolean) => { failTranscript = value; }, pause: (value: Promise<void> | undefined) => { pauseMemory = value; } };
+}
+
+describe("TinyChat bundled access lifecycle", () => {
+  test("requires a captured revision and a V2 bundle without altering current access", async () => {
+    const f = lifecycleSlice();
+    const { revision, ...revisionless } = f.body();
+    expect((await handlePostSessions(revisionless, f.host, f.store, accessScope)).status).toBe(409);
+    expect((await handlePostSessions({ agentId: AGENT_ID, entityId: "entity-a", revision, serializedDelegation: memoryGrant() }, f.host, f.store, accessScope)).status).toBe(400);
+    expect(f.memory()).toBeUndefined();
+  });
+
+  test("reports an opaque revision while disconnected and rejects an earlier ceremony", async () => {
+    const f = lifecycleSlice();
+    const before = await handleGetSessions("entity-a", f.host, f.store, accessScope);
+    expect((before.body as { revision?: string }).revision).toBeString();
+    const pendingCeremony = f.body();
+    const stopped = await sessions.handleDeleteSessions("entity-a", f.host, f.store, accessScope);
+    expect(stopped.status).toBe(200);
+    expect((await handlePostSessions(pendingCeremony, f.host, f.store, accessScope)).status).toBe(409);
+    expect(f.memory()).toBeUndefined();
+  });
+
+  test("cleans both candidates on a partial replacement failure and permits explicit retry", async () => {
+    const f = lifecycleSlice();
+    expect((await handlePostSessions(f.body(), f.host, f.store, accessScope)).status).toBe(200);
+    expect(f.memory()?.canUse()).toBe(true);
+    f.fail(true);
+    expect((await handlePostSessions(f.body(), f.host, f.store, accessScope)).status).toBe(503);
+    expect(f.memory()).toBeUndefined();
+    expect(f.registry.has("entity-a")).toBe(false);
+    expect((await handleGetSessions("entity-a", f.host, f.store, accessScope)).body).toMatchObject({ status: "none" });
+    f.fail(false);
+    expect((await handlePostSessions(f.body(), f.host, f.store, accessScope)).status).toBe(200);
+    expect(await f.registry.readerFor("entity-a").getTranscript("fireflies", "canary-1")).toBeDefined();
+  });
+
+  test("disconnect wins over pending activation and its late cleanup preserves a new connection", async () => {
+    const f = lifecycleSlice();
+    let release!: () => void;
+    f.pause(new Promise<void>(resolve => { release = resolve; }));
+    const old = handlePostSessions(f.body(), f.host, f.store, accessScope);
+    await Promise.resolve(); await Promise.resolve();
+    expect(f.store.snapshot(accessScope, "entity-a").state).toBe("activating");
+    await sessions.handleDeleteSessions("entity-a", f.host, f.store, accessScope);
+    f.pause(undefined);
+    expect((await handlePostSessions(f.body(), f.host, f.store, accessScope)).status).toBe(200);
+    release();
+    expect((await old).status).toBe(409);
+    expect(f.memory()?.canUse()).toBe(true);
+    expect((await handleGetSessions("entity-a", f.host, f.store, accessScope)).body).toMatchObject({ status: "active" });
+  });
+
+  test("GET degrades stored active grants when an actual registry client disappears", async () => {
+    const f = lifecycleSlice();
+    expect((await handlePostSessions(f.body(), f.host, f.store, accessScope)).status).toBe(200);
+    f.registry.revoke("entity-a");
+    expect((await handleGetSessions("entity-a", f.host, f.store, accessScope)).body).toMatchObject({ status: "none" });
   });
 });

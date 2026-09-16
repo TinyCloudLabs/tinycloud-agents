@@ -251,3 +251,20 @@ describe("webSearchAction", () => {
     expect(result.body).toEqual({ error: "invalid_args" });
   });
 });
+
+describe("private tool access leases", () => {
+  it("cannot dispatch a private tool with an inactive admission lease", async () => {
+    let calls = 0;
+    const host = hostWithActions([{ name: "TINYCLOUD_READ_MEETING", handler: async () => { calls++; return { text: "private" }; } } as any]);
+    const result = await handlePostTool("tinycloud_read_meeting", AGENT_ID, {}, host, { access: { isCurrent: () => true, isActive: () => false } } as any);
+    expect(result).toMatchObject({ status: 409, body: { error: "delegation_required" } });
+    expect(calls).toBe(0);
+  });
+  it("discards a private result that completes in an obsolete generation", async () => {
+    let current = true, release!: () => void;
+    const host = hostWithActions([{ name: "TINYCLOUD_READ_MEETING", handler: async () => { await new Promise<void>(resolve => { release = resolve; }); return { text: "private" }; } } as any]);
+    const pending = handlePostTool("tinycloud_read_meeting", AGENT_ID, {}, host, { access: { isCurrent: () => current, isActive: () => current } } as any);
+    await new Promise(resolve => setTimeout(resolve, 0)); current = false; release();
+    expect(await pending).toMatchObject({ status: 409, body: { error: "delegation_required" } });
+  });
+});

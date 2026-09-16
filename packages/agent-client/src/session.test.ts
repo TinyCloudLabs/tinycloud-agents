@@ -300,3 +300,54 @@ test("delegation-mode Session refresh timer fires invalidate()+reSignIn() at ~50
 
   await session.stop();
 });
+
+function stopDeferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+test("stop during sign-in rejects the late session and prevents SQL dispatch", async () => {
+  const gate = stopDeferred<SignInResult>();
+  const transport = new ScriptedTransport([OK_QUERY]);
+  transport.signIn = () => gate.promise;
+  const clock = new FakeClock();
+  const session = new Session({ transport, worker: new Worker({clock, logger: silentLogger}), clock, logger: silentLogger, reSignInMs: DEFAULT_RE_SIGN_IN_MS });
+  const read = session.run("read", () => transport.query("SELECT 1")).catch(e => e);
+  const stopping = session.stop();
+  gate.resolve(SESSION);
+  expect(await read).toBeInstanceOf(Error);
+  expect(transport.queryCount).toBe(0);
+  await stopping;
+});
+
+test("stop prevents already queued transport closures from dispatching", async () => {
+  const gate = stopDeferred<TransportResult<QueryData>>();
+  const transport = new ScriptedTransport([OK_QUERY]);
+  const clock = new FakeClock();
+  const session = new Session({ transport, worker: new Worker({clock, logger: silentLogger}), clock, logger: silentLogger, reSignInMs: DEFAULT_RE_SIGN_IN_MS });
+  await session.ensureSignedIn();
+  let started!: () => void;
+  const dispatched = new Promise<void>(resolve => { started = resolve; });
+  const first = session.run("write", () => { started(); return gate.promise; }).catch(e => e);
+  await dispatched;
+  const second = session.run("write", () => transport.query("SELECT 2")).catch(e => e);
+  await Promise.resolve();
+  const stopping = session.stop();
+  gate.resolve(OK_QUERY);
+  await first;
+  expect(await second).toBeInstanceOf(Error);
+  expect(transport.queryCount).toBe(0);
+  await stopping;
+});
+
+test("stop between sign-in settlement and session installation rejects the late completion", async () => {
+  const transport = new ScriptedTransport([OK_QUERY]);
+  const clock = new FakeClock();
+  const session = new Session({ transport, worker: new Worker({clock, logger: silentLogger}), clock, logger: silentLogger, reSignInMs: DEFAULT_RE_SIGN_IN_MS });
+  const pending = session.ensureSignedIn().catch(e => e);
+  // doSignIn has resolved, while ensureSignedIn's continuation has not yet run.
+  await Promise.resolve();
+  await session.stop();
+  expect(await pending).toBeInstanceOf(Error);
+});

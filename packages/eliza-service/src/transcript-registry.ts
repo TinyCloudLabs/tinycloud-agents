@@ -4,7 +4,7 @@ import {
   validateExactDelegationPolicy,
 } from "@tinycloud/agent-client";
 import type { PortableDelegation } from "@tinycloud/agent-client";
-import { DelegationExpiredError, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
+import { currentPrivateAccess, DelegationExpiredError, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
 import type { TranscriptMetadata, TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
 import { checkContext, decodeBody, discoveryResult, MeetingRetrievalError, withinContext } from "./meeting-evidence.js";
 import type { BodyResult, MeetingSelection, RetrievalContext } from "./meeting-evidence.js";
@@ -37,12 +37,15 @@ interface Entry {
   expiry: Date;
   lastUsed: number;
   roomId?: string;
+  isCurrent: () => boolean;
+  canUse: () => boolean;
 }
 
 /** Per-entity transcript grants and renewable delegated access; never retains bodies. */
 export class TranscriptAccessRegistry implements TranscriptRegistry {
   private readonly entries = new Map<string, Entry>();
-  private readonly pending = new Map<string, Promise<void>>();
+  private readonly pending = new Map<string, { serialized: string; roomId?: string; isCurrent?: () => boolean; canUse?: () => boolean; work: Promise<void> }>();
+  private readonly generations = new Map<string, object>();
   private readonly roomToEntity = new Map<string, string>();
   /** Content-free follow-up state; transcript text is never retained here. */
   private readonly selectedMeetingByRoom = new Map<string, MeetingSelection>();
@@ -61,25 +64,26 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
   /**
    * Activate and retain one entity's transcript grant.
    *
-   * A registration always activates the delegation it was handed: an in-flight
-   * activation for the same entity is awaited (and ignored) first, because
-   * returning it would silently substitute the PREVIOUS grant for a freshly
-   * minted one. A failure is isolated to this entity — it drops that entity's
-   * access and rethrows without touching any other entity's entry.
+   * Only identical pending registrations coalesce. Every replacement fences
+   * the old activation immediately; late work cannot install or drop its client.
    */
-  async register(entityId: string, serializedDelegation: string, roomId?: string): Promise<void> {
+  async register(entityId: string, serializedDelegation: string, roomId?: string, isCurrent?: () => boolean, canUse?: () => boolean): Promise<void> {
     const inFlight = this.pending.get(entityId);
-    if (inFlight) await inFlight.catch(() => undefined);
+    if (inFlight?.serialized === serializedDelegation && inFlight.roomId === roomId && inFlight.isCurrent === isCurrent && inFlight.canUse === canUse) return inFlight.work;
     this.drop(entityId);
-    const work = this.activate(entityId, serializedDelegation, roomId);
-    this.pending.set(entityId, work);
+    const generation = {};
+    this.generations.set(entityId, generation);
+    const owns = () => this.generations.get(entityId) === generation && (isCurrent?.() ?? true);
+    const work = this.activate(entityId, serializedDelegation, roomId, owns, canUse ?? (() => true));
+    const pending = { serialized: serializedDelegation, roomId, isCurrent, canUse, work };
+    this.pending.set(entityId, pending);
     try {
       await work;
     } catch (error) {
-      this.drop(entityId);
+      if (owns()) this.drop(entityId);
       throw error;
     } finally {
-      if (this.pending.get(entityId) === work) this.pending.delete(entityId);
+      if (this.pending.get(entityId) === pending) this.pending.delete(entityId);
     }
   }
 
@@ -89,6 +93,8 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
   }
 
   readerFor(entityId: string, roomId?: string): TranscriptReader {
+    const inheritedAccess = currentPrivateAccess();
+    if (inheritedAccess && !inheritedAccess()) throw new NoDelegationError(entityId);
     // Room binding is an ISOLATION check, not an index: a room that another
     // entity owns must never resolve here. A room this registry has never seen
     // (tool dispatch synthesizes one when the caller omits it, and a user has
@@ -96,13 +102,14 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
     const roomOwner = roomId ? this.roomToEntity.get(roomId) : undefined;
     if (roomOwner !== undefined && roomOwner !== entityId) throw new NoDelegationError(entityId);
     const entry = this.entries.get(entityId);
-    if (!entry) throw new NoDelegationError(entityId);
+    if (!entry || !entry.isCurrent() || !entry.canUse()) throw new NoDelegationError(entityId);
     if (Date.now() >= entry.expiry.getTime()) {
       this.drop(entityId);
       throw new DelegationExpiredError(entityId);
     }
     entry.lastUsed = Date.now();
     const assertAccess = () => {
+      if (inheritedAccess && !inheritedAccess()) throw new NoDelegationError(entityId);
       // Recheck the current grant before and after every storage operation. Replaced
       // handles cannot finish an old request with evidence from their former grant.
       this.readerFor(entityId, roomId);
@@ -113,13 +120,14 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
       if (Date.now() >= entry.refreshAt) {
         if (!entry.refresh) {
           const startedAt = Date.now();
-          entry.refresh = this.activateAccess(entry.delegation).then(access => {
+          entry.refresh = this.activateAccess(entry.delegation, assertAccess).then(access => {
             // Renewal preserves the entry and its selection. A late activation
             // must never restore a revoked, replaced, evicted, or stopped entry.
             assertAccess();
             entry.access = access;
             entry.refreshAt = startedAt + SESSION_REFRESH_MS;
-          }, () => {
+          }, (error) => {
+            if (error instanceof DelegationExpiredError) throw error;
             assertAccess();
             throw new MeetingRetrievalError("transcript_unavailable");
           }).finally(() => { entry.refresh = undefined; });
@@ -128,7 +136,7 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
       }
       assertAccess();
       return entry.access;
-    }, assertAccess, () => this.drop(entityId));
+    }, assertAccess, () => { if (this.entries.get(entityId) === entry) this.drop(entityId); });
   }
 
   selectedMeetingFor(entityId: string, roomId?: string): string | null {
@@ -140,6 +148,7 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
 
   selectMeeting(entityId: string, roomId: string | undefined, meetingRef: string): void {
     if (!roomId) return;
+    this.readerFor(entityId, roomId);
     const roomOwner = this.roomToEntity.get(roomId);
     if (roomOwner !== undefined && roomOwner !== entityId) throw new NoDelegationError(entityId);
     if (!this.entries.has(entityId)) throw new NoDelegationError(entityId);
@@ -150,6 +159,7 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
 
   setSelection(entityId: string, roomId: string | undefined, selection: MeetingSelection): void {
     if (!roomId) return;
+    this.readerFor(entityId, roomId);
     const owner = this.roomToEntity.get(roomId);
     if (owner !== undefined && owner !== entityId) throw new NoDelegationError(entityId);
     if (selection.state === "none") { this.selectedMeetingByRoom.delete(roomId); return; }
@@ -162,6 +172,7 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
   has(entityId: string): boolean {
     const entry = this.entries.get(entityId);
     return entry !== undefined
+      && entry.isCurrent()
       && Date.now() < entry.expiry.getTime();
   }
 
@@ -170,32 +181,41 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
     this.roomToEntity.clear();
     this.selectedMeetingByRoom.clear();
     this.pending.clear();
+    this.generations.clear();
   }
 
-  private async activate(entityId: string, serialized: string, roomId?: string): Promise<void> {
+  private async activate(entityId: string, serialized: string, roomId: string | undefined, isCurrent: () => boolean, canUse: () => boolean): Promise<void> {
+    const assertCurrent = () => { if (!isCurrent()) throw new NoDelegationError(entityId); };
+    assertCurrent();
     const delegation = deserializeTranscriptDelegationForActivation(serialized);
     validateExactDelegationPolicy(delegation, { agentDID: this.args.agentDid, policy: defaultTinychatTranscriptPolicy() });
     const expiry = delegation.expiry instanceof Date ? delegation.expiry : new Date(delegation.expiry as unknown as string);
     const startedAt = Date.now();
-    const access = await this.activateAccess(delegation);
+    const access = await this.activateAccess(delegation, assertCurrent);
+    assertCurrent();
     if (this.entries.size >= (this.args.maxEntries ?? MAX_ENTRIES)) this.evictLru();
-    this.entries.set(entityId, { access, delegation, refreshAt: startedAt + SESSION_REFRESH_MS, expiry, lastUsed: Date.now(), roomId });
+    this.entries.set(entityId, { access, delegation, refreshAt: startedAt + SESSION_REFRESH_MS, expiry, lastUsed: Date.now(), roomId, isCurrent, canUse });
     if (roomId) {
       this.selectedMeetingByRoom.delete(roomId);
       this.roomToEntity.set(roomId, entityId);
     }
   }
 
-  private async activateAccess(delegation: PortableDelegation): Promise<Access> {
+  private async activateAccess(delegation: PortableDelegation, assertCurrent: () => void): Promise<Access> {
     // Build a fresh wallet session, then reactivate the same exact parent grant.
     const node = this.args.nodeFactory
       ? this.args.nodeFactory({ privateKey: this.args.agentKey, host: this.args.host })
       : createTranscriptNode({ privateKey: this.args.agentKey, host: this.args.host });
     await node.signIn();
-    return await node.useDelegation(delegation) as unknown as Access;
+    assertCurrent();
+    const access = await node.useDelegation(delegation) as unknown as Access;
+    assertCurrent();
+    return access;
   }
 
   private drop(entityId: string): void {
+    this.generations.delete(entityId);
+    this.pending.delete(entityId);
     this.entries.delete(entityId);
     for (const [room, owner] of this.roomToEntity) {
       if (owner !== entityId) continue;

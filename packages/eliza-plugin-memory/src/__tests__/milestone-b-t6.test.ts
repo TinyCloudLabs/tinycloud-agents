@@ -824,3 +824,123 @@ describe("T6(e): refresh path — dedupe, expired eviction, no poisoning", () =>
     expect(caught?.entityId).toBe(ENTITY_A);
   });
 });
+
+describe("disconnect access fences", () => {
+  test("disconnect clears fresh memory and summary caches for only the affected entity", async () => {
+    const a = makeFake("A"); const b = makeFake("B");
+    a.stop = async () => {}; b.stop = async () => {};
+    const reg = makeReg([[ENTITY_A, a, ROOM_A], [ENTITY_B, b, ROOM_B]]);
+    const svc = makeSvc(reg);
+    await svc.storeLongTermMemory(ltmInput(ENTITY_A, "private A"));
+    await svc.storeLongTermMemory(ltmInput(ENTITY_B, "private B"));
+    await svc.getLongTermMemories(AGENT as never, ENTITY_A as never);
+    await svc.getLongTermMemories(AGENT as never, ENTITY_B as never);
+    await svc.storeSessionSummary({ agentId: AGENT, entityId: ENTITY_A, roomId: ROOM_A, summary: "private summary", messageCount: 1, lastMessageOffset: 0, startTime: new Date(), endTime: new Date() } as never);
+    const stopping = svc.disconnectEntity(ENTITY_A);
+    expect(svc.hasDelegation(ENTITY_A)).toBe(false);
+    expect(await svc.getLongTermMemories(AGENT as never, ENTITY_A as never)).toEqual([]);
+    expect(await svc.getCurrentSessionSummary(AGENT as never, ROOM_A as never)).toBeNull();
+    expect((await svc.getLongTermMemories(AGENT as never, ENTITY_B as never))[0].content).toBe("private B");
+    expect(a.db.query("SELECT content FROM long_term_memories").get()).toEqual({content: "private A"});
+    await stopping;
+    a.db.close(); b.db.close();
+  });
+
+  test("pending cold summary reads cannot publish or seed after disconnect", async () => {
+    const a = makeFake("A"); a.stop = async () => {};
+    const gate = deferred(); const started = deferred();
+    const query = a.sql.query;
+    a.sql.query = async (...args) => { const result = await query(...args); started.resolve(); await gate.promise; return result; };
+    const reg = makeReg([[ENTITY_A, a, ROOM_A]]);
+    const svc = makeSvc(reg);
+    await svc.storeSessionSummary({ agentId: AGENT, entityId: ENTITY_A, roomId: ROOM_A, summary: "old secret", messageCount: 1, lastMessageOffset: 0, startTime: new Date(), endTime: new Date() } as never);
+    // New service makes this a cold load while retaining the real SQL rows.
+    const cold = makeSvc(reg);
+    const pending = cold.getCurrentSessionSummary(AGENT as never, ROOM_A as never);
+    await started.promise;
+    await cold.disconnectEntity(ENTITY_A);
+    gate.resolve();
+    expect(await pending).toBeNull();
+    expect(await cold.getCurrentSessionSummary(AGENT as never, ROOM_A as never)).toBeNull();
+    a.db.close();
+  });
+
+  test("an in-flight summary write cannot publish, seed cache or rebind a room after disconnect", async () => {
+    const a = makeFake("A"); a.stop = async () => {};
+    const gate = deferred(); const started = deferred();
+    const execute = a.sql.execute;
+    a.sql.execute = async (...args) => { const result = await execute(...args); started.resolve(); await gate.promise; return result; };
+    const reg = makeReg([[ENTITY_A, a]]); const svc = makeSvc(reg);
+    const pending = svc.storeSessionSummary({ agentId: AGENT, entityId: ENTITY_A, roomId: ROOM_A, summary: "already dispatched", messageCount: 1, lastMessageOffset: 0, startTime: new Date(), endTime: new Date() } as never).catch(e => e);
+    await started.promise;
+    await svc.disconnectEntity(ENTITY_A);
+    gate.resolve();
+    expect(await pending).toBeInstanceOf(NoDelegationError);
+    expect(() => reg.clientForRoom(ROOM_A)).toThrow(NoDelegationError);
+    expect(await svc.getCurrentSessionSummary(AGENT as never, ROOM_A as never)).toBeNull();
+    expect(a.db.query("SELECT summary FROM session_summaries").get()).toEqual({ summary: "already dispatched" });
+    a.db.close();
+  });
+
+  test("queued private writes do not dispatch after disconnect", async () => {
+    const a = makeFake("A"); const b = makeFake("B");
+    a.stop = async () => {}; b.stop = async () => {};
+    const gate = deferred(); const started = deferred();
+    const execute = b.sql.execute;
+    b.sql.execute = async (...args) => { started.resolve(); await gate.promise; return execute(...args); };
+    const svc = makeSvc(makeReg([[ENTITY_A, a], [ENTITY_B, b]]));
+    const first = svc.storeLongTermMemory(ltmInput(ENTITY_B)); await started.promise;
+    const pending = svc.storeLongTermMemory(ltmInput(ENTITY_A)).catch(e => e);
+    await svc.disconnectEntity(ENTITY_A);
+    gate.resolve(); await first;
+    expect(await pending).toBeInstanceOf(NoDelegationError);
+    expect(a.callLog.some(x => x.startsWith("x:"))).toBe(false);
+    a.db.close(); b.db.close();
+  });
+});
+
+test("a resumed legacy request cannot acquire private access from a later connection", async () => {
+  const { withPrivateAccess } = await import("../index");
+  const a = makeFake("A"); a.stop = async () => {};
+  const reg = makeReg([[ENTITY_A, a]]); const svc = makeSvc(reg);
+  await svc.storeLongTermMemory(ltmInput(ENTITY_A, "private"));
+  const gate = deferred(); let current = true;
+  const oldRequest = withPrivateAccess(() => current, async () => {
+    await gate.promise;
+    expect(await svc.getLongTermMemories(AGENT as never, ENTITY_A as never)).toEqual([]);
+    await expect(svc.storeLongTermMemory(ltmInput(ENTITY_A))).rejects.toBeInstanceOf(NoDelegationError);
+  });
+  current = false;
+  gate.resolve();
+  await oldRequest;
+  // Independent current request retains its own authority.
+  expect((await svc.getLongTermMemories(AGENT as never, ENTITY_A as never))[0].content).toBe("private");
+  a.db.close();
+});
+
+test("A to B replacement uses B for real memory SQL and fences A's stale background refresh", async () => {
+  const a = makeFake("grant-A"); const b = makeFake("grant-B");
+  a.stop = async () => {}; b.stop = async () => {};
+  const reg = new EntityClientRegistry({ createClient: c => c.serializedDelegation === "A" ? a : b });
+  const svc = new TinyCloudMemoryStorageService(undefined as never, {registry: reg, ttlMs: 0});
+  await svc.registerDelegation(ENTITY_A, "A");
+  await svc.storeLongTermMemory(ltmInput(ENTITY_A, "A memory"));
+  expect((await svc.getLongTermMemories(AGENT as never, ENTITY_A as never))[0].content).toBe("A memory");
+  const gate = deferred(); const started = deferred(); const finished = deferred();
+  const query = a.sql.query;
+  a.sql.query = async (...args) => {
+    const data = await query(...args); started.resolve(); await gate.promise; finished.resolve(); return data;
+  };
+  expect((await svc.getLongTermMemories(AGENT as never, ENTITY_A as never))[0].content).toBe("A memory");
+  await started.promise;
+  await svc.registerDelegation(ENTITY_A, "B");
+  await svc.storeLongTermMemory(ltmInput(ENTITY_A, "B memory"));
+  expect((await svc.getLongTermMemories(AGENT as never, ENTITY_A as never))[0].content).toBe("B memory");
+  gate.resolve(); await finished.promise;
+  await Promise.resolve(); await Promise.resolve();
+  expect((await svc.getLongTermMemories(AGENT as never, ENTITY_A as never))[0].content).toBe("B memory");
+  expect(a.db.query("SELECT content FROM long_term_memories").get()).toEqual({content: "A memory"});
+  expect(b.callLog.some(call => call.startsWith("q:"))).toBe(true);
+  await svc.stop();
+  a.db.close(); b.db.close();
+});

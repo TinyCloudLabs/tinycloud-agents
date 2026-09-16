@@ -44,6 +44,8 @@ interface RegistryEntry {
   registeredAt: number;
   /** Expiry extracted from the signed delegation (build-plan §7). Undefined when unknown. */
   delegationExpiry?: Date;
+  isCurrent?: () => boolean;
+  canUse?: () => boolean;
 }
 
 /**
@@ -111,7 +113,7 @@ const DEFAULT_TTL_MS = Number(process.env.ELIZA_REGISTRY_TTL_MS) || 4 * 60 * 60 
  * Invariants:
  *   - One user's bad/expired delegation throws only in its own call, never in another's.
  *   - LRU eviction calls client.stop() and drops room mappings.
- *   - Concurrent registerDelegation calls for the same entity are deduplicated.
+ *   - Only identical pending grants for the same current lifecycle are deduplicated.
  */
 export class EntityClientRegistry {
   private readonly entries: Map<string, RegistryEntry>;
@@ -125,10 +127,16 @@ export class EntityClientRegistry {
   private readonly maxClients: number;
   private readonly ttlMs: number;
   /**
-   * In-flight registerDelegation promises per entityId — deduplicates concurrent
-   * first-time registrations so only one client build runs per entity.
+   * Candidate registrations. Only identical grants with current ownership coalesce.
    */
-  private readonly pending: Map<string, Promise<void>>;
+  private readonly pending = new Map<string, {
+    serialized: string;
+    promise: Promise<void>;
+    client?: AgentClient;
+    owns: () => boolean;
+  }>();
+  private readonly revisions = new Map<string, object>();
+  private readonly prebuilt = new Set<string>();
 
   constructor(deps: EntityClientRegistryDeps = {}) {
     // Guard: runWrite without a test seam (clients or createClient) indicates accidental
@@ -147,13 +155,13 @@ export class EntityClientRegistry {
     this.dbHandle = deps.dbHandle ?? MEMORY_DB_HANDLE;
     this.maxClients = deps.maxClients ?? DEFAULT_MAX_CLIENTS;
     this.ttlMs = deps.ttlMs ?? DEFAULT_TTL_MS;
-    this.pending = new Map();
 
     // Populate from pre-built clients (T1 test seam).
     const now = Date.now();
     this.entries = new Map();
     if (deps.clients) {
       for (const [entityId, client] of deps.clients) {
+        this.prebuilt.add(entityId);
         const delegationExpiry = deps.clientExpiries?.get(entityId);
         this.entries.set(entityId, { client, lastUsed: now, registeredAt: now, delegationExpiry });
       }
@@ -165,11 +173,10 @@ export class EntityClientRegistry {
   /**
    * Register a delegation for the given entity and optionally bind a room.
    *
-   * - Wire the room→entity mapping synchronously (before any await) so callers
-   *   that do not await (T1 test seam) see the mapping immediately.
-   * - If a pre-built client is in the map (T1 seam), just updates lastUsed and returns.
-   * - Otherwise, builds a delegation-mode client, calls signIn, then routes ensureSchema
-   *   through the write lane. Concurrent calls for the same entity are deduplicated.
+   * The pre-built test seam retains synchronous room binding. Production replaces
+   * the old client, then signs in and initializes schema under an ownership fence.
+   * Rooms become available only when the candidate is installed, and canUse keeps
+   * installed candidates private until the service commits the complete bundle.
    *
    * @throws {DelegationExpiredError} when signIn signals the delegation is EXPIRED.
    * @throws re-throws any other signIn / ensureSchema errors to the caller only.
@@ -178,30 +185,47 @@ export class EntityClientRegistry {
     entityId: string,
     serializedDelegation: string,
     roomId?: string,
+    isCurrent?: () => boolean,
+    canUse?: () => boolean,
   ): Promise<void> {
-    // Wire room synchronously FIRST — before any await — for T1 sync test compatibility.
-    if (roomId) this.roomToEntity.set(roomId, entityId);
-
-    // Pre-built client (T1 seam) — just touch lastUsed.
+    if (isCurrent && !isCurrent()) throw new NoDelegationError(entityId);
+    // Preserve only the explicit pre-built test seam; production entries replace.
     const existing = this.entries.get(entityId);
-    if (existing) {
+    if (existing && this.prebuilt.has(entityId)) {
       existing.lastUsed = Date.now();
+      existing.isCurrent = isCurrent;
+      existing.canUse = canUse;
+      if (roomId) this.roomToEntity.set(roomId, entityId);
       return;
     }
 
-    // Deduplicate concurrent first-time registrations for the same entity.
     const inFlight = this.pending.get(entityId);
-    if (inFlight) {
-      await inFlight;
+    if (inFlight?.serialized === serializedDelegation && inFlight.owns()) {
+      await inFlight.promise;
+      if (!inFlight.owns() || isCurrent?.() === false) throw new NoDelegationError(entityId);
+      if (roomId) this.roomToEntity.set(roomId, entityId);
       return;
     }
 
-    const work = this._buildEntry(entityId, serializedDelegation);
-    this.pending.set(entityId, work);
+    // Invalidate and detach before the first await. Old cleanup only owns its client.
+    const cleanup = this.disconnectEntity(entityId);
+    const revision = {};
+    this.revisions.set(entityId, revision);
+    const owns = () => this.revisions.get(entityId) === revision && (!isCurrent || isCurrent());
+    const pending = { serialized: serializedDelegation, promise: Promise.resolve(), owns, client: undefined as AgentClient | undefined };
+    this.pending.set(entityId, pending);
+    const work = (async () => {
+      await cleanup;
+      if (!owns()) throw new NoDelegationError(entityId);
+      await this._buildEntry(entityId, serializedDelegation, owns, canUse, client => { pending.client = client; });
+      if (!owns()) throw new NoDelegationError(entityId);
+      if (roomId) this.roomToEntity.set(roomId, entityId);
+    })();
+    pending.promise = work;
     try {
       await work;
     } finally {
-      this.pending.delete(entityId);
+      if (this.pending.get(entityId) === pending) this.pending.delete(entityId);
     }
   }
 
@@ -214,7 +238,7 @@ export class EntityClientRegistry {
    */
   clientFor(entityId: string): AgentClient {
     const entry = this.entries.get(entityId);
-    if (!entry) {
+    if (!entry || entry.isCurrent?.() === false || entry.canUse?.() === false) {
       throw new NoDelegationError(entityId);
     }
 
@@ -256,6 +280,7 @@ export class EntityClientRegistry {
    * Precondition: entityId must already be registered (clientFor succeeded above).
    */
   bindRoom(entityId: string, roomId: string): void {
+    this.clientFor(entityId);
     this.roomToEntity.set(roomId, entityId);
   }
 
@@ -265,14 +290,45 @@ export class EntityClientRegistry {
    * tears down per-user clients rather than leaving refresh timers dangling.
    */
   async stop(): Promise<void> {
-    await Promise.allSettled([...this.entries.values()].map((e) => e.client.stop()));
-    this.entries.clear();
-    this.roomToEntity.clear();
+    await Promise.allSettled([...new Set([...this.entries.keys(), ...this.pending.keys()])]
+      .map(entityId => this.disconnectEntity(entityId)));
+  }
+
+  hasDelegation(entityId: string): boolean {
+    const entry = this.entries.get(entityId);
+    return !!entry && entry.isCurrent?.() !== false &&
+      (!entry.delegationExpiry || Date.now() < entry.delegationExpiry.getTime()) &&
+      Date.now() - entry.lastUsed <= this.ttlMs;
+  }
+
+  entityForRoom(roomId: string): string | undefined {
+    return this.roomToEntity.get(roomId);
+  }
+
+  async disconnectEntity(entityId: string): Promise<void> {
+    this.revisions.set(entityId, {});
+    const entry = this.entries.get(entityId);
+    const candidate = this.pending.get(entityId)?.client;
+    this.entries.delete(entityId);
+    this.pending.delete(entityId);
+    this.prebuilt.delete(entityId);
+    for (const [room, owner] of this.roomToEntity) {
+      if (owner === entityId) this.roomToEntity.delete(room);
+    }
+    await Promise.allSettled([...new Set([entry?.client, candidate])]
+      .filter((client): client is AgentClient => !!client).map(client => client.stop()));
   }
 
   // ── private helpers ──────────────────────────────────────────────────────────
 
-  private async _buildEntry(entityId: string, serializedDelegation: string): Promise<void> {
+  private async _buildEntry(
+    entityId: string,
+    serializedDelegation: string,
+    isCurrent: () => boolean,
+    canUse: (() => boolean) | undefined,
+    onClient: (client: AgentClient) => void,
+  ): Promise<void> {
+    const assertCurrent = () => { if (!isCurrent()) throw new NoDelegationError(entityId); };
     // Extract delegation expiry for proactive re-mint UX (build-plan §7).
     // Malformed serializations: signIn will also fail below; expiry stays undefined.
     let delegationExpiry: Date | undefined;
@@ -297,28 +353,24 @@ export class EntityClientRegistry {
     };
 
     const client = this.createClientFn(config);
-
+    onClient(client);
     try {
       await client.signIn();
+      assertCurrent();
+      await this.runWriteFn(() => {
+        assertCurrent();
+        return client.ensureSchema([...MEMORY_SCHEMA]);
+      });
+      assertCurrent();
+      if (this.entries.size >= this.maxClients) await this._evictLru();
+      assertCurrent();
+      const now = Date.now();
+      this.entries.set(entityId, { client, lastUsed: now, registeredAt: now, delegationExpiry, isCurrent, canUse });
     } catch (err) {
-      // Flush the half-built client before surfacing the error.
       await client.stop().catch(() => {});
-      if (isExpiredError(err)) {
-        throw new DelegationExpiredError(entityId, { cause: err });
-      }
+      if (isExpiredError(err)) throw new DelegationExpiredError(entityId, { cause: err });
       throw err;
     }
-
-    // Route ensureSchema through the write lane (single-writer SQLite invariant).
-    await this.runWriteFn(() => client.ensureSchema([...MEMORY_SCHEMA]));
-
-    // Make room (LRU eviction) before inserting the new entry.
-    if (this.entries.size >= this.maxClients) {
-      await this._evictLru();
-    }
-
-    const now = Date.now();
-    this.entries.set(entityId, { client, lastUsed: now, registeredAt: now, delegationExpiry });
   }
 
   private async _evict(entityId: string): Promise<void> {

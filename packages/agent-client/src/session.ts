@@ -118,10 +118,16 @@ export class Session {
       throw new TinyCloudClientError("agent-client: session stopped; cannot sign in");
     }
     if (this.established) return this.established;
-    if (this.signInInFlight) return this.signInInFlight;
+    if (this.signInInFlight) {
+      const result = await this.signInInFlight;
+      this.assertRunning();
+      return result;
+    }
     this.signInInFlight = this.doSignIn();
     try {
-      this.established = await this.signInInFlight;
+      const result = await this.signInInFlight;
+      this.assertRunning();
+      this.established = result;
       return this.established;
     } finally {
       this.signInInFlight = null;
@@ -174,6 +180,7 @@ export class Session {
     label?: string,
   ): Promise<TransportResult<T>> {
     await this.ensureSignedIn();
+    this.assertRunning();
 
     const first = await this.attempt(lane, op, label);
     if (first.kind === "ok") return first.result;
@@ -217,7 +224,10 @@ export class Session {
     op: () => Promise<TransportResult<T>>,
     label?: string,
   ): Promise<TransportResult<T>> {
-    const run = op as Job<TransportResult<T>>;
+    const run: Job<TransportResult<T>> = () => {
+      this.assertRunning();
+      return op();
+    };
     return lane === "read" ? this.worker.read(run, label) : this.worker.write(run, label);
   }
 
@@ -240,8 +250,13 @@ export class Session {
     return this.ensureSignedIn();
   }
 
+  private assertRunning(): void {
+    if (this.stopped) throw new TinyCloudClientError("agent-client: session stopped");
+  }
+
   private async doSignIn(): Promise<SignInResult> {
     const result = await this.transport.signIn();
+    this.assertRunning();
     this.scheduleRefresh();
     return result;
   }
