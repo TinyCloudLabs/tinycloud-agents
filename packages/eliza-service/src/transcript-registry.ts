@@ -12,7 +12,6 @@ import { createTranscriptNode, TranscriptResponseLimitError } from "./transcript
 
 const SQL_PATH = "xyz.tinycloud.tinychat/connectors";
 const MAX_ENTRIES = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_MAX_CLIENTS) || 256;
-const TTL_MS = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_TTL_MS) || 4 * 60 * 60 * 1000;
 // node-sdk 2.6.0 activates a child session lasting at most one hour, even when
 // its portable parent is valid for days. Renew on the next read before expiry.
 const SESSION_REFRESH_MS = 50 * 60 * 1000;
@@ -54,7 +53,6 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
       agentKey: string;
       host: string;
       maxEntries?: number;
-      ttlMs?: number;
       /** Overrides the delegated-node client. Production leaves this unset. */
       nodeFactory?: (args: { privateKey: string; host: string }) => TranscriptNode;
     },
@@ -99,7 +97,7 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
     if (roomOwner !== undefined && roomOwner !== entityId) throw new NoDelegationError(entityId);
     const entry = this.entries.get(entityId);
     if (!entry) throw new NoDelegationError(entityId);
-    if (Date.now() >= entry.expiry.getTime() || Date.now() - entry.lastUsed > (this.args.ttlMs ?? TTL_MS)) {
+    if (Date.now() >= entry.expiry.getTime()) {
       this.drop(entityId);
       throw new DelegationExpiredError(entityId);
     }
@@ -160,12 +158,11 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
     this.selectedMeetingByRoom.set(roomId, selection);
   }
 
-  /** True only while this entity has live, unexpired activated access. */
+  /** True while this entity has a registered, unexpired parent grant. */
   has(entityId: string): boolean {
     const entry = this.entries.get(entityId);
     return entry !== undefined
-      && Date.now() < entry.expiry.getTime()
-      && Date.now() - entry.lastUsed <= (this.args.ttlMs ?? TTL_MS);
+      && Date.now() < entry.expiry.getTime();
   }
 
   async stop(): Promise<void> {

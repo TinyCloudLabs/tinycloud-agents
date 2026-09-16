@@ -82,15 +82,18 @@ function fixture(parentMs = 7 * 24 * HOUR) {
 }
 
 describe("transcript activated-session renewal", () => {
-  test("reads SQL and KV after child expiry using the same live parent and a fresh node", async () => {
+  test("reads SQL and KV after eight idle hours using the same seven-day parent and a fresh node", async () => {
     const f = fixture();
     await f.registry.register("entity", f.grant(), "room");
     f.registry.selectMeeting("entity", "room", "meeting");
-    const reader = f.registry.readerFor("entity", "room");
+    let reader = f.registry.readerFor("entity", "room");
     expect((await reader.getMetadata!("meeting"))?.meetingRef).toBe("meeting");
-    advance(61 * MINUTE);
+    advance(8 * HOUR);
+    expect(f.registry.has("entity")).toBe(true);
+    reader = f.registry.readerFor("entity", "room");
     expect((await reader.getMetadata!("meeting"))?.meetingRef).toBe("meeting");
     expect(await reader.readBody!("fireflies", "source")).toMatchObject({ state: "present" });
+    expect(f.registry.has("entity")).toBe(true);
     expect(f.activations).toHaveLength(2);
     expect(f.activations[1]).toEqual(f.activations[0]);
     expect(f.signIns).toEqual([1, 2]);

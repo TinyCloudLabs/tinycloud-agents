@@ -10,7 +10,7 @@
 // normalization, exact policy validation, the 7-day ceiling, the fixed SQL
 // statement, and the fixed KV key — is the real implementation.
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import { serializeDelegation } from "@tinycloud/agent-client";
 import type { PortableDelegation } from "@tinycloud/agent-client";
 import { handleGetSessions, handlePostSessions } from "./handlers/sessions.js";
@@ -208,13 +208,12 @@ function corpusB(): Corpus {
 
 // ── Wiring that mirrors RuntimeHost, minus a real AgentRuntime ────────────────
 
-function makeSlice(opts: { trace?: NodeTrace; failSignIn?: boolean; ttlMs?: number; maxEntries?: number; corpus?: Corpus } = {}) {
+function makeSlice(opts: { trace?: NodeTrace; failSignIn?: boolean; maxEntries?: number; corpus?: Corpus } = {}) {
   const trace: NodeTrace = opts.trace ?? { sql: [], dbs: [], kvKeys: [], signIns: 0 };
   const registry = new TranscriptAccessRegistry({
     agentDid: AGENT_DID,
     agentKey: AGENT_KEY,
     host: "https://node.tinycloud.xyz",
-    ...(opts.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
     ...(opts.maxEntries !== undefined ? { maxEntries: opts.maxEntries } : {}),
     nodeFactory: fakeNodeFactory(
       (ownerSpace) => opts.corpus ?? (ownerSpace.toLowerCase().includes(OWNER_B.toLowerCase()) ? corpusB() : corpusA()),
@@ -491,14 +490,32 @@ describe("per-entity isolation, expiry, and revocation", () => {
       .rejects.toMatchObject({ code: "delegation_required" });
   });
 
-  test("an idle-expired entry is dropped and reported as delegation_expired", async () => {
-    const { host, store, runtime, registry } = makeSlice({ ttlMs: -1 });
-    await handlePostSessions({
-      agentId: AGENT_ID, entityId: "entity-a",
-      session: { version: 2, delegations: { memory: memoryGrant(), transcripts: transcriptGrant() } },
-    }, host, store);
-    await expect(runTool(runtime, "entity-a", { query: "ember compass" })).rejects.toMatchObject({ code: "delegation_expired" });
-    expect(registry.has("entity-a")).toBe(false);
+  test("a seven-day transcript grant supports the registered tool after eight idle hours", async () => {
+    setSystemTime(new Date("2030-01-01T00:00:00Z"));
+    try {
+      const { host, store, runtime, registry, trace, memoryCalls } = makeSlice();
+      const posted = await handlePostSessions({
+        agentId: AGENT_ID, entityId: "entity-a",
+        session: { version: 2, delegations: { memory: memoryGrant(), transcripts: transcriptGrant({ expiryMs: 7 * DAY_MS }) } },
+      }, host, store);
+      expect(posted.status).toBe(200);
+      expect(trace.signIns).toBe(1);
+
+      setSystemTime(new Date(Date.now() + 8 * 60 * 60 * 1000));
+      expect(registry.has("entity-a")).toBe(true);
+      const result = await runTool(runtime, "entity-a", { query: "final choice replaced cobalt" });
+      expect(result).toMatchObject({ data: { matches: [{
+        meetingRef: "meeting-a",
+        excerpts: [{ text: expect.stringContaining("ember compass") }],
+      }] } });
+      expect(trace.sql).toHaveLength(2);
+      expect(trace.kvKeys).toEqual([`${KV_PATH}fireflies/transcript/canary-1`]);
+      expect(trace.signIns).toBe(2);
+      expect(memoryCalls).toHaveLength(1);
+      expect(registry.has("entity-a")).toBe(true);
+    } finally {
+      setSystemTime();
+    }
   });
 
   test("revocation prevents the next read", async () => {
