@@ -21,9 +21,11 @@ describe("local validation host", () => {
     const keyFile = join(dir, "agent.key");
     writeFileSync(keyFile, `0x${"03".repeat(32)}`, { mode: 0o600 });
     let activated = 0;
+    let pause: Promise<void> | undefined;
+    let entered!: () => void;
     try {
       const host = await createLocalValidationHost({ agentKeyFile: keyFile, host: "https://node.example",
-        activateMemory: async () => { activated++; return { spaceId: "local-test", sql: { db() { throw new Error("Memory SQL access is forbidden"); } } }; },
+        activateMemory: async () => { activated++; if (pause) { entered(); await pause; } return { spaceId: "local-test", sql: { db() { throw new Error("Memory SQL access is forbidden"); } } }; },
       });
       const owner = "0x1111111111111111111111111111111111111111";
       const space = `tinycloud:pkh:eip155:1:${owner}:default`;
@@ -39,6 +41,7 @@ describe("local validation host", () => {
       const storage = await host.storageFor(TINYCHAT_AGENT_ID);
       await storage.registerDelegation("entity-local", grant, "room-local");
       expect(activated).toBe(1);
+      expect(host.privateAccessAvailable!(TINYCHAT_AGENT_ID, "entity-local")).toBe(false);
       const runtime = await host.runtimeFor(TINYCHAT_AGENT_ID);
       expect(runtime.actions).toHaveLength(5);
       expect(runtime.actions.map((action: { name: string }) => action.name.toLowerCase())).not.toContain("run_artifact_skill");
@@ -48,6 +51,14 @@ describe("local validation host", () => {
       const invalid = JSON.parse(grant); invalid.delegateDID = "did:key:wrong";
       await expect(storage.registerDelegation("entity-local", JSON.stringify(invalid))).rejects.toThrow();
       expect(activated).toBe(1);
+      let release!: () => void;
+      pause = new Promise<void>(resolve => { release = resolve; });
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const old = storage.registerDelegation("entity-local", grant);
+      await started;
+      await host.disconnectEntity!(TINYCHAT_AGENT_ID, "entity-local");
+      release();
+      await expect(old).rejects.toThrow();
       await host.stop();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

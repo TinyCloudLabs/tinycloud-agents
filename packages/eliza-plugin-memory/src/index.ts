@@ -70,3 +70,5 @@ export {
   settingString,
   resolveMemoryClientConfig,
 } from "./config";
+
+export { withPrivateAccess, currentPrivateAccess } from "./access-context";

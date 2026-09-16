@@ -656,3 +656,110 @@ describe("EntityClientRegistry — same-registry entity isolation", () => {
     expect(registry.clientFor("entityB")).toBe(clientB);
   });
 });
+
+function accessDeferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+describe("access lifecycle", () => {
+  test("a replacement installs the new actual client and stops the old client", async () => {
+    let stopped = 0;
+    const a = makeMinimalClient("A", { stopFn: async () => { stopped++; } });
+    const b = makeTrackedClient("B");
+    const registry = new EntityClientRegistry({ createClient: c => c.serializedDelegation === "A" ? a : b });
+    await registry.registerDelegation("entity", "A", "old-room");
+    await registry.registerDelegation("entity", "B", "new-room");
+    await registry.clientFor("entity").sql.query("SELECT 1");
+    expect(b.callLog).toEqual(["query:SELECT"]);
+    expect(stopped).toBe(1);
+    expect(() => registry.clientForRoom("old-room")).toThrow(NoDelegationError);
+  });
+
+  test("different pending grants replace rather than deduplicate, and old cleanup cannot remove the new entry", async () => {
+    const gate = accessDeferred();
+    let stopped = 0;
+    const started = accessDeferred();
+    const a = makeMinimalClient("A", { stopFn: async () => { stopped++; } });
+    a.signIn = async () => { started.resolve(); await gate.promise; return { spaceId: "A", address: "a", did: "a" }; };
+    const b = makeMinimalClient("B");
+    const registry = new EntityClientRegistry({ createClient: c => c.serializedDelegation === "A" ? a : b });
+    const old = registry.registerDelegation("entity", "A", "old-room").catch(e => e);
+    await started.promise;
+    await registry.registerDelegation("entity", "B", "new-room");
+    gate.resolve();
+    expect(await old).toBeInstanceOf(NoDelegationError);
+    expect(registry.clientFor("entity")).toBe(b);
+    expect(() => registry.clientForRoom("old-room")).toThrow(NoDelegationError);
+    expect(stopped).toBeGreaterThan(0);
+  });
+
+  test("disconnect invalidates pending sign-in before schema dispatch", async () => {
+    const gate = accessDeferred();
+    let schema = 0;
+    const candidate = makeMinimalClient("A");
+    candidate.signIn = async () => { await gate.promise; return { spaceId: "A", address: "a", did: "a" }; };
+    candidate.ensureSchema = async () => { schema++; };
+    const registry = new EntityClientRegistry({ createClient: () => candidate });
+    const registration = registry.registerDelegation("entity", "A", "room").catch(e => e);
+    await registry.disconnectEntity("entity");
+    gate.resolve();
+    expect(await registration).toBeInstanceOf(NoDelegationError);
+    expect(schema).toBe(0);
+    expect(registry.hasDelegation("entity")).toBe(false);
+    expect(() => registry.clientForRoom("room")).toThrow(NoDelegationError);
+  });
+
+  test("schema failure stops candidate and permits a later retry", async () => {
+    let stops = 0;
+    const bad = makeMinimalClient("A", { stopFn: async () => { stops++; } });
+    bad.ensureSchema = async () => { throw new Error("schema failed"); };
+    const good = makeMinimalClient("B");
+    const registry = new EntityClientRegistry({ createClient: c => c.serializedDelegation === "A" ? bad : good });
+    await expect(registry.registerDelegation("entity", "A")).rejects.toThrow("schema failed");
+    expect(stops).toBe(1);
+    await registry.registerDelegation("entity", "B");
+    expect(registry.clientFor("entity")).toBe(good);
+  });
+
+  test("candidate is unavailable until the service commits the whole bundle", async () => {
+    let active = false;
+    const registry = new EntityClientRegistry({ createClient: () => makeMinimalClient("A") });
+    await registry.registerDelegation("entity", "A", undefined, () => true, () => active);
+    expect(registry.hasDelegation("entity")).toBe(true);
+    expect(() => registry.clientFor("entity")).toThrow(NoDelegationError);
+    active = true;
+    expect(registry.clientFor("entity")).toBeDefined();
+  });
+});
+
+test("identical pending candidates coalesce while bundled access is unavailable", async () => {
+  const gate = accessDeferred(); let builds = 0;
+  const candidate = makeMinimalClient("A");
+  candidate.signIn = async () => { await gate.promise; return { spaceId: "A", address: "a", did: "a" }; };
+  const registry = new EntityClientRegistry({ createClient: () => { builds++; return candidate; } });
+  const current = () => true; let active = false;
+  const first = registry.registerDelegation("entity", "A", "room1", current, () => active);
+  const second = registry.registerDelegation("entity", "A", "room2", current, () => active);
+  gate.resolve();
+  await Promise.all([first, second]);
+  expect(builds).toBe(1);
+  active = true;
+  expect(registry.clientForRoom("room1")).toBe(candidate);
+  expect(registry.clientForRoom("room2")).toBe(candidate);
+});
+
+test("a superseded external lease cannot coalesce with an identical new grant", async () => {
+  const gate = accessDeferred(); const started = accessDeferred(); let oldCurrent = true;
+  const a = makeMinimalClient("A"); const b = makeMinimalClient("B"); let builds = 0;
+  a.signIn = async () => { started.resolve(); await gate.promise; return { spaceId: "A", address: "a", did: "a" }; };
+  const registry = new EntityClientRegistry({ createClient: () => ++builds === 1 ? a : b });
+  const old = registry.registerDelegation("entity", "same-grant", undefined, () => oldCurrent).catch(e => e);
+  await started.promise;
+  oldCurrent = false;
+  await registry.registerDelegation("entity", "same-grant", undefined, () => true);
+  gate.resolve();
+  expect(await old).toBeInstanceOf(NoDelegationError);
+  expect(registry.clientFor("entity")).toBe(b);
+});

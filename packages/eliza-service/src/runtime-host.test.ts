@@ -302,3 +302,39 @@ describe("RuntimeHost — delegation preflight", () => {
     expect(seen).toEqual(["entity-a"]);
   });
 });
+
+describe("RuntimeHost account access teardown", () => {
+  it("detaches both registries synchronously and preserves other accounts and runtime history", async () => {
+    const memory = new Set(["alice", "bob"]);
+    const transcripts = new Set(["alice", "bob"]);
+    let release!: () => void;
+    const draining = new Promise<void>(resolve => { release = resolve; });
+    let runtimeStops = 0;
+    const host = new RuntimeHost({ _bootFactory: async agentId => ({
+      agentId,
+      runtime: { stop: async () => { runtimeStops++; } } as unknown as IAgentRuntime,
+      storageService: {
+        hasDelegation: (entity: string) => memory.has(entity),
+        disconnectEntity: (entity: string) => { memory.delete(entity); return draining; },
+      } as unknown as TinyCloudMemoryStorageService,
+      transcriptRegistry: { has: (entity: string) => transcripts.has(entity), revoke: (entity: string) => { transcripts.delete(entity); } } as never,
+    }) });
+    await host.boot(AGENT_ID_A);
+    expect(host.privateAccessAvailable(AGENT_ID_A, "alice")).toBe(true);
+    const stopped = host.disconnectEntity(AGENT_ID_A, "alice");
+    expect(memory.has("alice")).toBe(false);
+    expect(transcripts.has("alice")).toBe(false);
+    expect(host.privateAccessAvailable(AGENT_ID_A, "alice")).toBe(false);
+    expect(host.privateAccessAvailable(AGENT_ID_A, "bob")).toBe(true);
+    expect(runtimeStops).toBe(0);
+    release(); await stopped;
+  });
+
+  it("status and disconnect do not boot an unused runtime", async () => {
+    const state = makeFactory(() => new FakeStorageService());
+    const host = new RuntimeHost({ _bootFactory: state.factory });
+    expect(host.privateAccessAvailable(AGENT_ID_A, "alice")).toBe(false);
+    await host.disconnectEntity(AGENT_ID_A, "alice");
+    expect(state.bootCount).toBe(0);
+  });
+});

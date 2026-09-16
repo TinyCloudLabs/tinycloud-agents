@@ -6,9 +6,9 @@ import {
   type ArtifactSkillRuntimeInput,
 } from "@tinycloud/agent-client";
 import { SessionStore } from "./session-store.js";
-import { startElizaService, type ElizaServiceHost } from "./server.js";
+import { createElizaServiceFetch, startElizaService, type ElizaServiceHost } from "./server.js";
 import { runArtifactSkillAction } from "./actions/run-artifact-skill.js";
-import { ARTIFACTORY_AGENT_ID } from "./auth/app-registry.js";
+import { ARTIFACTORY_AGENT_ID, TINYCHAT_AGENT_ID } from "./auth/app-registry.js";
 
 const TEST_SERVICE_SECRET = "server-test-service-secret";
 const TEST_ARTIFACTORY_SERVICE_SECRET = "server-test-artifactory-secret";
@@ -29,6 +29,14 @@ function makeValidSerialized(): string {
     chainId: 1,
     host: "https://node.tinycloud.xyz",
   });
+}
+
+function activeSessions(entityId = TEST_ENTITY_ID): SessionStore {
+  const store = new SessionStore();
+  const scope = { appId: "tinychat", agentId: TINYCHAT_AGENT_ID };
+  const lease = store.reserve(scope, entityId)!;
+  store.commit(scope, entityId, lease, { agentId: scope.agentId, serializedDelegation: makeValidSerialized(), serializedTranscriptDelegation: "synthetic-transcript" });
+  return store;
 }
 
 class FakeStorage {
@@ -84,6 +92,7 @@ function makeMessageHost(opts: {
       preflight: async () => {
         if (opts.preflightError) throw opts.preflightError;
       },
+      privateAccessAvailable: () => true,
     },
   };
 }
@@ -178,7 +187,7 @@ describe("eliza-service HTTP server", () => {
     } finally { if (saved === undefined) delete process.env.BUILD_REVISION; else process.env.BUILD_REVISION = saved; }
   });
 
-  it("POST /sessions routes to the sessions handler", async () => {
+  it("POST /sessions preserves the Artifactory memory-only contract", async () => {
     const { host, storage } = makeHost();
     const sessions = new SessionStore();
     server = startElizaService({ host, sessions, port: 0 });
@@ -188,7 +197,7 @@ describe("eliza-service HTTP server", () => {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "Authorization": `Bearer ${TEST_SERVICE_SECRET}`,
+        "Authorization": `Bearer ${TEST_ARTIFACTORY_SERVICE_SECRET}`,
       },
       body: JSON.stringify({
         agentId: TEST_AGENT_ID,
@@ -208,7 +217,7 @@ describe("eliza-service HTTP server", () => {
 
   it("POST /messages streams SSE frames from the message handler", async () => {
     const { host, seen } = makeMessageHost({ chunks: [{ text: "one" }, { text: "two" }] });
-    server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+    server = startElizaService({ host, sessions: activeSessions(), port: 0 });
 
     const res = await fetch(url("/messages"), {
       method: "POST",
@@ -238,7 +247,7 @@ describe("eliza-service HTTP server", () => {
     const { host } = makeMessageHost({
       preflightError: new NoDelegationError(TEST_ENTITY_ID),
     });
-    server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+    server = startElizaService({ host, sessions: activeSessions(), port: 0 });
 
     const res = await fetch(url("/messages"), {
       method: "POST",
@@ -311,7 +320,7 @@ describe("eliza-service HTTP server", () => {
     };
 
     try {
-      server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
+      server = startElizaService({ host, sessions: activeSessions(), port: 0 });
       const res = await fetch(url("/messages"), {
         method: "POST",
         headers: {
@@ -361,7 +370,47 @@ describe("eliza-service HTTP server", () => {
     });
 
     expect(res.status).toBe(404);
-    expect(await res.json()).toEqual({ status: "none" });
+    expect(await res.json()).toEqual({ status: "none", state: "none", revision: expect.any(String) });
+  });
+
+  it("rejects revisionless TinyChat POST and keeps its disconnected revision unchanged", async () => {
+    const { host, storage } = makeHost();
+    const sessions = new SessionStore();
+    server = startElizaService({ host, sessions, port: 0 });
+    const headers = { Authorization: `Bearer ${TEST_SERVICE_SECRET}`, "content-type": "application/json" };
+    const before = await (await fetch(url(`/sessions/${TEST_ENTITY_ID}`), { headers })).json();
+    const response = await fetch(url("/sessions"), { method: "POST", headers,
+      body: JSON.stringify({ agentId: TEST_AGENT_ID, entityId: TEST_ENTITY_ID, serializedDelegation: makeValidSerialized() }),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "stale_revision" });
+    expect(storage.registered).toHaveLength(0);
+    expect(await (await fetch(url(`/sessions/${TEST_ENTITY_ID}`), { headers })).json()).toEqual(before);
+  });
+
+  it("DELETE authenticates, invalidates the account revision, and leaves other apps unchanged", async () => {
+    const { host } = makeHost();
+    const stopped: string[] = [];
+    host.disconnectEntity = (agentId, entityId) => { stopped.push(`${agentId}:${entityId}`); return Promise.resolve(); };
+    const sessions = activeSessions();
+    sessions.set(TEST_ENTITY_ID, { agentId: ARTIFACTORY_AGENT_ID, serializedDelegation: makeValidSerialized() });
+    const scope = { appId: "tinychat", agentId: TINYCHAT_AGENT_ID };
+    const old = sessions.lease(scope, TEST_ENTITY_ID);
+    server = startElizaService({ host, sessions, port: 0 });
+    const path = url(`/sessions/${TEST_ENTITY_ID}`);
+    expect((await fetch(path, { method: "DELETE" })).status).toBe(401);
+    expect(old.isActive()).toBe(true);
+    expect((await fetch(path, { method: "DELETE", headers: { Authorization: `Bearer ${TEST_ARTIFACTORY_SERVICE_SECRET}` } })).status).toBe(404);
+    expect(old.isActive()).toBe(true);
+    expect(stopped).toEqual([]);
+    const response = await fetch(path, { method: "DELETE", headers: { Authorization: `Bearer ${TEST_SERVICE_SECRET}` } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "none", state: "disconnected", revision: expect.any(String) });
+    expect(old.isCurrent()).toBe(false);
+    expect(stopped).toEqual([`${TINYCHAT_AGENT_ID}:${TEST_ENTITY_ID}`]);
+    const legacy = await fetch(path, { headers: { Authorization: `Bearer ${TEST_ARTIFACTORY_SERVICE_SECRET}` } });
+    expect(legacy.status).toBe(200);
+    expect(await legacy.json()).toEqual({ entityId: TEST_ENTITY_ID, status: "active" });
   });
 
   it("POST /tools/:name dispatches to the action and returns JSON", async () => {
@@ -656,7 +705,7 @@ describe("eliza-service HTTP server", () => {
     expect(await res.json()).toEqual({ error: "unauthorized" });
   });
 
-  it("POST /tools/:name returns 404 for an unknown tool", async () => {
+  it("POST /tools/:name preserves Artifactory's 404 for an unknown tool", async () => {
     const host = makeToolHost({ name: "WEB_SEARCH" });
     server = startElizaService({ host, sessions: new SessionStore(), port: 0 });
 
@@ -664,7 +713,7 @@ describe("eliza-service HTTP server", () => {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "Authorization": `Bearer ${TEST_SERVICE_SECRET}`,
+        "Authorization": `Bearer ${TEST_ARTIFACTORY_SERVICE_SECRET}`,
       },
       body: JSON.stringify({ args: {} }),
     });
@@ -699,4 +748,24 @@ describe("eliza-service HTTP server", () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "malformed_json" });
   });
+});
+
+
+it("checks the private lease again at the HTTP tool publication boundary", async () => {
+  const original = process.env.ELIZA_SERVICE_SECRET;
+  process.env.ELIZA_SERVICE_SECRET = TEST_SERVICE_SECRET;
+  try {
+  const sessions = new SessionStore();
+  const scope = { appId: "tinychat", agentId: "92361e74-91ed-43a2-9656-5cc37ff3a07a" };
+  const lease = sessions.reserve(scope, TEST_ENTITY_ID)!;
+  sessions.commit(scope, TEST_ENTITY_ID, lease, { agentId: scope.agentId, serializedDelegation: "controlled" });
+  const result = { get text() { sessions.disconnect(scope, TEST_ENTITY_ID); return "PRIVATE BUFFERED RESULT"; } };
+  const host = makeToolHost({ name: "TINYCLOUD_READ_MEETING" });
+  host.runtimeFor = async () => ({ actions: [{ name: "TINYCLOUD_READ_MEETING", handler: async () => result }] }) as unknown as IAgentRuntime;
+  host.privateAccessAvailable = () => true;
+  const handler = createElizaServiceFetch({ sessions, host });
+  const response = await handler(new Request("http://localhost/tools/tinycloud_read_meeting", { method: "POST", headers: { Authorization: `Bearer ${TEST_SERVICE_SECRET}`, "content-type": "application/json" }, body: JSON.stringify({ entityId: TEST_ENTITY_ID }) }));
+  expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({ error: "delegation_required" });
+  } finally { if (original === undefined) delete process.env.ELIZA_SERVICE_SECRET; else process.env.ELIZA_SERVICE_SECRET = original; }
 });

@@ -48,6 +48,7 @@ export interface SwrOptions {
 export class SwrCache<V> {
   private readonly store = new Map<string, SwrEntry<V>>();
   private readonly inflight = new Map<string, Promise<V>>();
+  private readonly revisions = new Map<string, object>();
   private readonly ttlMs: number;
   private readonly clock: Clock;
   private readonly now: Now;
@@ -73,12 +74,18 @@ export class SwrCache<V> {
   /** Drop a single key. */
   invalidate(key: string): void {
     this.store.delete(key);
+    this.inflight.delete(key);
+    this.revisions.set(key, {});
   }
 
   /** Drop every key beginning with `prefix` (e.g. all entries for one entity). */
   invalidatePrefix(prefix: string): void {
-    for (const key of this.store.keys()) {
-      if (key.startsWith(prefix)) this.store.delete(key);
+    this.invalidateWhere(key => key.startsWith(prefix));
+  }
+
+  invalidateWhere(matches: (key: string) => boolean): void {
+    for (const key of new Set([...this.store.keys(), ...this.inflight.keys()])) {
+      if (matches(key)) this.invalidate(key);
     }
   }
 
@@ -106,10 +113,13 @@ export class SwrCache<V> {
       return entry.value;
     }
 
-    // Cold miss: await the load, but never longer than the deadline.
+    // Cold miss: invalidation also fences the result returned to this caller.
+    const revision = this.revisions.get(key);
     try {
-      return await this.withDeadline(this.revalidate(key, loader), deadlineMs);
+      const value = await this.withDeadline(this.revalidate(key, loader), deadlineMs);
+      return this.revisions.get(key) === revision ? value : fallback;
     } catch {
+      if (this.revisions.get(key) !== revision) return fallback;
       const latest = this.store.get(key);
       return latest ? latest.value : fallback;
     }
@@ -140,20 +150,24 @@ export class SwrCache<V> {
     const existing = this.inflight.get(key);
     if (existing) return existing;
 
-    const run = (async (): Promise<V> => {
+    const revision = this.revisions.get(key);
+    let resolve!: (value: V) => void;
+    let reject!: (error: unknown) => void;
+    const run = new Promise<V>((done, fail) => { resolve = done; reject = fail; });
+    this.inflight.set(key, run);
+    void (async () => {
       try {
         const value = await loader();
+        if (this.revisions.get(key) !== revision) throw new Error("cache load invalidated");
         this.set(key, value);
-        return value;
+        resolve(value);
       } catch (err) {
         this.onRevalidateError(key, err);
-        throw err;
+        reject(err);
       } finally {
-        this.inflight.delete(key);
+        if (this.inflight.get(key) === run) this.inflight.delete(key);
       }
     })();
-
-    this.inflight.set(key, run);
     return run;
   }
 }

@@ -41,6 +41,13 @@ export async function createLocalValidationHost(config: {
   const assertAgent = (agentId: string) => {
     if (agentId !== TINYCHAT_AGENT_ID) throw new Error("Local validation only supports TinyChat");
   };
+  const generations = new Map<string, object>();
+  const memory = new Map<string, { transport: DelegatedTransport; isCurrent: () => boolean }>();
+  const detachMemory = (entityId: string) => {
+    generations.delete(entityId);
+    memory.get(entityId)?.transport.invalidate();
+    memory.delete(entityId);
+  };
   return {
     agentDid: identity.did,
     async runtimeFor(agentId) { assertAgent(agentId); return runtime; },
@@ -48,28 +55,66 @@ export async function createLocalValidationHost(config: {
     async storageFor(agentId) {
       assertAgent(agentId);
       return {
-        async registerDelegation(_entityId, serializedDelegation) {
+        async registerDelegation(entityId, serializedDelegation, _roomId, isCurrent = () => true) {
+          detachMemory(entityId);
+          const generation = {};
+          generations.set(entityId, generation);
+          const current = () => generations.get(entityId) === generation && isCurrent();
+          const assertCurrent = () => { if (!current()) throw new NoDelegationError(entityId); };
           // Reuse the normal signed-grant validation + SDK activation; never
           // call ensureSchema, query, execute or batch on the memory handle.
           const transport = new DelegatedTransport(resolveDelegationConfig({
             mode: "delegation", serializedDelegation, agentKey: identity.normalizedKey,
             host: config.host, dbHandle: MEMORY_DB_HANDLE,
           }), {
-            activate: config.activateMemory ?? (async (resolved, delegation, agent) => {
+            activate: async (resolved, delegation, agent) => {
+              assertCurrent();
+              if (config.activateMemory) {
+                const access = await config.activateMemory(resolved, delegation, agent);
+                assertCurrent();
+                return access;
+              }
               const node = new TinyCloudNode({ privateKey: agent.normalizedKey, host: resolved.host, autoCreateSpace: false });
               disableLocalAccountWrites(node);
               await node.signIn();
-              return node.useDelegation(delegation);
-            }),
+              assertCurrent();
+              const access = await node.useDelegation(delegation);
+              assertCurrent();
+              return access;
+            },
           });
-          await transport.signIn();
+          try {
+            await transport.signIn();
+            assertCurrent();
+            memory.set(entityId, { transport, isCurrent: current });
+          } catch (error) {
+            transport.invalidate();
+            if (current()) detachMemory(entityId);
+            throw error;
+          }
         },
       };
     },
-    async registerTranscriptDelegation(agentId, entityId, serialized, roomId) {
+    async registerTranscriptDelegation(agentId, entityId, serialized, roomId, isCurrent, canUse) {
       assertAgent(agentId);
-      await registry.register(entityId, serialized, roomId);
+      await registry.register(entityId, serialized, roomId, isCurrent, canUse);
     },
-    async stop() { setTranscriptRegistry(runtime, null); await registry.stop(); },
+    privateAccessAvailable(agentId, entityId) {
+      assertAgent(agentId);
+      return !!memory.get(entityId)?.isCurrent() && registry.has(entityId);
+    },
+    disconnectEntity(agentId, entityId) {
+      assertAgent(agentId);
+      detachMemory(entityId);
+      registry.revoke(entityId);
+      return Promise.resolve();
+    },
+    async stop() {
+      generations.clear();
+      for (const entry of memory.values()) entry.transport.invalidate();
+      memory.clear();
+      setTranscriptRegistry(runtime, null);
+      await registry.stop();
+    },
   };
 }

@@ -14,6 +14,7 @@ export interface TaskToolOptions {
   entityId: string;
   roomId: string;
   allowedTools: readonly string[];
+  access?: { isCurrent(): boolean; isActive(): boolean };
   deadlineAt: number;
   signal: AbortSignal;
   calendar?: TaskRequest["calendar"];
@@ -34,6 +35,7 @@ export class TaskTools {
     this.checkTask();
     const name = typeof call.name === "string" ? call.name.toLowerCase() : "";
     if (options.app.appId !== TINYCHAT_APP_ID || options.app.agentId !== TINYCHAT_AGENT_ID || !(TASK_TOOLS as readonly string[]).includes(name) || !options.allowedTools.includes(name) || !isToolAllowedForApp(name, options.app.appId)) return failure(403, "tool_not_allowed");
+    if (name !== "web_search" && options.access && !options.access.isActive()) return failure(409, "delegation_required");
     if (typeof call.id !== "string" || call.id.length === 0 || call.id.length > 256 || !validArgs(name, call.args)) return failure(400, "invalid_args");
     if (this.count >= 16) return failure(429, "tool_attempt_limit");
     if (this.running) return failure(409, "tool_already_running");
@@ -62,7 +64,7 @@ export class TaskTools {
           this.checkTask();
           return runtime;
         },
-      }, { signal: abort.signal }), abort.signal);
+      }, { signal: abort.signal, access: options.access }), abort.signal);
       this.checkTask();
       if (abort.signal.aborted) result = failure(408, "retrieval_timeout");
     } catch (error) {
@@ -79,6 +81,7 @@ export class TaskTools {
   }
 
   private checkTask(): void {
+    if (this.options.access && !this.options.access.isCurrent()) throw new TaskError("task_cancelled");
     if (this.options.signal.aborted) throw new TaskError("task_cancelled");
     if (Date.now() >= this.options.deadlineAt) throw new TaskError("turn_timeout");
   }

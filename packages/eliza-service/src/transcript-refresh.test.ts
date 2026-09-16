@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import { serializeDelegation } from "@tinycloud/agent-client";
 import type { PortableDelegation } from "@tinycloud/agent-client";
+import { withPrivateAccess } from "@tinycloud/eliza-plugin-memory";
 import { TranscriptAccessRegistry } from "./transcript-registry.js";
 
 const MINUTE = 60_000;
@@ -205,4 +206,86 @@ describe("transcript activated-session renewal", () => {
     expect(f.activations[2]).toEqual(f.activations[0]);
     expect(f.reads).toEqual(["3:sql"]);
   });
+});
+
+describe("initial transcript activation fencing", () => {
+  test("disconnect during sign-in prevents delegated activation and room installation", async () => {
+    const signingIn = deferred(); const release = deferred(); let activations = 0;
+    const registry = new TranscriptAccessRegistry({ agentDid: AGENT, agentKey: "synthetic", host: HOST,
+      nodeFactory: () => ({ async signIn() { signingIn.resolve(); await release.promise; }, async useDelegation() { activations++; return {}; } }),
+    });
+    const registration = registry.register("entity", fixture().grant(), "room");
+    await signingIn.promise;
+    registry.revoke("entity");
+    release.resolve();
+    await expect(registration).rejects.toThrow();
+    expect(activations).toBe(0);
+    expect(registry.has("entity")).toBe(false);
+  });
+
+  test("a delayed old activation cannot overwrite or remove a newer client", async () => {
+    const activating = deferred(); const release = deferred(); let nodes = 0;
+    const registry = new TranscriptAccessRegistry({ agentDid: AGENT, agentKey: "synthetic", host: HOST,
+      nodeFactory: () => { const node = ++nodes; return {
+        async signIn() {},
+        async useDelegation() {
+          if (node === 1) { activating.resolve(); await release.promise; }
+          return { sql: { db: () => ({ query: async () => ({ ok: true, data: { rows: [] } }) }) }, kv: { get: async () => ({ ok: true, data: { data: `"grant-${node}"` } }) } };
+        },
+      }; },
+    });
+    const old = registry.register("entity", fixture().grant("old"), "room");
+    await activating.promise;
+    registry.revoke("entity");
+    const replacement = registry.register("entity", fixture().grant("new"), "room");
+    // New authorization must not wait for stale remote activation.
+    await Promise.race([replacement, new Promise((_, reject) => setTimeout(() => reject(new Error("replacement blocked on stale activation")), 50))]);
+    release.resolve();
+    await expect(old).rejects.toThrow();
+    expect(await registry.readerFor("entity", "room").getTranscript("fireflies", "source")).toBe("grant-2");
+  });
+
+  test("candidate transcript access stays unusable until the whole bundle commits", async () => {
+    const f = fixture(); let active = false;
+    await f.registry.register("entity", f.grant(), "room", () => true, () => active);
+    expect(f.registry.has("entity")).toBe(true);
+    expect(() => f.registry.readerFor("entity", "room")).toThrow();
+    active = true;
+    expect(await f.registry.readerFor("entity", "room").getTranscript("fireflies", "source")).toBe("Synthetic transcript");
+  });
+});
+
+test("pending registrations with different room bindings do not coalesce", async () => {
+  const entered = deferred(); const release = deferred(); let nodes = 0;
+  const registry = new TranscriptAccessRegistry({ agentDid: AGENT, agentKey: "synthetic", host: HOST,
+    nodeFactory: () => { const node = ++nodes; return {
+      async signIn() { if (node === 1) { entered.resolve(); await release.promise; } },
+      async useDelegation() { return { sql: {}, kv: {} }; },
+    }; },
+  });
+  const serialized = fixture().grant();
+  const first = registry.register("entity", serialized, "old-room").then(() => "installed", () => "stale");
+  await entered.promise;
+  const second = registry.register("entity", serialized, "new-room").then(() => "installed", () => "stale");
+  release.resolve();
+  expect(await second).toBe("installed");
+  expect(await first).toBe("stale");
+  expect(nodes).toBe(2);
+});
+
+test("an inherited old turn cannot resolve a replacement transcript client or alter its selection", async () => {
+  const f = fixture(); let current = true;
+  await f.registry.register("entity", f.grant("old"), "room");
+  const reader = withPrivateAccess(() => current, () => f.registry.readerFor("entity", "room"));
+  current = false;
+  await f.registry.register("entity", f.grant("new"), "room");
+  f.registry.selectMeeting("entity", "room", "meeting");
+  await expect(reader.getMetadata!("meeting")).rejects.toThrow();
+  withPrivateAccess(() => current, () => {
+    expect(() => f.registry.readerFor("entity", "room")).toThrow();
+    expect(() => f.registry.setSelection("entity", "room", { state: "none" })).toThrow();
+    expect(() => f.registry.selectMeeting("entity", "new-room", "other-meeting")).toThrow();
+  });
+  expect(f.registry.selectedMeetingFor("entity", "room")).toBe("meeting");
+  expect(f.reads).toEqual([]);
 });

@@ -31,7 +31,7 @@ import {
   DelegationPolicyError,
 } from "@tinycloud/agent-client";
 import { MEMORY_DB_HANDLE } from "@tinycloud/eliza-plugin-memory";
-import type { SessionStore } from "../session-store.js";
+import type { SessionStore, SessionScope } from "../session-store.js";
 
 /**
  * Minimal host interface consumed by sessions handlers.
@@ -40,9 +40,13 @@ import type { SessionStore } from "../session-store.js";
 export interface SessionHandlerHost {
   readonly agentDid: string;
   storageFor(agentId: string): Promise<{
-    registerDelegation(entityId: string, serialized: string, roomId?: string): Promise<void>;
+    registerDelegation(entityId: string, serialized: string, roomId?: string, isCurrent?: () => boolean, canUse?: () => boolean): Promise<void>;
   }>;
-  registerTranscriptDelegation?(agentId: string, entityId: string, serializedDelegation: string, roomId?: string): Promise<void>;
+  registerTranscriptDelegation?(agentId: string, entityId: string, serializedDelegation: string, roomId?: string, isCurrent?: () => boolean, canUse?: () => boolean): Promise<void>;
+  /** Detach both clients synchronously, then return their bounded cleanup. */
+  disconnectEntity?(agentId: string, entityId: string): Promise<void>;
+  /** Installed, unexpired candidates; session state separately controls admission. */
+  privateAccessAvailable?(agentId: string, entityId: string): boolean;
 }
 
 export interface PostSessionsBody {
@@ -51,6 +55,7 @@ export interface PostSessionsBody {
   /** Opaque serialized delegation — never log or leak. */
   serializedDelegation?: string;
   roomId?: string;
+  revision?: string;
   /** V2 envelope. v1 serializedDelegation remains accepted during migration. */
   session?: { version: 2; delegations: { memory: string; transcripts: string }; roomId?: string };
 }
@@ -64,9 +69,19 @@ export async function handlePostSessions(
   body: PostSessionsBody,
   host: SessionHandlerHost,
   store: SessionStore,
+  scope?: SessionScope,
 ): Promise<HandlerResult> {
   const { agentId, entityId } = body;
   const envelope = body.session;
+  const bundled = scope?.appId === "tinychat";
+  if (bundled) {
+    if (typeof body.revision !== "string" || body.revision !== store.snapshot(scope, entityId).revision) {
+      return { status: 409, body: { error: "stale_revision" } };
+    }
+    if (envelope?.version !== 2 || typeof envelope.delegations?.memory !== "string" || typeof envelope.delegations?.transcripts !== "string") {
+      return { status: 400, body: { error: "bundle_required" } };
+    }
+  }
   const serializedDelegation = envelope?.delegations.memory ?? body.serializedDelegation;
   const serializedTranscriptDelegation = envelope?.delegations.transcripts;
   const roomId = envelope?.roomId ?? body.roomId;
@@ -132,7 +147,39 @@ export async function handlePostSessions(
     throw e;
   }
 
-  // 4. Register via B's seam — the ONLY write path from C into B's registry
+  if (bundled) {
+    if (!host.disconnectEntity || !host.registerTranscriptDelegation || !host.privateAccessAvailable) {
+      return { status: 503, body: { error: "private_access_unavailable" } };
+    }
+    // Reserve before the first await. Both old candidates and every admitted
+    // lease are unusable from this point, including during bounded cleanup.
+    const lease = store.reserve(scope, entityId, body.revision);
+    if (!lease) return { status: 409, body: { error: "stale_revision" } };
+    const stale = () => ({ status: 409, body: { error: "stale_revision" } });
+    try {
+      await host.disconnectEntity(agentId, entityId);
+      if (!lease.isCurrent()) return stale();
+      const storage = await host.storageFor(agentId);
+      if (!lease.isCurrent()) return stale();
+      await storage.registerDelegation(entityId, serializedDelegation, roomId, lease.isCurrent, lease.isActive);
+      if (!lease.isCurrent()) return stale();
+      await host.registerTranscriptDelegation(agentId, entityId, serializedTranscriptDelegation!, roomId, lease.isCurrent, lease.isActive);
+      if (!lease.isCurrent()) return stale();
+      if (!host.privateAccessAvailable(agentId, entityId)) throw new Error("private access unavailable");
+      if (!store.commit(scope, entityId, lease, { agentId, serializedDelegation, serializedTranscriptDelegation, roomId })) return stale();
+      return { status: 200, body: { entityId, status: "active", transcriptStatus: "active", revision: lease.revision, state: "active" } };
+    } catch (error) {
+      // Cleanup can only own the current generation. Detachment is synchronous
+      // so a new ceremony cannot be deleted by this operation after an await.
+      if (!lease.isCurrent()) return stale();
+      store.fail(scope, entityId, lease);
+      try { await host.disconnectEntity(agentId, entityId); } catch { /* inactive; report failure below */ }
+      return { status: error instanceof DelegationPolicyError ? 400 : 503,
+        body: { error: error instanceof DelegationPolicyError ? transcriptErrorCode(error) : "private_access_unavailable" } };
+    }
+  }
+
+  // Unrelated applications retain their existing memory-only contract.
   const storage = await host.storageFor(agentId);
   await storage.registerDelegation(entityId, serializedDelegation, roomId);
   if (serializedTranscriptDelegation) {
@@ -171,17 +218,23 @@ export async function handleGetSessions(
   entityId: string,
   host: SessionHandlerHost,
   store: SessionStore,
+  scope?: SessionScope,
 ): Promise<HandlerResult> {
-  const record = store.get(entityId);
+  const snapshot = scope?.appId === "tinychat" ? store.snapshot(scope, entityId) : undefined;
+  const metadata = snapshot ? { revision: snapshot.revision, state: snapshot.state } : {};
+  const record = snapshot ? snapshot.record : store.get(entityId);
+  if (snapshot && (snapshot.state !== "active" || !host.privateAccessAvailable?.(scope!.agentId, entityId))) {
+    return { status: 404, body: { status: "none", ...metadata } };
+  }
   if (!record) {
-    return { status: 404, body: { status: "none" } };
+    return { status: 404, body: { status: "none", ...metadata } };
   }
 
   let deleg;
   try {
     deleg = deserializeDelegationSafe(record.serializedDelegation);
   } catch {
-    return { status: 404, body: { status: "none" } };
+    return { status: 404, body: { status: "none", ...metadata } };
   }
 
   const policy = defaultElizaMemoryPolicy();
@@ -218,7 +271,19 @@ export async function handleGetSessions(
     if (transcriptStatus !== "active") delegStatus = transcriptStatus as typeof delegStatus;
   }
 
-  return { status: 200, body: { entityId, status: delegStatus, ...(transcriptStatus ? { transcriptStatus } : {}) } };
+  return { status: 200, body: { entityId, status: delegStatus, ...(transcriptStatus ? { transcriptStatus } : {}), ...metadata } };
+}
+
+export async function handleDeleteSessions(entityId: string, host: SessionHandlerHost, store: SessionStore, scope: SessionScope): Promise<HandlerResult> {
+  if (scope.appId !== "tinychat") return { status: 404, body: { error: "not_found" } };
+  const snapshot = store.disconnect(scope, entityId);
+  try {
+    if (!host.disconnectEntity) throw new Error("private access unavailable");
+    await host.disconnectEntity(scope.agentId, entityId);
+  } catch {
+    return { status: 503, body: { error: "disconnect_unconfirmed", revision: snapshot.revision } };
+  }
+  return { status: 200, body: { entityId, status: "none", revision: snapshot.revision, state: "disconnected" } };
 }
 
 /** Map a policy rejection to a stable, non-revealing session error code. */

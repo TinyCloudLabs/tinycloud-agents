@@ -233,3 +233,70 @@ describe("TinyChat task HTTP seam", () => {
     expect((await handler(request())).status).toBe(409);
   });
 });
+
+describe("task private access generations", () => {
+  it("filters private offers when no active server-side bundle exists", async () => {
+    let offered: any[] = [];
+    const handler = service(async (_input, init) => { offered = JSON.parse(String(init?.body)).tools ?? []; return new Response(finished); });
+    await events(await handler(request(body({ allowedTools: ["web_search", "tinycloud_read_meeting"] }))));
+    expect(offered.map(tool => tool.function.name)).toEqual(["web_search"]);
+  });
+  it("disconnect discards queued content and cancels only the affected entity while keeping usage", async () => {
+    const store = new SessionStore(); const scope = { appId: "tinychat", agentId: TINYCHAT_AGENT_ID };
+    let release!: () => void; const waiting = new Promise<void>(resolve => { release = resolve; });
+    const handler = createElizaServiceFetch({ host: { ...host, disconnectEntity: async () => {}, privateAccessAvailable: () => true }, sessions: store, tasks: {
+      apiKey: "fake-local-provider-key", baseUrl: "http://localhost/v1", models: { [MODEL]: 10000 },
+      fetchImpl: async () => new Response(new ReadableStream<Uint8Array>({ async start(c) {
+        c.enqueue(encoder.encode(frame({ usage }) + frame({ choices: [{ delta: { content: "PRIVATE QUEUED" } }] })));
+        await waiting; try { c.enqueue(encoder.encode(finished)); c.close(); } catch { /* Cancelled body. */ }
+      } })),
+    } });
+    const response = await handler(request());
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const deleted = await handler(new Request(`http://localhost/sessions/${ENTITY}`, { method: "DELETE", headers: { Authorization: `Bearer ${secret}` } }));
+    expect(deleted.status).toBe(200); release();
+    const all = await events(response);
+    expect(all[0].type).toBe("accepted");
+    expect(JSON.stringify(all)).not.toContain("PRIVATE QUEUED");
+    expect(all.at(-1)).toMatchObject({ outcome: "cancelled", promptTokens: 12, completionTokens: 3 });
+    expect(store.snapshot(scope, ENTITY).state).toBe("disconnected");
+  });
+});
+
+it("cannot upgrade a task admitted while the bundle was still activating", async () => {
+  const sessions = new SessionStore(); const scope = { appId: "tinychat", agentId: TINYCHAT_AGENT_ID };
+  const candidate = sessions.reserve(scope, ENTITY)!;
+  let finish!: (value: Response) => void; let actionCalls = 0; let offered: any[] = [];
+  const handler = createElizaServiceFetch({ sessions, host: { ...host, privateAccessAvailable: () => true,
+    runtimeFor: async () => ({ actions: [{ name: "TINYCLOUD_READ_MEETING", handler: async () => { actionCalls++; return { text: "private" }; } }] }) as any,
+  }, tasks: { apiKey: "local", baseUrl: "http://localhost/v1", models: { [MODEL]: 10000 }, fetchImpl: async (_url, init) => {
+    offered = JSON.parse(String(init?.body)).tools;
+    return new Promise<Response>(resolve => { finish = resolve; });
+  } } });
+  const response = await handler(request(body({ allowedTools: ["web_search", "tinycloud_read_meeting"] })));
+  sessions.commit(scope, ENTITY, candidate, { agentId: scope.agentId, serializedDelegation: "controlled" });
+  finish(new Response(frame({ choices: [{ delta: { tool_calls: [{ index: 0, id: "private", function: { name: "tinycloud_read_meeting", arguments: "{}" } }] }, finish_reason: "tool_calls" }], usage }) + "data: [DONE]\n\n"));
+  const all = await events(response);
+  expect(offered.map(tool => tool.function.name)).toEqual(["web_search"]);
+  expect(actionCalls).toBe(0);
+  expect(all.at(-1)).toMatchObject({ outcome: "failed", code: "routing_mismatch", promptTokens: 12, completionTokens: 3 });
+});
+
+it("another account's running task and connection survive disconnect", async () => {
+  const other = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const sessions = new SessionStore(); const scope = { appId: "tinychat", agentId: TINYCHAT_AGENT_ID };
+  const candidate = sessions.reserve(scope, other)!;
+  sessions.commit(scope, other, candidate, { agentId: scope.agentId, serializedDelegation: "other-controlled" });
+  let finish!: (value: Response) => void;
+  const handler = createElizaServiceFetch({ sessions, host: { ...host, privateAccessAvailable: () => true, disconnectEntity: async () => {} }, tasks: {
+    apiKey: "local", baseUrl: "http://localhost/v1", models: { [MODEL]: 10000 }, fetchImpl: async () => new Promise<Response>(resolve => { finish = resolve; }),
+  } });
+  const response = await handler(request(body({ entityId: other })));
+  const deleted = await handler(new Request(`http://localhost/sessions/${ENTITY}`, { method: "DELETE", headers: { Authorization: `Bearer ${secret}` } }));
+  expect(deleted.status).toBe(200);
+  finish(new Response(frame({ choices: [{ delta: { content: "other account answer" } }] }) + finished));
+  const all = await events(response);
+  expect(JSON.stringify(all)).toContain("other account answer");
+  expect(all.at(-1)).toMatchObject({ outcome: "success", promptTokens: 12, completionTokens: 3 });
+  expect(candidate.isActive()).toBe(true);
+});

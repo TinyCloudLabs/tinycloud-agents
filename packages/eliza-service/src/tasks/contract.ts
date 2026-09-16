@@ -21,6 +21,7 @@ export interface TaskRequest {
   messages: TaskMessage[];
   calendar?: { localDate: string; timeZone: string };
   allowedTools: string[];
+  accessRevision?: string;
   deadlineAt: number;
 }
 export interface TaskConfig {
@@ -73,7 +74,8 @@ function calendar(value: unknown): boolean {
 }
 
 export function validateTask(value: unknown, config: TaskConfig, appId: string): TaskRequest {
-  if (!object(value) || !fields(value, ["version", "executionId", "entityId", "roomId", "model", "messages", "calendar", "allowedTools", "deadlineAt"]) || value.version !== 1 || !uuid(value.executionId) || !entityUuid(value.entityId)) throw new TaskError("invalid_task");
+  if (!object(value) || !fields(value, ["version", "executionId", "entityId", "roomId", "model", "messages", "calendar", "allowedTools", "deadlineAt", "accessRevision"]) || value.version !== 1 || !uuid(value.executionId) || !entityUuid(value.entityId)) throw new TaskError("invalid_task");
+  if (value.accessRevision !== undefined && (!text(value.accessRevision) || value.accessRevision.length > 256)) throw new TaskError("invalid_access_revision");
   if (value.roomId !== undefined && (!text(value.roomId) || value.roomId.length > 256)) throw new TaskError("invalid_room");
   if (!object(value.model) || !fields(value.model, ["id", "contextWindowTokens"]) || !text(value.model.id) || !Number.isSafeInteger(value.model.contextWindowTokens) || (value.model.contextWindowTokens as number) <= 0) throw new TaskError("invalid_model");
   const allowedContext = Object.prototype.hasOwnProperty.call(config.models, value.model.id) ? config.models[value.model.id] : undefined;
