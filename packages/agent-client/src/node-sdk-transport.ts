@@ -9,7 +9,7 @@
 
 import { TinyCloudNode } from "@tinycloud/node-sdk";
 import type { IDatabaseHandle } from "@tinycloud/node-sdk";
-import type { ResolvedAgentClientConfig } from "./config";
+import { AGENT_SESSION_EXPIRATION_MS, type ResolvedAgentClientConfig } from "./config";
 import { AuthError } from "./errors";
 import { adapterBatch, adapterExecute, adapterQuery } from "./sql-handle-adapter";
 import type {
@@ -37,6 +37,7 @@ export class NodeSdkTransport implements Transport {
       prefix: config.prefix,
       // MANDATORY: defaults false → every invoke 404s (plan §2.5).
       autoCreateSpace: true,
+      sessionExpirationMs: AGENT_SESSION_EXPIRATION_MS,
     });
     // No Cloudflare UA workaround: Bun's default fetch UA passes prod
     // (spike-verified; plan §5 invariant 6).

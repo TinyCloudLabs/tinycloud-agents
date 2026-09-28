@@ -8,7 +8,10 @@
 //      and the session guarantees at most one signIn in flight at a time.
 //   2. PROACTIVE re-signIn at ~50min (config knob; sessions last ~1h —
 //      tinyboilerplate precedent). The refresh timer is unref()'d so it can NEVER
-//      hold the host process open.
+//      hold the host process open. Transient failures (network, AuthError) keep the
+//      cadence alive; a PERMANENT rejection of the stored delegation (expired or
+//      otherwise invalid — see isDelegationRejection) stops it, logs once, and
+//      notifies `onDelegationRejected` so the host can require a reconnect.
 //   3. LAZY re-signIn on a 401/unauthorized failure from the node: EXACTLY ONE
 //      re-signIn + ONE retry of the failed call, then surface AuthError. Never a
 //      loop (plan §3 lifecycle step 2).
@@ -21,7 +24,12 @@
 //
 // HARD CONTRACT: zero host-framework (Eliza) imports — see ./index.ts.
 
-import { AuthError, TinyCloudClientError } from "./errors";
+import {
+  isDelegationExpiredError,
+  isDelegationRejection,
+  type DelegationShapeError,
+} from "./delegation-validate";
+import { AuthError, TinyCloudClientError, type DelegationPolicyError } from "./errors";
 import { consoleLogger, type Logger } from "./logger";
 import type { SignInResult, Transport, TransportResult } from "./transport";
 import {
@@ -65,10 +73,18 @@ export interface SessionOptions {
    * Whether to arm the proactive refresh timer after signIn.
    * Both private-key and delegation mode set this to true. For delegation mode
    * the timer calls invalidate()+reSignIn() which re-activates with the SAME
-   * stored delegation — it refreshes the ~1h node session, not the ~7d delegation.
+   * stored delegation — it refreshes the ~1h delegated node session, not the user
+   * delegation itself (up to 30d).
    * Defaults to true.
    */
   proactiveRefresh?: boolean;
+  /**
+   * Called (once per rejection episode) when signIn fails because the stored
+   * delegation itself is rejected — expired or otherwise invalid. Retrying cannot
+   * succeed, so proactive refresh stops; the host should drop/mark the session so
+   * the user is asked to reconnect. Must not throw.
+   */
+  onDelegationRejected?: (error: DelegationShapeError | DelegationPolicyError) => void;
 }
 
 /** Outcome of one node attempt: a result (possibly an ok:false non-auth error) or an auth failure. */
@@ -88,6 +104,9 @@ export class Session {
   private readonly logger: Logger;
   /** When false, the proactive refresh timer is never armed. Defaults to true for both modes. */
   private readonly proactiveRefresh: boolean;
+  private readonly onDelegationRejected?: SessionOptions["onDelegationRejected"];
+  /** Set once the stored delegation is rejected; cleared by a later successful signIn. */
+  private delegationRejected = false;
 
   /** Cached established session; null until first signIn (or after a forced re-signIn). */
   private established: SignInResult | null = null;
@@ -107,6 +126,7 @@ export class Session {
     this.clock = options.clock ?? realClock;
     this.logger = options.logger ?? consoleLogger;
     this.proactiveRefresh = options.proactiveRefresh ?? true;
+    this.onDelegationRejected = options.onDelegationRejected;
   }
 
   /**
@@ -255,10 +275,40 @@ export class Session {
   }
 
   private async doSignIn(): Promise<SignInResult> {
-    const result = await this.transport.signIn();
+    let result: SignInResult;
+    try {
+      result = await this.transport.signIn();
+    } catch (error) {
+      if (isDelegationRejection(error)) this.handleDelegationRejected(error);
+      throw error;
+    }
     this.assertRunning();
+    this.delegationRejected = false;
     this.scheduleRefresh();
     return result;
+  }
+
+  /**
+   * The stored delegation can never activate again: disarm proactive refresh, log
+   * ONCE (not every cycle), and notify the host. Subsequent lazy calls still fail
+   * fast with the same local validation error (no network I/O).
+   */
+  private handleDelegationRejected(error: DelegationShapeError | DelegationPolicyError): void {
+    if (this.refreshTimer !== null) {
+      this.clock.clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+    if (this.delegationRejected) return;
+    this.delegationRejected = true;
+    this.logger.warn(
+      "agent-client: stored delegation rejected; stopping proactive refresh until the user reconnects",
+      { reason: error.name, expired: isDelegationExpiredError(error) },
+    );
+    try {
+      this.onDelegationRejected?.(error);
+    } catch {
+      // A host callback must never break the session's error path.
+    }
   }
 
   /**
@@ -283,6 +333,10 @@ export class Session {
       await this.reSignIn();
       // doSignIn re-arms the timer on success.
     } catch (error) {
+      // Permanent: doSignIn already disarmed, logged once and notified. Re-arming
+      // would retry an expired delegation every cycle forever (prod incident
+      // 2026-09: ~50-min DelegationShapeError loop per expired user session).
+      if (isDelegationRejection(error)) return;
       this.logger.warn(
         "agent-client: proactive re-signIn failed; will retry lazily on next 401",
         { reason: error instanceof Error ? error.name : "unknown" },

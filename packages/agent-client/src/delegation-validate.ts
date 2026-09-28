@@ -8,12 +8,16 @@
 // HARD CONTRACT: zero host-framework (Eliza) imports.
 
 import type { PortableDelegation } from "@tinycloud/node-sdk";
+import { DelegationPolicyError } from "./errors";
 
 /** Thrown when a PortableDelegation fails shallow shape validation. */
 export class DelegationShapeError extends Error {
-  constructor(message: string) {
+  /** True when the only problem is that the delegation's expiry has passed. */
+  readonly expired: boolean;
+  constructor(message: string, options?: { expired?: boolean }) {
     super(message);
     this.name = "DelegationShapeError";
+    this.expired = options?.expired ?? false;
   }
 }
 
@@ -64,7 +68,7 @@ export function validateDelegationShape(
     throw new DelegationShapeError("expiry is not a valid Date");
   }
   if (expiryMs <= Date.now()) {
-    throw new DelegationShapeError("delegation has expired: check expiry");
+    throw new DelegationShapeError("delegation has expired: check expiry", { expired: true });
   }
 
   // 4. At least one SQL resource must be present.
@@ -84,4 +88,25 @@ export function validateDelegationShape(
       "no SQL resource found covering dbHandle: check actions or resources",
     );
   }
+}
+
+/**
+ * True when `error` is a local validation rejection of a stored delegation
+ * (shape or policy). Such a failure is PERMANENT for the session that holds the
+ * delegation: the serialized bytes never change, so every re-activation fails the
+ * same way (an expired delegation only stays expired). Activation faults from the
+ * node/SDK surface as AuthError instead and remain retryable.
+ */
+export function isDelegationRejection(
+  error: unknown,
+): error is DelegationShapeError | DelegationPolicyError {
+  return error instanceof DelegationShapeError || error instanceof DelegationPolicyError;
+}
+
+/** True when a delegation rejection is specifically "the delegation has expired". */
+export function isDelegationExpiredError(error: unknown): boolean {
+  return (
+    (error instanceof DelegationShapeError && error.expired) ||
+    (error instanceof DelegationPolicyError && error.reason === "EXPIRED")
+  );
 }

@@ -26,7 +26,7 @@ import { DelegatedTransport } from "./delegated-transport";
 import { consoleLogger, type Logger } from "./logger";
 import { NodeSdkTransport } from "./node-sdk-transport";
 import { createEnsureSchema, type EnsureSchema } from "./schema";
-import { Session } from "./session";
+import { Session, type SessionOptions } from "./session";
 import { createSql, type SqlApi } from "./sql";
 import type { SignInResult, Transport } from "./transport";
 import { realClock, Worker, type Clock } from "./worker";
@@ -41,6 +41,11 @@ export interface AgentClientDeps {
   clock?: Clock;
   /** Logger (default: consoleLogger). */
   logger?: Logger;
+  /**
+   * Notified when the stored delegation is permanently rejected (e.g. expired) on
+   * signIn/re-signIn; see {@link SessionOptions.onDelegationRejected}.
+   */
+  onDelegationRejected?: SessionOptions["onDelegationRejected"];
 }
 
 /** The public client surface (plan §3). */
@@ -87,6 +92,7 @@ export function createAgentClient(
       proactiveRefresh: true,
       clock,
       logger,
+      onDelegationRejected: deps.onDelegationRejected,
     });
 
     const sql = createSql(session, transport);

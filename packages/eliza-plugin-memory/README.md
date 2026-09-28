@@ -159,8 +159,9 @@ re-pointed — DID match is exact), (3) swap `TINYCLOUD_AGENT_KEY_FILE` and
 expires unused; revoke it upstream if you need immediate cutoff (revocation is upstream,
 not in this plugin).
 
-**Delegation expiry & re-mint cadence.** A delegation carries a fixed expiry (observed
-~7 days), capped by the parent sign-in window (child expiry ≤ parent). It **cannot** be
+**Delegation expiry & re-mint cadence.** A delegation carries a fixed expiry (tinychat
+mints 30-day agent delegations; the service accepts up to 30 days), capped by the parent
+sign-in window (child expiry ≤ parent). It **cannot** be
 extended by re-running activation — re-minting requires the user to sign a fresh
 delegation (consent runbook). Plan a re-mint cadence shorter than the expiry. After
 expiry the service rejects at startup with the `Expired` reason above (fail-open: memory

@@ -13,10 +13,17 @@
 import { afterAll, beforeEach, expect, mock, test } from "bun:test";
 import type { PortableDelegation } from "@tinycloud/node-sdk";
 import * as realNodeSdk from "@tinycloud/node-sdk";
-import { resolveDelegationConfig } from "./config.ts";
+import {
+  AGENT_ACTIVATION_NODE_OPTIONS,
+  AGENT_SESSION_EXPIRATION_MS,
+  resolveConfig,
+  resolveDelegationConfig,
+} from "./config.ts";
 
 // Records the order of SDK method calls across an activation.
 let calls: string[] = [];
+// Constructor configs seen by the fake node (asserts the options each site passes).
+let constructed: Array<Record<string, unknown>> = [];
 // Sentinel access object returned by the mocked useDelegation.
 const SENTINEL_ACCESS = {
   spaceId: "tinycloud:pkh:eip155:1:0xowner:default",
@@ -28,6 +35,9 @@ const SENTINEL_ACCESS = {
 // from the module need to be preserved (TinyCloudNode is the only one it uses
 // at runtime; deserializeDelegation is referenced but not exercised here).
 class FakeTinyCloudNode {
+  constructor(config: Record<string, unknown>) {
+    constructed.push(config);
+  }
   signIn = mock(async () => {
     calls.push("signIn");
     return { session: "fake-siwe-session" };
@@ -53,6 +63,7 @@ afterAll(() => {
 
 beforeEach(() => {
   calls = [];
+  constructed = [];
 });
 
 const AGENT_KEY = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -92,4 +103,27 @@ test("defaultActivate calls signIn() BEFORE useDelegation() (node-sdk 2.3.0 wall
 
   // Returned access is the sentinel produced by useDelegation.
   expect(access).toBe(SENTINEL_ACCESS as never);
+});
+
+test("defaultActivate builds its node with 30-day sessions and no account bootstrap", async () => {
+  const { defaultActivate } = await import("./delegated-transport.ts");
+  const config = resolveDelegationConfig({
+    mode: "delegation",
+    serializedDelegation: "fake-serialized-delegation",
+    agentKey: AGENT_KEY,
+  });
+  await defaultActivate(config, fakeDelegation(), { did: "did:pkh:eip155:1:0xfakeagent", normalizedKey: AGENT_KEY });
+  expect(constructed).toHaveLength(1);
+  expect(constructed[0]).toMatchObject({
+    sessionExpirationMs: AGENT_SESSION_EXPIRATION_MS,
+    autoBootstrapAccount: false,
+  });
+  expect(AGENT_ACTIVATION_NODE_OPTIONS.sessionExpirationMs).toBe(30 * 24 * 60 * 60 * 1000);
+});
+
+test("NodeSdkTransport builds its node with 30-day sessions", async () => {
+  const { NodeSdkTransport } = await import("./node-sdk-transport.ts");
+  new NodeSdkTransport(resolveConfig({ privateKey: `0x${AGENT_KEY}` }));
+  expect(constructed).toHaveLength(1);
+  expect(constructed[0]).toMatchObject({ sessionExpirationMs: AGENT_SESSION_EXPIRATION_MS, autoCreateSpace: true });
 });

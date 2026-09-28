@@ -47,13 +47,30 @@ keeps TinyChat's version-2 meeting controller unavailable. Health alone does not
 establish contract compatibility or deployment provenance.
 
 The transcript transport propagates SQL/KV abort signals and deadline cancellation
-through the pinned SDK 2.6.0. It caps retained decoded input at 1 MiB before the
+through the pinned SDK 2.11.0. It caps retained decoded input at 1 MiB before the
 SDK buffers or parses KV, SQL and error bodies, cancelling streams that exceed
 the limit. Native fetch has already allocated the crossing chunk; native queues,
 decompression and later bounded decoding/parsing copies remain outside this
 buffer bound. No process-memory ceiling or deployed memory acceptance is
 established. Verify memory behavior and latency in the target environment before
-enabling the new controller; no SDK upgrade is bundled here.
+enabling the new controller.
+
+### Sessions and delegation lifetime (node-sdk 2.11.0)
+
+- The agent's TinyCloud sessions request a 30-day lifetime
+  (`AGENT_SESSION_EXPIRATION_MS`). Delegated child sessions from `useDelegation`
+  are still capped at 1 hour by the SDK and by the user's delegation expiry, so
+  the service keeps re-activating every ~50 minutes.
+- Incoming transcript grants are accepted up to 30 days (tinychat's agent
+  delegation lifetime). Memory grants have no service-side ceiling.
+- When a stored user delegation expires, the session stops its proactive refresh,
+  logs `stored delegation rejected; stopping proactive refresh` once, and reports
+  `delegation_expired` so the user is asked to reconnect. Transient failures keep
+  retrying with the existing `proactive re-signIn failed` warning.
+- Activation nodes run with `autoBootstrapAccount: false` (~2-4s signIn on the TEE
+  node, compared with ~20s and a one-time ~55s bootstrap "repair" otherwise).
+- Live check with throwaway keys (no production secrets):
+  `TINYCLOUD_LIVE=1 bun --bun run scripts/live-session-probe.ts`.
 
 ## 2. Push to GHCR
 

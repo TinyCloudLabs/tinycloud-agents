@@ -1,6 +1,6 @@
 import type { IAgentRuntime } from "@elizaos/core";
 import { TinyCloudNode } from "@tinycloud/node-sdk";
-import { agentIdentityFromFile, DelegatedTransport, resolveDelegationConfig, type DelegatedActivateFn } from "@tinycloud/agent-client";
+import { AGENT_ACTIVATION_NODE_OPTIONS, agentIdentityFromFile, DelegatedTransport, resolveDelegationConfig, type DelegatedActivateFn } from "@tinycloud/agent-client";
 import { MEMORY_DB_HANDLE, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
 import { TINYCHAT_AGENT_ID } from "./auth/app-registry.js";
 import { webSearchPlugin } from "./actions/web-search.js";
@@ -74,7 +74,10 @@ export async function createLocalValidationHost(config: {
                 assertCurrent();
                 return access;
               }
-              const node = new TinyCloudNode({ privateKey: agent.normalizedKey, host: resolved.host, autoCreateSpace: false });
+              const node = new TinyCloudNode({
+                privateKey: agent.normalizedKey, host: resolved.host, autoCreateSpace: false,
+                ...AGENT_ACTIVATION_NODE_OPTIONS,
+              });
               disableLocalAccountWrites(node);
               await node.signIn();
               assertCurrent();

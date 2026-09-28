@@ -107,7 +107,7 @@ export async function handlePostSessions(
         agentDID: host.agentDid,
         policy: defaultTinychatTranscriptPolicy(),
       });
-      // The 7-day ceiling is read from the SIGNED `exp` claim when the UCAN
+      // The 30-day ceiling is read from the SIGNED `exp` claim when the UCAN
       // carries one; the top-level `expiry` summary is unsigned and forgeable,
       // so a short summary must not launder a long-lived signed grant.
       if (!withinTranscriptExpiryCeiling(serializedTranscriptDelegation, transcriptDelegation)) {
@@ -296,10 +296,11 @@ function transcriptErrorCode(error: DelegationPolicyError): string {
   }
 }
 
-const MAX_TRANSCRIPT_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
+/** tinychat mints its agent delegations for 30 days; allow up to that. */
+const MAX_TRANSCRIPT_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
- * Enforce the transcript grant's 7-day ceiling against the signed UCAN `exp`
+ * Enforce the transcript grant's 30-day ceiling against the signed UCAN `exp`
  * claim, falling back to the (already policy-validated) top-level expiry only
  * when the token carries no `exp`. Never throws and never echoes token bytes.
  */

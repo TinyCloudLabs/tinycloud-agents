@@ -7,7 +7,7 @@
 //
 // The single injected boundary is the delegated-node client itself (the SDK call
 // that would otherwise require a live node). Everything above it — signed-att
-// normalization, exact policy validation, the 7-day ceiling, the fixed SQL
+// normalization, exact policy validation, the 30-day ceiling, the fixed SQL
 // statement, and the fixed KV key — is the real implementation.
 
 import { describe, expect, setSystemTime, test } from "bun:test";
@@ -403,9 +403,9 @@ describe("transcript grant validation happens before activation", () => {
       transcriptGrant({ att: transcriptAtt(OWNER_A, { [`${space(OWNER_A)}/kv/`]: ["tinycloud.kv/get"] }) })],
     ["the wrong delegatee", "wrong_delegatee", () => transcriptGrant({ delegateDID: OTHER_DID })],
     ["an owner different from the memory grant", "wrong_delegator", () => transcriptGrant({ owner: OWNER_B })],
-    ["a signed expiry beyond seven days", "delegation_expiry_too_long", () =>
-      transcriptGrant({ expiryMs: 60 * 60 * 1000, signedExpiryMs: 8 * DAY_MS })],
-    ["a summary expiry beyond seven days", "delegation_expiry_too_long", () => transcriptGrant({ expiryMs: 8 * DAY_MS })],
+    ["a signed expiry beyond thirty days", "delegation_expiry_too_long", () =>
+      transcriptGrant({ expiryMs: 60 * 60 * 1000, signedExpiryMs: 31 * DAY_MS })],
+    ["a summary expiry beyond thirty days", "delegation_expiry_too_long", () => transcriptGrant({ expiryMs: 31 * DAY_MS })],
   ];
 
   for (const [label, code, build] of cases) {
@@ -491,13 +491,13 @@ describe("per-entity isolation, expiry, and revocation", () => {
       .rejects.toMatchObject({ code: "delegation_required" });
   });
 
-  test("a seven-day transcript grant supports the registered tool after eight idle hours", async () => {
+  test("a thirty-day transcript grant (tinychat's agent delegation lifetime) supports the registered tool after eight idle hours", async () => {
     setSystemTime(new Date("2030-01-01T00:00:00Z"));
     try {
       const { host, store, runtime, registry, trace, memoryCalls } = makeSlice();
       const posted = await handlePostSessions({
         agentId: AGENT_ID, entityId: "entity-a",
-        session: { version: 2, delegations: { memory: memoryGrant(), transcripts: transcriptGrant({ expiryMs: 7 * DAY_MS }) } },
+        session: { version: 2, delegations: { memory: memoryGrant(), transcripts: transcriptGrant({ expiryMs: 30 * DAY_MS }) } },
       }, host, store);
       expect(posted.status).toBe(200);
       expect(trace.signIns).toBe(1);
