@@ -18,5 +18,5 @@
       "@tinycloud/eliza-plugin-memory": ["packages/eliza-plugin-memory/dist/index"]
     }
   },
-  "include": ["live-smoke.ts"]
+  "include": ["live-smoke.ts", "live-session-probe.ts"]
 }

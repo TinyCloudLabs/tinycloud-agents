@@ -24,6 +24,31 @@ export const DEFAULT_BREAKER_THRESHOLD = 5;
 /** How long the breaker stays open once tripped (plan §5 invariant 4). */
 export const DEFAULT_BREAKER_OPEN_MS = 120_000;
 
+/**
+ * Lifetime requested for every TinyCloud session the agent signs in with
+ * (`TinyCloudNode` `sessionExpirationMs`): 30 days. The node-sdk default is 7 days
+ * (sdk-core `EXPIRY.SESSION_MS`). Delegated child sessions created by
+ * `useDelegation` are still bounded by the SDK (1h in node-sdk 2.11.0) and by the
+ * user delegation's own expiry, so this never outlives the user's grant.
+ */
+export const AGENT_SESSION_EXPIRATION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * `TinyCloudNode` options for the agent's delegation-ACTIVATION nodes (a fresh
+ * wallet session whose only job is `useDelegation` on a user's grant).
+ *
+ * `autoBootstrapAccount: false`: node-sdk >=2.7 runs first-account bootstrap on
+ * signIn. On prod it fails on the first signIn and "repairs" on the next (~55s
+ * measured on tee.node, 2026-09-28), then costs ~5s per signIn; with it off a
+ * signIn is ~2-4s. The agent never needs account-registry/encryption bootstrap to
+ * activate a user delegation, and under node-sdk 2.6.0 that bootstrap always
+ * failed, so this preserves the deployed behavior.
+ */
+export const AGENT_ACTIVATION_NODE_OPTIONS = {
+  sessionExpirationMs: AGENT_SESSION_EXPIRATION_MS,
+  autoBootstrapAccount: false,
+} as const;
+
 /** Proactive re-signIn cadence — sessions last ~1h, refresh at ~50min (plan §3 lifecycle). */
 export const DEFAULT_RE_SIGN_IN_MS = 50 * 60_000;
 

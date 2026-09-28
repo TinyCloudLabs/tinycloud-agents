@@ -59,7 +59,7 @@ export {
   NoDelegationError,
   DelegationExpiredError,
 } from "./entity-registry";
-export type { EntityClientRegistryDeps } from "./entity-registry";
+export type { EntityClientHooks, EntityClientRegistryDeps } from "./entity-registry";
 
 export { WriteLane, WriteLaneOverflowError, writeLane, runWrite } from "./write-lane";
 export type { WriteLaneOptions } from "./write-lane";

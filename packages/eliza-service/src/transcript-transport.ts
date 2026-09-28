@@ -1,5 +1,6 @@
 import { KVService, NodeWasmBindings, SQLService, ServiceContext, TinyCloudNode } from "@tinycloud/node-sdk";
 import type { DelegatedAccess, FetchFunction, IWasmBindings, PortableDelegation } from "@tinycloud/node-sdk";
+import { AGENT_ACTIVATION_NODE_OPTIONS } from "@tinycloud/agent-client";
 import { disableLocalAccountWrites } from "./local-validation-node.js";
 
 export const TRANSCRIPT_RESPONSE_BYTE_LIMIT = 1_048_576;
@@ -9,6 +10,7 @@ export type TranscriptFetch = (url: string, init?: Parameters<FetchFunction>[1])
 export function createTranscriptNode(args: { privateKey: string; host: string; localValidation?: boolean }) {
   const bindings = new NodeWasmBindings();
   const node = new TinyCloudNode({ privateKey: args.privateKey, host: args.host, wasmBindings: bindings,
+    ...AGENT_ACTIVATION_NODE_OPTIONS,
     ...(args.localValidation ? { autoCreateSpace: false } : {}),
   });
   if (args.localValidation) disableLocalAccountWrites(node);
@@ -24,7 +26,7 @@ export function createTranscriptNode(args: { privateKey: string; host: string; l
 /**
  * Reuse the public activated-session export and the same WASM bindings used by
  * TinyCloudNode. These are precisely the inputs DelegatedAccess gives its SDK
- * services in 2.6.0. Never substitute the portable parent or node's own session.
+ * services in 2.6.0 and 2.11.0. Never substitute the portable parent or node's own session.
  */
 export function createTranscriptServices(
   access: Pick<DelegatedAccess, "restorable" | "path" | "delegation">,

@@ -9,7 +9,7 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { DelegationPolicyError } from "@tinycloud/agent-client";
+import { DelegationPolicyError, DelegationShapeError } from "@tinycloud/agent-client";
 import type { AgentClient, QueryData } from "@tinycloud/agent-client";
 
 function makeMinimalClient(id: string, opts: { stopFn?: () => Promise<void> } = {}): AgentClient {
@@ -31,6 +31,7 @@ import {
   DelegationExpiredError,
   EntityClientRegistry,
   NoDelegationError,
+  type EntityClientHooks,
 } from "./entity-registry";
 
 // ── minimal fake client ───────────────────────────────────────────────────────
@@ -425,6 +426,59 @@ describe("EntityClientRegistry — T3 delegation build", () => {
 
     expect(caught).toBeInstanceOf(DelegationExpiredError);
     expect(caught?.entityId).toBe("entity-exp");
+  });
+
+  test("expired DelegationShapeError on signIn also surfaces DelegationExpiredError", async () => {
+    const badClient = {
+      ...makeDelegationClient("shape"),
+      signIn: async () => {
+        throw new DelegationShapeError("delegation has expired: check expiry", { expired: true });
+      },
+    };
+    const registry = new EntityClientRegistry({ createClient: () => badClient, runWrite: async (fn) => fn() });
+    await expect(registry.registerDelegation("entityShape", "serialized-shape")).rejects.toBeInstanceOf(DelegationExpiredError);
+  });
+
+  test("a later session rejection of the stored delegation marks the entry expired (reconnect prompt)", async () => {
+    const clients: Array<{ client: TrackedClient; hooks?: EntityClientHooks }> = [];
+    const registry = new EntityClientRegistry({
+      createClient: (_config, hooks) => {
+        const client = makeDelegationClient(`c${clients.length}`);
+        clients.push({ client, hooks });
+        return client;
+      },
+      runWrite: async (fn) => fn(),
+    });
+    await registry.registerDelegation("entityIdle", "serialized-idle", "room-idle");
+    await registry.registerDelegation("entityOther", "serialized-other");
+    expect(registry.hasDelegation("entityIdle")).toBe(true);
+    expect(clients[0].hooks?.onDelegationRejected).toBeInstanceOf(Function);
+
+    // The idle entity's session later finds its stored delegation expired.
+    clients[0].hooks!.onDelegationRejected!(new DelegationShapeError("delegation has expired: check expiry", { expired: true }));
+
+    expect(registry.hasDelegation("entityIdle")).toBe(false);
+    expect(() => registry.clientFor("entityIdle")).toThrow(DelegationExpiredError);
+    // Other entities are unaffected.
+    expect(registry.hasDelegation("entityOther")).toBe(true);
+    expect(registry.clientFor("entityOther")).toBe(clients[1].client);
+  });
+
+  test("a rejection from a replaced (stale) client does not mark the new entry", async () => {
+    const clients: Array<{ client: TrackedClient; hooks?: EntityClientHooks }> = [];
+    const registry = new EntityClientRegistry({
+      createClient: (_config, hooks) => {
+        const client = makeDelegationClient(`c${clients.length}`);
+        clients.push({ client, hooks });
+        return client;
+      },
+      runWrite: async (fn) => fn(),
+    });
+    await registry.registerDelegation("entityR", "grant-old");
+    await registry.registerDelegation("entityR", "grant-new");
+    clients[0].hooks!.onDelegationRejected!(new DelegationPolicyError("expired", "EXPIRED"));
+    expect(registry.hasDelegation("entityR")).toBe(true);
+    expect(registry.clientFor("entityR")).toBe(clients[1].client);
   });
 
   test("concurrent registerDelegation calls for the same entity deduplicate", async () => {

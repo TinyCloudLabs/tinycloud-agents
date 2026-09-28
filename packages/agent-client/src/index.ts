@@ -21,6 +21,8 @@ export {
   DEFAULT_BREAKER_THRESHOLD,
   DEFAULT_BREAKER_OPEN_MS,
   DEFAULT_RE_SIGN_IN_MS,
+  AGENT_SESSION_EXPIRATION_MS,
+  AGENT_ACTIVATION_NODE_OPTIONS,
   resolveConfig,
   resolveDelegationConfig,
 } from "./config";
@@ -60,7 +62,12 @@ export type {
 export { NodeSdkTransport } from "./node-sdk-transport";
 export { DelegatedTransport } from "./delegated-transport";
 export type { DelegatedSqlAccess, DelegatedTransportDeps, DelegatedActivateFn } from "./delegated-transport";
-export { validateDelegationShape, DelegationShapeError } from "./delegation-validate";
+export {
+  validateDelegationShape,
+  DelegationShapeError,
+  isDelegationRejection,
+  isDelegationExpiredError,
+} from "./delegation-validate";
 
 export { Worker, realClock } from "./worker";
 export type {

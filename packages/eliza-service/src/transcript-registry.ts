@@ -12,7 +12,7 @@ import { createTranscriptNode, TranscriptResponseLimitError } from "./transcript
 
 const SQL_PATH = "xyz.tinycloud.tinychat/connectors";
 const MAX_ENTRIES = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_MAX_CLIENTS) || 256;
-// node-sdk 2.6.0 activates a child session lasting at most one hour, even when
+// node-sdk (2.6.0 and 2.11.0) activates a child session lasting at most one hour, even when
 // its portable parent is valid for days. Renew on the next read before expiry.
 const SESSION_REFRESH_MS = 50 * 60 * 1000;
 /** Bounded discovery: one row over the policy ceiling is the overflow sentinel. */
@@ -252,7 +252,7 @@ function decodeMetadata(row: unknown): TranscriptMetadata | null {
     ...(Object.keys(known).length ? { metadata: known } : {}),
   };
 }
-/** Pinned SDK 2.6.0 preserves HTTP error details, but KV_NOT_FOUND alone is ambiguous. */
+/** Pinned SDK (2.11.0; wrapError unchanged since 2.6.0) preserves HTTP error details, but KV_NOT_FOUND alone is ambiguous. */
 export function classifyBodyFailure(error: unknown): BodyResult {
   const value = error && typeof error === "object" ? error as Record<string, unknown> : {};
   // Pinned SDK wrapError preserves thrown adapter errors in `cause`.

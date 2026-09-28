@@ -16,7 +16,7 @@ import { readFileSync } from "node:fs";
 import type { IDatabaseHandle, PortableDelegation } from "@tinycloud/node-sdk";
 import { TinyCloudNode } from "@tinycloud/node-sdk";
 import { agentIdentityFromFile, agentIdentityFromKey, type AgentIdentity } from "./agent-identity";
-import type { ResolvedDelegationConfig } from "./config";
+import { AGENT_ACTIVATION_NODE_OPTIONS, type ResolvedDelegationConfig } from "./config";
 import { AuthError, DelegationPolicyError } from "./errors";
 import {
   defaultElizaMemoryPolicy,
@@ -116,7 +116,11 @@ export const defaultActivate: DelegatedActivateFn = async (
   // without a prior signIn() it throws "Not signed in. Call signIn() first."
   // signIn() establishes that session; useDelegation then builds the delegated
   // sub-session (user → agent) scoped to the delegation's SQL abilities.
-  const node = new TinyCloudNode({ privateKey: normalizedKey, host: config.host });
+  const node = new TinyCloudNode({
+    privateKey: normalizedKey,
+    host: config.host,
+    ...AGENT_ACTIVATION_NODE_OPTIONS,
+  });
   await node.signIn();
   const access = await node.useDelegation(delegation);
   return access as unknown as DelegatedSqlAccess;

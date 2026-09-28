@@ -64,7 +64,8 @@ export async function adapterExecute(
   const result = await handle.execute(sql, params);
   return mapResult(result, (data) => ({
     changes: data.changes,
-    lastInsertRowId: data.lastInsertRowId,
+    // node-sdk >=2.7 types this as `number | null`; keep ExecuteData's `undefined`.
+    lastInsertRowId: data.lastInsertRowId ?? undefined,
   }));
 }
 
@@ -77,7 +78,7 @@ export async function adapterBatch(
   return mapResult(result, (data) => ({
     results: data.results.map((r) => ({
       changes: r.changes,
-      lastInsertRowId: r.lastInsertRowId,
+      lastInsertRowId: r.lastInsertRowId ?? undefined,
     })),
   }));
 }

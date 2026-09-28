@@ -6,8 +6,8 @@
 //
 // T1 test seam preserved: inject pre-built clients via deps.clients.
 
-import { createAgentClient, DelegationPolicyError, deserializeDelegationSafe } from "@tinycloud/agent-client";
-import type { AgentClient, DelegationAgentClientConfig } from "@tinycloud/agent-client";
+import { createAgentClient, deserializeDelegationSafe, isDelegationExpiredError } from "@tinycloud/agent-client";
+import type { AgentClient, AgentClientDeps, DelegationAgentClientConfig } from "@tinycloud/agent-client";
 
 import { MEMORY_DB_HANDLE, MEMORY_SCHEMA } from "./schema";
 import { runWrite as processRunWrite } from "./write-lane";
@@ -23,8 +23,9 @@ export class NoDelegationError extends Error {
 }
 
 /**
- * Thrown when signIn signals EXPIRED (DelegationPolicyError reason="EXPIRED")
- * or when a client's idle TTL lapses in clientFor.
+ * Thrown when signIn signals the delegation expired (DelegationPolicyError
+ * reason="EXPIRED" or an expired DelegationShapeError), when the client's session
+ * later rejects its stored delegation, or when a client's idle TTL lapses in clientFor.
  */
 export class DelegationExpiredError extends Error {
   readonly entityId: string;
@@ -46,7 +47,12 @@ interface RegistryEntry {
   delegationExpiry?: Date;
   isCurrent?: () => boolean;
   canUse?: () => boolean;
+  /** Set when the client's session permanently rejected its stored delegation. */
+  rejected?: boolean;
 }
+
+/** Hooks the registry passes to each client it builds. */
+export type EntityClientHooks = Pick<AgentClientDeps, "onDelegationRejected">;
 
 /**
  * Constructor deps.
@@ -68,7 +74,7 @@ export interface EntityClientRegistryDeps {
    * Default: createAgentClient from @tinycloud/agent-client.
    * Tests inject a mock here to avoid live node I/O.
    */
-  createClient?: (config: DelegationAgentClientConfig) => AgentClient;
+  createClient?: (config: DelegationAgentClientConfig, hooks?: EntityClientHooks) => AgentClient;
   /**
    * Write lane for routing ensureSchema writes.
    * Default: the process-wide runWrite from write-lane.ts.
@@ -118,7 +124,7 @@ const DEFAULT_TTL_MS = Number(process.env.ELIZA_REGISTRY_TTL_MS) || 4 * 60 * 60 
 export class EntityClientRegistry {
   private readonly entries: Map<string, RegistryEntry>;
   private readonly roomToEntity: Map<string, string>;
-  private readonly createClientFn: (config: DelegationAgentClientConfig) => AgentClient;
+  private readonly createClientFn: (config: DelegationAgentClientConfig, hooks?: EntityClientHooks) => AgentClient;
   private readonly runWriteFn: <T>(fn: () => Promise<T>) => Promise<T>;
   private readonly agentKey?: string;
   private readonly agentKeyFile?: string;
@@ -147,7 +153,7 @@ export class EntityClientRegistry {
           "(test-only seam). Supplying runWrite alone bypasses the process-wide write lane.",
       );
     }
-    this.createClientFn = deps.createClient ?? ((config) => createAgentClient(config));
+    this.createClientFn = deps.createClient ?? ((config, hooks) => createAgentClient(config, hooks));
     this.runWriteFn = deps.runWrite ?? processRunWrite;
     this.agentKey = deps.agentKey;
     this.agentKeyFile = deps.agentKeyFile;
@@ -243,7 +249,8 @@ export class EntityClientRegistry {
     }
 
     // Check signed delegation expiry first — enables re-mint UX trigger (build-plan §7).
-    if (entry.delegationExpiry !== undefined && Date.now() >= entry.delegationExpiry.getTime()) {
+    // A session that rejected its stored delegation is treated the same way.
+    if (entry.rejected || (entry.delegationExpiry !== undefined && Date.now() >= entry.delegationExpiry.getTime())) {
       void this._evict(entityId);
       throw new DelegationExpiredError(entityId);
     }
@@ -296,7 +303,7 @@ export class EntityClientRegistry {
 
   hasDelegation(entityId: string): boolean {
     const entry = this.entries.get(entityId);
-    return !!entry && entry.isCurrent?.() !== false &&
+    return !!entry && entry.isCurrent?.() !== false && !entry.rejected &&
       (!entry.delegationExpiry || Date.now() < entry.delegationExpiry.getTime()) &&
       Date.now() - entry.lastUsed <= this.ttlMs;
   }
@@ -352,7 +359,15 @@ export class EntityClientRegistry {
       agentKeyFile: this.agentKeyFile,
     };
 
-    const client = this.createClientFn(config);
+    // If the client's session later rejects the stored delegation (e.g. it expired
+    // while idle), mark this entry so the next access reports delegation_expired
+    // and hasDelegation() is false — the user is prompted to reconnect.
+    const client = this.createClientFn(config, {
+      onDelegationRejected: () => {
+        const entry = this.entries.get(entityId);
+        if (entry?.client === client) entry.rejected = true;
+      },
+    });
     onClient(client);
     try {
       await client.signIn();
@@ -400,5 +415,5 @@ export class EntityClientRegistry {
 }
 
 function isExpiredError(err: unknown): boolean {
-  return err instanceof DelegationPolicyError && err.reason === "EXPIRED";
+  return isDelegationExpiredError(err);
 }
