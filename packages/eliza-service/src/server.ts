@@ -1,14 +1,15 @@
-import { mapDelegationError } from "./errors.js";
+import { mapDelegationError, type DelegationErrorCode } from "./errors.js";
 import { handlePostMessages, type MessageHandlerHost, type PostMessagesBody } from "./handlers/messages.js";
 import {
   handleGetSessions,
   handleDeleteSessions,
   handlePostSessions,
+  storedGrantExpired,
   type PostSessionsBody,
   type SessionHandlerHost,
 } from "./handlers/sessions.js";
 import { handlePostTool, isToolAllowedForApp, type PostToolBody } from "./handlers/tools.js";
-import type { SessionStore, SessionLease } from "./session-store.js";
+import type { SessionStore, SessionLease, SessionScope } from "./session-store.js";
 import { TINYCHAT_APP_ID } from "./auth/app-registry.js";
 import { checkServiceAuth } from "./auth/service-auth.js";
 import { defaultRateLimiter } from "./rate-limit.js";
@@ -144,7 +145,9 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
         }
 
         const lease = auth.resolved.appId === TINYCHAT_APP_ID ? opts.sessions.lease(auth.resolved, messagesBody.entityId) : undefined;
-        if (lease && (!lease.active || !lease.isActive() || !opts.host.privateAccessAvailable?.(auth.resolved.agentId, messagesBody.entityId))) return json(409, { error: "delegation_required" });
+        if (lease && (!lease.active || !lease.isActive() || !opts.host.privateAccessAvailable?.(auth.resolved.agentId, messagesBody.entityId))) {
+          return json(409, { error: privateAccessDenial(opts, auth.resolved, messagesBody.entityId, lease) });
+        }
         const key = JSON.stringify([auth.resolved.appId, auth.resolved.agentId, messagesBody.entityId]);
         const controller = new AbortController();
         const controllers = messages.get(key) ?? new Set<AbortController>();
@@ -187,7 +190,13 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
         const lease = auth.resolved.appId === TINYCHAT_APP_ID ? opts.sessions.lease(auth.resolved, toolBody.entityId ?? "") : undefined;
         const access = lease ? { isCurrent: lease.isCurrent, isActive: () => lease.active && lease.isActive() && opts.host.privateAccessAvailable?.(auth.resolved.agentId, toolBody.entityId ?? "") === true && (toolBody.accessRevision === undefined || toolBody.accessRevision === lease.revision) } : undefined;
         const result = await handlePostTool(toolName, auth.resolved.agentId, parsed.value, opts.host, { signal: request.signal, access });
-        if (access && (!access.isCurrent() || toolName.toLowerCase() !== "web_search" && !access.isActive())) return json(409, { error: "delegation_required" });
+        if (lease && access && (!access.isCurrent() || toolName.toLowerCase() !== "web_search" && !access.isActive())) {
+          // Never publish across the fence. While the revision this request ran
+          // under is still current, report the specific grant failure it observed
+          // (or the stored grant's expiry) instead of a generic delegation_required.
+          const observed = result.status === 409 && SPECIFIC_DELEGATION_ERRORS.has(String(result.body.error)) ? String(result.body.error) : undefined;
+          return json(409, { error: access.isCurrent() && observed ? observed : privateAccessDenial(opts, auth.resolved, toolBody.entityId ?? "", lease, toolBody.accessRevision) });
+        }
         return json(result.status, result.body);
       }
 
@@ -199,6 +208,21 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
       return json(500, { error: "internal_error" });
     }
   };
+}
+
+/** Grant failures a tool can observe; both mean "reconnect", never "retry". */
+const SPECIFIC_DELEGATION_ERRORS = new Set(["delegation_expired", "delegation_revoked"]);
+
+/**
+ * Stable code for a denied TinyChat private request. Fencing outcomes (replaced,
+ * disconnected, activating, or stale caller revision) stay delegation_required;
+ * a current, active session whose stored signed grant lapsed reports
+ * delegation_expired. Purely explanatory: callers have already denied access.
+ */
+function privateAccessDenial(opts: ElizaServiceOptions, scope: SessionScope, entityId: string, lease: SessionLease, accessRevision?: string): DelegationErrorCode {
+  if (!lease.active || !lease.isActive() || (accessRevision !== undefined && accessRevision !== lease.revision)) return "delegation_required";
+  const record = opts.sessions.snapshot(scope, entityId).record;
+  return record && storedGrantExpired(record, opts.host.agentDid) ? "delegation_expired" : "delegation_required";
 }
 
 async function runMessagePreflight(
