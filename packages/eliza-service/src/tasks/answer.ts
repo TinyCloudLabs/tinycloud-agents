@@ -52,9 +52,11 @@ export function buildSynthesisMessages(input: {
       "Do not infer decisions, assigned actions or owners from evidence that does not state them. Preserve explicit test or synthetic designations when the evidence states them; never infer them from a title. " +
       "Recorded actions establish assignments or plans only; never claim completion unless retained evidence explicitly states it. " +
       "Public facts cite their actual returned URL beside the claim. Public sources cannot replace unread or denied private facts. Keep meeting labels and public URLs distinct. " +
-      "Stored overviews and excerpts do not establish full transcript coverage. Leave coverage counts/statuses to the deterministic section appended by the service; do not write your own coverage section or claim all meetings were read or summarized. " +
-      "Citations establish structural provenance, not semantic support for every claim. Say when evidence is insufficient. Never expose storage references, tool objects or grant/session identifiers. " +
-      (input.allowWebSearch && !codes.length ? "You may request web_search for public sources needed to answer the latest question, or answer now if the supplied evidence is sufficient. No private tools are available in this round." : "Do not request another tool call.") },
+      "When a read meeting's body state is not_requested, its evidence is the stored recap (overview, notes or action items) by design; that is the intended source for this request, not a retrieval failure. " +
+      "Say such answers are based on the stored recaps and, when useful, that the user can ask about a specific meeting for transcript detail; never describe them as being unable to get or pull transcripts. " +
+      "Recaps and excerpts do not establish full transcript coverage, so never claim complete or full coverage. Leave coverage counts/statuses to the deterministic section appended by the service; do not write your own coverage section or claim all meetings were read or summarized. " +
+      "Citations establish structural provenance, not semantic support for every claim. Say when evidence is insufficient. Never expose storage references, tool objects or grant/session identifiers, and never describe tool calls, rounds or other internal retrieval steps. " +
+      (input.allowWebSearch && !codes.length ? "You may request web_search for public sources needed to answer the latest question, or answer now if the supplied evidence is sufficient. Do not request private meeting tools." : "Do not request another tool call.") },
     { role: "user", content: `Question: ${input.question}\n\n${scope}Private meeting evidence:\n${input.evidence.serialized}\n\nPublic web sources:\n${JSON.stringify(publicSources(input.publicSources))}${codes.length ? `\n\nProduce a fresh answer correcting these validation codes: ${codes.join(", ")}.` : ""}\n\nAnswer concisely with supplied source citations.` },
   ];
 }
@@ -103,8 +105,13 @@ function coverageConflict(text: string, evidence: PackedMeetingEvidence): boolea
   const usable = evidence.meetings.filter(meeting => meeting.state === "read" && meeting.coverage.support !== "none" && meeting.evidence.some(item => item.kind !== "metadata" && item.text.trim()));
   const read = usable.length;
   const incomplete = read !== evidence.meetings.length || evidence.discoveries.some(({ discovery: d }) => d.scanLimited || d.countKind === "lower_bound" || d.matchedCount > d.returnedCount || d.omittedMeetingRefs.length > 0);
-  const partial = incomplete || evidence.meetings.some(meeting => meeting.body.state !== "present" || meeting.body.partialDecoding || meeting.coverage.support !== "sufficient"
+  // As in finalizeMeetingAnswer, a body that was not requested is a recap-only read, not a partial
+  // one; a recap that did not support the focus is still partial through `support`.
+  const partial = incomplete || evidence.meetings.some(meeting => !["present", "not_requested"].includes(meeting.body.state) || meeting.body.partialDecoding || meeting.coverage.support !== "sufficient"
     || meeting.coverage.omittedEvidenceCount > 0 || meeting.coverage.omissionReasons.length > 0 || meeting.evidence.some(item => item.truncated));
+  // Recaps never establish transcript coverage: full-coverage and exhaustive-decision claims stay
+  // guarded whenever any included body was not read.
+  const transcriptBounded = partial || evidence.meetings.some(meeting => meeting.body.state !== "present");
   const records = "(?:(?:discovered|returned|matching|selected)\\s+)?(?:meetings?(?:\\s+records?)?|records?)";
   const scope = "(?:\\s+(?:for|in|during)\\s+(?:this|the|that)\\s+(?:period|interval|week|month|scan))?";
   const allRead = new RegExp(`\\b(?:read\\s+all\\s+(?:(?:the|\\d+)\\s+)?${records}|all\\s+(?:(?:the|\\d+)\\s+)?${records}${scope}\\s+(?:were\\s+|have\\s+been\\s+)?read)\\b`, "gi");
@@ -120,7 +127,7 @@ function coverageConflict(text: string, evidence: PackedMeetingEvidence): boolea
       const pattern = new RegExp(`\\b${meeting.id}\\b\\]?\\s+(?:was\\s+)?(?:read|summarized)\\b`, "gi");
       if ([...clause.matchAll(pattern)].some(affirmed)) return true;
     }
-    if (!partial) continue;
+    if (!transcriptBounded) continue;
     const completeCoverage = /\b(?:complete|full)\s+(?:(?:transcript|meeting)\s+)?coverage\b|\bcoverage(?:\s+for\s+(?:this|that|the)\s+meeting)?\s+is\s+(?:complete|full)\b/gi;
     if ([...clause.matchAll(completeCoverage)].some(affirmed)) return true;
     const qualified = /\b(?:in|from|within|based on|according to)\s+(?:the\s+)?(?:retained|supplied|available)\s+(?:meeting\s+)?(?:evidence|excerpts?|notes|content)\b/i.test(clause);
@@ -146,7 +153,10 @@ export function buildCoverage(evidence: PackedMeetingEvidence, citedMeetingIds: 
       invalid_json: "Body data could not be decoded", unsupported_shape: "Body format was unsupported", empty: "The returned body was empty",
       size_limit: "Body exceeded the read limit", access_denied: "Body access was denied", unavailable: "Body was unavailable", timeout: "Body read timed out", cancelled: "Body read was cancelled",
     };
-    status += `. ${body[meeting.body.state] ?? "Body state was unavailable"}`;
+    // Recap-only reads are a deliberate choice; describe the source rather than an unread body.
+    const recapOnly = read && usable && meeting.body.state === "not_requested"
+      && !meeting.evidence.some(item => item.kind === "transcript_excerpt" || item.kind === "body_excerpt" || (item.kind === "notes" && item.offsets));
+    status += `. ${recapOnly ? "Based on the stored recap" : body[meeting.body.state] ?? "Body state was unavailable"}`;
     if (meeting.coverage.omittedEvidenceCount > 0 || meeting.coverage.omissionReasons.length > 0 || meeting.evidence.some(item => item.truncated)) status += ". Evidence was omitted or shortened";
     return `- ${meeting.id} — ${status}.`;
   });
@@ -161,7 +171,7 @@ export function buildCoverage(evidence: PackedMeetingEvidence, citedMeetingIds: 
     if (d.omittedMeetingRefs.length) row += ` (${d.omittedMeetingRefs.length} omitted identities reported)`;
     rows.push(`${row}.`);
   }
-  return `### Coverage\n\n${rows.length ? rows.join("\n") : "No meeting identities were returned."}\n\nReads may contain stored overviews or excerpts; they do not establish full transcript coverage.${evidence.discoveries.length > 1 ? " Query counts describe their own scopes and are not added together." : ""}`;
+  return `### Coverage\n\n${rows.length ? rows.join("\n") : "No meeting identities were returned."}\n\nStored recaps and excerpts summarize a meeting rather than reproduce its full transcript; ask about a specific meeting for transcript detail.${evidence.discoveries.length > 1 ? " Query counts describe their own scopes and are not added together." : ""}`;
 }
 
 export function finalizeMeetingAnswer(validation: ValidatedMeetingAnswer, evidence: PackedMeetingEvidence, sources: readonly PublicSource[] = []): BufferedMeetingAnswer {

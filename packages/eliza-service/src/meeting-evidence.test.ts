@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { classifyBodyFailure, createReader } from "./transcript-registry.js";
-import { findMeetings, listMeetingActions, parseFindMeetingsArgs, parseReadMeetingArgs, parseListMeetingActionsArgs, parseTranscriptSearchArgs, readMeeting, searchTranscripts } from "./actions/tinycloud-search-transcripts.js";
+import { findMeetings, listMeetingActions, parseFindMeetingsArgs, parseReadMeetingArgs, parseListMeetingActionsArgs, parseTranscriptSearchArgs, readMeeting, searchTranscripts, TRANSCRIPT_SOURCES } from "./actions/tinycloud-search-transcripts.js";
 import type { TranscriptMetadata, TranscriptReader } from "./actions/tinycloud-search-transcripts.js";
-import { readMeetingEvidence } from "./meeting-evidence.js";
+import { readMeetingEvidence, storedRecap } from "./meeting-evidence.js";
+import { TINYCLOUD_MEETING_TOOLS } from "./tasks/tool-contract.js";
 
 const row: TranscriptMetadata = { meetingRef: "old", source: "fireflies", sourceId: "old-source", title: "Design", startedAt: "2025-01-01T10:00:00Z", organizerEmail: null, participantNames: [], participantEmails: [], summaryOverview: null, summaryActionItems: null };
 function reader(overrides: Partial<TranscriptMetadata> = {}, body: unknown = [{ text: "Beginning. Middle. Final decision: cobalt." }]): TranscriptReader {
@@ -254,5 +255,118 @@ describe("storage classification and scoped discovery", () => {
       expect(result.data.outcomes[0].body.state).toBe(state);
       if (state === "present") expect(result.data.outcomes[0].body.partialDecoding).toBe(true);
     }
+  });
+});
+
+describe("Exo Local meetings", () => {
+  // Row and body exactly as TinyChat's localTranscriber/connectorStore write them (see its
+  // localTranscriber.test.ts): source exo-local, source_id local:<session>, no recap, and a
+  // Fireflies-shaped sentence array with You (mic) / Others (system audio) channel speakers.
+  const sentences = [
+    { index: 0, speaker_name: "You", text: "Hello there. again", start_time: 0, end_time: 3.9 },
+    { index: 1, speaker_name: "Others", text: "Hi back.", start_time: 4.0, end_time: 4.6 },
+  ];
+  const metadata = { capture: "local", transcript_provider: "whispercpp", model: "QuantizedTinyEn", language: "en", transcript_text: "Hello there. again\nHi back.", speaker_labels: "channel-you-others" };
+  function exoLocal() {
+    const db = new Database(":memory:");
+    db.run("CREATE TABLE connector_meeting (id TEXT, source TEXT, source_id TEXT, title TEXT, started_at TEXT, organizer_email TEXT, participants TEXT, summary_overview TEXT, summary_action_items TEXT, metadata TEXT)");
+    db.prepare("INSERT INTO connector_meeting VALUES (?, 'exo-local', 'local:sess-1', 'Local recording Sep 28, 6:00 PM', '2026-09-28T18:00:00.000Z', NULL, ?, NULL, NULL, ?)")
+      .run("0b6f5a52-4f0e-4c55-9d1e-6a3e0c2b7f10", JSON.stringify([{ name: "You", email: null }, { name: "Others", email: null }]), JSON.stringify(metadata));
+    const keys: string[] = []; const params: unknown[] = [];
+    const source = createReader({
+      sql: { db: () => ({ query: async (sql, values) => { params.push(...(values ?? [])); return { ok: true, data: { rows: db.query(sql).values(...(values ?? [])) } }; } }) },
+      kv: { get: async (key, options) => { keys.push(key); return key === "xyz.tinycloud.tinychat/connectors/exo-local/transcript/local:sess-1" && options?.raw
+        ? { ok: true, data: { data: JSON.stringify(sentences) } } : { ok: false, error: { code: "KV_NOT_FOUND", message: "Key not found" } }; } },
+    });
+    return { source, keys, params, close: () => db.close() };
+  }
+  test("discovers TinyChat's Exo Local rows instead of silently dropping them", async () => {
+    const { source, params, close } = exoLocal();
+    try {
+      expect(await source.listMetadata()).toHaveLength(1);
+      const found = await findMeetings(source, { source: "exo-local" });
+      expect(params).toContain("exo-local");
+      expect(found.data.meetings).toEqual([expect.objectContaining({ meetingRef: "0b6f5a52-4f0e-4c55-9d1e-6a3e0c2b7f10", source: "exo-local", participants: ["You", "Others"] })]);
+      // Opaque provider metadata, including the duplicated transcript text, stays out of metadata results.
+      expect(JSON.stringify(found)).not.toContain("transcript_text");
+      expect(JSON.stringify(found)).not.toContain("Hello there");
+    } finally { close(); }
+  });
+  test("reads the You/Others body from the writer's key as an attributed transcript", async () => {
+    const { source, keys, close } = exoLocal();
+    try {
+      const summary = (await readMeeting(source, { meetingRef: "0b6f5a52-4f0e-4c55-9d1e-6a3e0c2b7f10", focus: "summary" })).data.outcomes[0];
+      expect(keys).toEqual(["xyz.tinycloud.tinychat/connectors/exo-local/transcript/local:sess-1"]);
+      expect(summary).toMatchObject({ source: "exo-local", state: "read", body: { state: "present" }, coverage: { bodyAttempted: true, support: "sufficient" } });
+      expect(summary.evidence.map(item => [item.kind, item.speaker, item.startSecs, item.text])).toEqual([
+        ["transcript_excerpt", "You", 0, "Hello there. again"],
+        ["transcript_excerpt", "Others", 4, "Hi back."],
+      ]);
+      const speaker = (await readMeeting(source, { meetingRef: "0b6f5a52-4f0e-4c55-9d1e-6a3e0c2b7f10", focus: "speaker", speaker: "Others" })).data.outcomes[0];
+      expect(speaker.evidence).toEqual([expect.objectContaining({ kind: "transcript_excerpt", speaker: "Others", text: "Hi back." })]);
+      expect(speaker.coverage.support).toBe("sufficient");
+    } finally { close(); }
+  });
+  test("tool arguments and the TinyChat tool contract accept exactly the readable sources", async () => {
+    expect(parseFindMeetingsArgs({ source: "exo-local" })).toEqual({ source: "exo-local" });
+    expect(parseTranscriptSearchArgs({ query: "release", source: "exo-local" })).toMatchObject({ source: "exo-local" });
+    expect(parseListMeetingActionsArgs({ source: "exo-local" })).toEqual({ source: "exo-local" });
+    expect(parseFindMeetingsArgs({ source: "exo-remote" })).toBeNull();
+    for (const tool of TINYCLOUD_MEETING_TOOLS) {
+      const properties = tool.function.parameters.properties as { source?: { enum: readonly string[] } };
+      if (properties.source) expect([...properties.source.enum]).toEqual([...TRANSCRIPT_SOURCES]);
+    }
+    // Unknown stored sources still never form a KV key.
+    const reader = createReader({ sql: { db: () => ({ query: async () => ({ ok: true, data: { rows: [["x", "exo-remote", "local:sess-1"]] } }) }) }, kv: { get: async () => { throw new Error("must not read"); } } });
+    expect(await reader.listMetadata()).toEqual([]);
+    await expect(reader.readBody!("exo-remote" as never, "local:sess-1")).rejects.toMatchObject({ code: "invalid_stored_metadata" });
+  });
+});
+
+describe("placeholder recaps", () => {
+  // Production: a Google Meet notes recap whose Summary section is only Gemini's notice.
+  const gemini = "A summary wasn't produced because there wasn't enough conversation in a supported language.";
+  test.each([
+    "", "   ", "N/A", "None.", "-", "TBD", "Pending", "No summary.", "Not available", "Summary unavailable", "No summary available.",
+    gemini, gemini.replaceAll("'", "’"), "Gemini couldn't create notes because there wasn't enough conversation in a supported language.",
+    "Notes could not be generated.", "The summary has not been generated yet.", "No summary was generated because the meeting was too short.",
+    "There was not enough speech to generate a summary.", "- Summary wasn't produced for this meeting.",
+  ])("%p counts as missing, so a summary reads the body", async (summaryOverview) => {
+    expect(storedRecap(summaryOverview)).toBeNull();
+    let reads = 0;
+    const source = reader({ summaryOverview });
+    source.getTranscript = async () => { reads++; return [{ text: "We chose cobalt for the launch.", speaker_name: "Ava", start_time: 12 }]; };
+    const outcome = (await readMeeting(source, { meetingRef: "old", focus: "summary" })).data.outcomes[0];
+    expect(reads).toBe(1);
+    expect(outcome.coverage.overviewPresent).toBe(false);
+    expect(outcome.evidence.map(item => [item.kind, item.text])).toEqual([["transcript_excerpt", "We chose cobalt for the launch."]]);
+    expect(outcome).toMatchObject({ body: { state: "present" }, coverage: { support: "sufficient" } });
+  });
+  test.each([
+    "Cobalt notes", "Budget approved for Q3.", "Discussed adding Portuguese as a supported language for the app.",
+    "The Q3 summary wasn't produced on time, so Ava will draft it by Friday.",
+    "Team agreed there was not enough discussion of hiring; Ben will schedule a follow-up.",
+    "Notes were taken by Ava; the team approved the launch.", "予算と採用計画を議論した。",
+  ])("real recap %p still answers a summary without a body read", async (summaryOverview) => {
+    expect(storedRecap(summaryOverview)).toBe(summaryOverview);
+    let reads = 0;
+    const source = reader({ summaryOverview });
+    source.getTranscript = async () => { reads++; return null; };
+    const outcome = (await readMeeting(source, { meetingRef: "old", focus: "summary" })).data.outcomes[0];
+    expect(reads).toBe(0);
+    expect(outcome).toMatchObject({ body: { state: "not_requested" }, coverage: { overviewPresent: true, support: "sufficient" } });
+    expect(outcome.evidence).toEqual([expect.objectContaining({ id: "summary", kind: "summary", text: summaryOverview })]);
+  });
+  test("a long recap that quotes a notice is not a placeholder", () => {
+    const recap = `${gemini} ${"The team then reviewed the launch plan and chose cobalt. ".repeat(12)}`;
+    expect(recap.length).toBeGreaterThan(600);
+    expect(storedRecap(recap)).toBe(recap.trim());
+  });
+  test("conference notes with a placeholder summary read the stored meeting transcript", async () => {
+    const source = reader({ source: "google-meet", summaryOverview: gemini, metadata: { notes_kind: "gemini", notes_association: "conference", transcript_count: 1 } },
+      [{ text: "Let's ship on Thursday.", speaker_name: "Sam", start_time: 30 }]);
+    const outcome = (await readMeeting(source, { meetingRef: "old", focus: "summary" })).data.outcomes[0];
+    expect(outcome.evidence).toEqual([expect.objectContaining({ kind: "transcript_excerpt", speaker: "Sam", text: "Let's ship on Thursday." })]);
+    expect(outcome.evidence.some(item => item.text.includes("supported language"))).toBe(false);
   });
 });
