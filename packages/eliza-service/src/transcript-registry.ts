@@ -5,6 +5,7 @@ import {
 } from "@tinycloud/agent-client";
 import type { PortableDelegation } from "@tinycloud/agent-client";
 import { currentPrivateAccess, DelegationExpiredError, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
+import { TRANSCRIPT_SOURCES } from "./actions/tinycloud-search-transcripts.js";
 import type { TranscriptMetadata, TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
 import { checkContext, decodeBody, discoveryResult, MeetingRetrievalError, withinContext } from "./meeting-evidence.js";
 import type { BodyResult, MeetingSelection, RetrievalContext } from "./meeting-evidence.js";
@@ -340,7 +341,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
 }
 
 function isSource(value: unknown): value is TranscriptMetadata["source"] {
-  return value === "fireflies" || value === "google-meet" || value === "tinycloud-transcriber";
+  return (TRANSCRIPT_SOURCES as readonly unknown[]).includes(value);
 }
 
 function safeSegment(value: string): boolean {
