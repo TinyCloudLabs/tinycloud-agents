@@ -131,6 +131,11 @@ function makeSvc(reg: EntityClientRegistry): TinyCloudMemoryStorageService {
   });
 }
 
+/** Serialized grant whose signed expiry the registry reads (signIn is faked). */
+function expiringGrant(expiresInMs: number): string {
+  return JSON.stringify({ expiry: new Date(Date.now() + expiresInMs).toISOString() });
+}
+
 function ltmInput(entityId: string, content = "test-content") {
   return { agentId: AGENT, entityId, category: "semantic", content } as never;
 }
@@ -474,17 +479,17 @@ describe("T6(c): failure isolation — entity A failure never affects entity B",
     await svc.stop();
   });
 
-  test("entity A DelegationExpiredError (TTL) does not break entity B reads", async () => {
+  test("entity A DelegationExpiredError (signed expiry) does not break entity B reads", async () => {
     const clientA = makeFake("A");
     const clientB = makeFake("B");
 
     const reg = new EntityClientRegistry({
       createClient: () => clientA,
       runWrite: async (fn) => fn(),
-      ttlMs: 1, // entity A will expire immediately
     });
 
-    await reg.registerDelegation(ENTITY_A, "ser-A");
+    // Entity A's signed grant lapses 5 ms after registration.
+    await reg.registerDelegation(ENTITY_A, expiringGrant(5));
     // Register entity B via T1 seam (won't go through createClient).
     const reg2 = makeReg([
       [ENTITY_B, clientB],
@@ -492,10 +497,10 @@ describe("T6(c): failure isolation — entity A failure never affects entity B",
 
     const svc = makeSvc(reg2);
 
-    // Wait for TTL to lapse for entity A.
+    // Wait for entity A's signed expiry to pass.
     await new Promise<void>((r) => setTimeout(r, 10));
 
-    // Entity A clientFor throws DelegationExpiredError (TTL eviction).
+    // Entity A clientFor throws DelegationExpiredError (signed expiry).
     expect(() => reg.clientFor(ENTITY_A)).toThrow(DelegationExpiredError);
 
     // Entity B (in a separate registry / service) reads fine.
@@ -787,18 +792,20 @@ describe("T6(e): refresh path — dedupe, expired eviction, no poisoning", () =>
     expect(buildCount).toBe(1); // one attempt, then evicted
   });
 
-  test("idle TTL eviction throws DelegationExpiredError on the next clientFor", async () => {
+  test("idle time does not evict; the signed expiry throws DelegationExpiredError on the next clientFor", async () => {
     const client = makeFake("A");
 
     const reg = new EntityClientRegistry({
       createClient: () => client,
       runWrite: async (fn) => fn(),
-      ttlMs: 1, // expire after 1 ms
+      ttlMs: 1, // deprecated idle TTL: ignored
     });
 
-    await reg.registerDelegation(ENTITY_A, "ser-A");
-    await new Promise<void>((r) => setTimeout(r, 10)); // lapse the TTL
+    await reg.registerDelegation(ENTITY_A, expiringGrant(50));
+    await new Promise<void>((r) => setTimeout(r, 10)); // idle, grant still valid
+    expect(reg.clientFor(ENTITY_A)).toBe(client);
 
+    await new Promise<void>((r) => setTimeout(r, 60)); // signed expiry passes
     expect(() => reg.clientFor(ENTITY_A)).toThrow(DelegationExpiredError);
   });
 
@@ -808,10 +815,9 @@ describe("T6(e): refresh path — dedupe, expired eviction, no poisoning", () =>
     const reg = new EntityClientRegistry({
       createClient: () => client,
       runWrite: async (fn) => fn(),
-      ttlMs: 1,
     });
 
-    await reg.registerDelegation(ENTITY_A, "ser-A");
+    await reg.registerDelegation(ENTITY_A, expiringGrant(5));
     await new Promise<void>((r) => setTimeout(r, 10));
 
     let caught: DelegationExpiredError | undefined;

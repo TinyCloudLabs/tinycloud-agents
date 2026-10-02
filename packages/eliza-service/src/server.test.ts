@@ -8,6 +8,7 @@ import {
 import { SessionStore } from "./session-store.js";
 import { createElizaServiceFetch, startElizaService, type ElizaServiceHost } from "./server.js";
 import { runArtifactSkillAction } from "./actions/run-artifact-skill.js";
+import { MeetingRetrievalError } from "./meeting-evidence.js";
 import { ARTIFACTORY_AGENT_ID, TINYCHAT_AGENT_ID } from "./auth/app-registry.js";
 
 const TEST_SERVICE_SECRET = "server-test-service-secret";
@@ -767,5 +768,32 @@ it("checks the private lease again at the HTTP tool publication boundary", async
   const response = await handler(new Request("http://localhost/tools/tinycloud_read_meeting", { method: "POST", headers: { Authorization: `Bearer ${TEST_SERVICE_SECRET}`, "content-type": "application/json" }, body: JSON.stringify({ entityId: TEST_ENTITY_ID }) }));
   expect(response.status).toBe(409);
   expect(await response.json()).toEqual({ error: "delegation_required" });
+  } finally { if (original === undefined) delete process.env.ELIZA_SERVICE_SECRET; else process.env.ELIZA_SERVICE_SECRET = original; }
+});
+
+it("reports a specific grant failure only while the request's revision is current", async () => {
+  const original = process.env.ELIZA_SERVICE_SECRET;
+  process.env.ELIZA_SERVICE_SECRET = TEST_SERVICE_SECRET;
+  try {
+    const scope = { appId: "tinychat", agentId: TINYCHAT_AGENT_ID };
+    const run = async (replaceDuringTool: boolean) => {
+      const sessions = activeSessions();
+      let available = true;
+      const host = makeToolHost({ name: "TINYCLOUD_READ_MEETING" });
+      host.runtimeFor = async () => ({ actions: [{ name: "TINYCLOUD_READ_MEETING", handler: async () => {
+        available = false; // the node rejected the grant; the registry dropped it
+        if (replaceDuringTool) sessions.reserve(scope, TEST_ENTITY_ID); // a new Connect started
+        throw new MeetingRetrievalError("delegation_revoked", 409);
+      } }] }) as unknown as IAgentRuntime;
+      host.privateAccessAvailable = () => available;
+      const response = await createElizaServiceFetch({ sessions, host })(new Request("http://localhost/tools/tinycloud_read_meeting", {
+        method: "POST", headers: { Authorization: `Bearer ${TEST_SERVICE_SECRET}`, "content-type": "application/json" },
+        body: JSON.stringify({ entityId: TEST_ENTITY_ID }),
+      }));
+      return { status: response.status, body: await response.json() };
+    };
+    expect(await run(false)).toEqual({ status: 409, body: { error: "delegation_revoked" } });
+    // The revision fence wins: a replaced session reports the generic code.
+    expect(await run(true)).toEqual({ status: 409, body: { error: "delegation_required" } });
   } finally { if (original === undefined) delete process.env.ELIZA_SERVICE_SECRET; else process.env.ELIZA_SERVICE_SECRET = original; }
 });
