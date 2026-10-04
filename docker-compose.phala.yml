@@ -69,6 +69,9 @@ services:
       DOMAIN: ${PHALA_INGRESS_DOMAIN:-eliza.tinycloud.xyz}
       TARGET_ENDPOINT: http://eliza-service:3000
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      # CNAME target the ingress publishes for DOMAIN: the CVM's gateway.cname
+      # (gateway.<base>). Never `_.<base>`: Android's resolver rejects a CNAME
+      # target whose first label is `_` (TC-606). See DEPLOY.md.
       GATEWAY_DOMAIN: ${PHALA_GATEWAY_CNAME}
       CERTBOT_EMAIL: ${CERTBOT_EMAIL}
       SET_CAA: "true"
