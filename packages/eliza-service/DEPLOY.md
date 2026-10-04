@@ -108,10 +108,19 @@ ELIZA_TASK_MODELS_JSON={"moonshotai/kimi-k3":1048576,"z-ai/glm-5.3":1048576,"z-a
 
 # ingress / DNS (Cloudflare)
 PHALA_INGRESS_DOMAIN=eliza.tinycloud.xyz
-PHALA_GATEWAY_CNAME=<phala gateway domain for this CVM>
+# the CVM's gateway.cname from `phala cvms get eliza-service --json`; never _.<base> (TC-606)
+PHALA_GATEWAY_CNAME=gateway.dstack-pha-prod5.phala.network
 CLOUDFLARE_API_TOKEN=<cloudflare token>
 CERTBOT_EMAIL=<ops email>
 ```
+
+`PHALA_GATEWAY_CNAME` is the CNAME target `dstack-ingress` writes for
+`eliza.tinycloud.xyz` through the Cloudflare API when its container is created.
+Use the CVM's `gateway.cname` (`gateway.<base>`). Never use `_.<base>` (e.g.
+`_.dstack-pha-prod5.phala.network`): Android's resolver rejects a CNAME target
+whose first label is `_`, so the service would not resolve on Android. The live
+record was `_.` until 2026-10-04 (TC-606), so the existing CVM's encrypted value
+may still be `_.`; correct it on the next env update instead of preserving it.
 
 ## 4. Provide the agent key (REQUIRED, never committed)
 
