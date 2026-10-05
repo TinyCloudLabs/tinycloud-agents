@@ -7,7 +7,7 @@
 //   4. An unregistered entity throws the typed NoDelegationError (not null,
 //      no cross-entity fallback).
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 
 import { DelegationPolicyError, DelegationShapeError } from "@tinycloud/agent-client";
 import type { AgentClient, QueryData } from "@tinycloud/agent-client";
@@ -527,21 +527,20 @@ describe("EntityClientRegistry — T3 delegation build", () => {
     expect(registry.clientFor("entityA")).toBe(clientA);
   });
 
-  test("idle TTL expiry in clientFor throws DelegationExpiredError", async () => {
+  test("idle time alone never expires an entry, even with the deprecated ttlMs option", async () => {
     const client = makeDelegationClient("A");
 
     const registry = new EntityClientRegistry({
       createClient: () => client,
       runWrite: async (fn) => fn(),
-      ttlMs: 1, // expire after 1ms
+      ttlMs: 1, // formerly an idle TTL; now ignored
     });
 
     await registry.registerDelegation("entityA", "serialized-A");
-
-    // Wait for TTL to lapse
     await new Promise<void>((r) => setTimeout(r, 10));
 
-    expect(() => registry.clientFor("entityA")).toThrow(DelegationExpiredError);
+    expect(registry.hasDelegation("entityA")).toBe(true);
+    expect(registry.clientFor("entityA")).toBe(client);
   });
 
   test("roomId is wired before the async build so a sync caller sees it", async () => {
@@ -816,4 +815,108 @@ test("a superseded external lease cannot coalesce with an identical new grant", 
   gate.resolve();
   expect(await old).toBeInstanceOf(NoDelegationError);
   expect(registry.clientFor("entity")).toBe(b);
+});
+
+// ── Grant lifetime: idle time never ends access; expiry/rejection/fencing do ──
+//
+// Regression for TinyChat losing private tools 4h after "Connect agent" while its
+// grant was valid for 30 days: hasDelegation()/clientFor() used to fail once an
+// entry had been idle for ELIZA_REGISTRY_TTL_MS (default 4h).
+
+describe("EntityClientRegistry — access lasts for the life of the grant", () => {
+  const HOUR = 60 * 60 * 1000;
+  const DAY = 24 * HOUR;
+  const START = new Date("2030-01-01T00:00:00Z");
+  afterEach(() => setSystemTime());
+
+  /** Serialized grant whose expiry the registry reads (signIn is faked). */
+  const grant = (expiresInMs: number) => JSON.stringify({ expiry: new Date(Date.now() + expiresInMs).toISOString() });
+  const advance = (ms: number) => setSystemTime(new Date(Date.now() + ms));
+
+  function lifetimeRegistry() {
+    const hooks: EntityClientHooks[] = [];
+    const clients: AgentClient[] = [];
+    const registry = new EntityClientRegistry({
+      createClient: (_config, hook) => {
+        const client = makeMinimalClient(`c${clients.length}`);
+        clients.push(client);
+        if (hook) hooks.push(hook);
+        return client;
+      },
+      runWrite: async (fn) => fn(),
+    });
+    return { registry, clients, hooks };
+  }
+
+  test("an entry idle for more than 4h (and for weeks) stays usable until its signed expiry", async () => {
+    setSystemTime(START);
+    const { registry, clients } = lifetimeRegistry();
+    await registry.registerDelegation("entity", grant(30 * DAY), "room");
+
+    advance(4 * HOUR + 60_000); // just past the former 4h default idle TTL
+    expect(registry.hasDelegation("entity")).toBe(true);
+    expect(registry.clientFor("entity")).toBe(clients[0]);
+
+    advance(29 * DAY); // ~29 days with no use at all
+    expect(registry.hasDelegation("entity")).toBe(true);
+    expect(registry.clientForRoom("room")).toBe(clients[0]);
+
+    advance(DAY); // past the 30-day signed expiry
+    expect(registry.hasDelegation("entity")).toBe(false);
+    expect(() => registry.clientFor("entity")).toThrow(DelegationExpiredError);
+    expect(clients).toHaveLength(1); // no silent rebuild
+  });
+
+  test("a session rejection after a long idle period still removes access", async () => {
+    setSystemTime(START);
+    const { registry, hooks } = lifetimeRegistry();
+    await registry.registerDelegation("entity", grant(30 * DAY));
+    advance(5 * HOUR);
+    expect(registry.hasDelegation("entity")).toBe(true);
+    hooks[0].onDelegationRejected!(new DelegationPolicyError("revoked or expired", "EXPIRED"));
+    expect(registry.hasDelegation("entity")).toBe(false);
+    expect(() => registry.clientFor("entity")).toThrow(DelegationExpiredError);
+  });
+
+  test("disconnect after a long idle period removes access and stops the client", async () => {
+    setSystemTime(START);
+    let stops = 0;
+    const client = makeMinimalClient("A", { stopFn: async () => { stops++; } });
+    const registry = new EntityClientRegistry({ createClient: () => client, runWrite: async (fn) => fn() });
+    await registry.registerDelegation("entity", grant(30 * DAY), "room");
+    advance(5 * HOUR);
+    await registry.disconnectEntity("entity");
+    expect(registry.hasDelegation("entity")).toBe(false);
+    expect(() => registry.clientFor("entity")).toThrow(NoDelegationError);
+    expect(() => registry.clientForRoom("room")).toThrow(NoDelegationError);
+    expect(stops).toBe(1);
+  });
+
+  test("a stale owner revision is still fenced after a long idle period", async () => {
+    setSystemTime(START);
+    const { registry } = lifetimeRegistry();
+    let current = true;
+    await registry.registerDelegation("entity", grant(30 * DAY), undefined, () => current, () => current);
+    advance(5 * HOUR);
+    expect(registry.hasDelegation("entity")).toBe(true);
+    current = false; // e.g. a newer Connect or a Disconnect replaced the session revision
+    expect(registry.hasDelegation("entity")).toBe(false);
+    expect(() => registry.clientFor("entity")).toThrow(NoDelegationError);
+  });
+
+  test("LRU capacity eviction still bounds memory and still prefers the least recently used entry", async () => {
+    setSystemTime(START);
+    const registry = new EntityClientRegistry({
+      createClient: () => makeMinimalClient("x"), runWrite: async (fn) => fn(), maxClients: 2,
+    });
+    await registry.registerDelegation("old", grant(30 * DAY));
+    advance(HOUR);
+    await registry.registerDelegation("recent", grant(30 * DAY));
+    advance(5 * HOUR);
+    registry.clientFor("old"); // touch: "recent" is now least recently used
+    await registry.registerDelegation("new", grant(30 * DAY));
+    expect(registry.hasDelegation("old")).toBe(true);
+    expect(registry.hasDelegation("recent")).toBe(false);
+    expect(registry.hasDelegation("new")).toBe(true);
+  });
 });

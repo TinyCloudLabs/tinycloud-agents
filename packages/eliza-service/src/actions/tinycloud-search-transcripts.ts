@@ -275,7 +275,12 @@ function action(operation: "find" | "read" | "search" | "actions", name: string,
         } else if (context.retrievalMode === undefined && first && (operation === "read" || (operation === "find" && (discovery?.matchedCount === 1 || (args as FindMeetingsArgs).selectFirst)) || (operation === "search" && result.data.matches.length === 1))) registry.selectMeeting(message.entityId, message.roomId, operation === "search" ? result.data.matches[0]!.meetingRef : first.meetingRef);
         return finish(callback, result);
       } catch (error) {
-        if (isAccessError(error) || (error as { code?: string }).code === "meeting_not_found") registry.setSelection?.(message.entityId, message.roomId, { state: "none" });
+        // Best-effort selection reset. When access itself is gone, dropping the
+        // grant already cleared this entity's selections; a cleanup failure must
+        // not replace the original code (e.g. delegation_revoked).
+        if (isAccessError(error) || (error as { code?: string }).code === "meeting_not_found") {
+          try { registry.setSelection?.(message.entityId, message.roomId, { state: "none" }); } catch { /* keep the original error */ }
+        }
         throw error;
       }
     },

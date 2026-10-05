@@ -1,8 +1,13 @@
 // EntityClientRegistry — routes SQL calls to the per-user delegated AgentClient
 // that owns the user's TinyCloud space.
 //
-// T3 FULL: real delegation-mode client build, LRU+TTL, concurrent-registration
-// dedup, and per-user failure isolation.
+// T3 FULL: real delegation-mode client build, LRU capacity bound, concurrent-
+// registration dedup, and per-user failure isolation.
+//
+// Access lasts as long as the grant: an entry stays usable until its signed
+// delegation expires, its session rejects the delegation, its owner revision is
+// no longer current, or it is disconnected/replaced. Idle time is not a
+// condition (a 4h idle TTL used to end 30-day grants early; see hasDelegation).
 //
 // T1 test seam preserved: inject pre-built clients via deps.clients.
 
@@ -24,8 +29,8 @@ export class NoDelegationError extends Error {
 
 /**
  * Thrown when signIn signals the delegation expired (DelegationPolicyError
- * reason="EXPIRED" or an expired DelegationShapeError), when the client's session
- * later rejects its stored delegation, or when a client's idle TTL lapses in clientFor.
+ * reason="EXPIRED" or an expired DelegationShapeError), when the signed expiry
+ * has passed, or when the client's session later rejects its stored delegation.
  */
 export class DelegationExpiredError extends Error {
   readonly entityId: string;
@@ -99,14 +104,14 @@ export interface EntityClientRegistryDeps {
    */
   maxClients?: number;
   /**
-   * Client idle TTL in ms — entries unused longer than this are evicted on clientFor.
-   * Env: ELIZA_REGISTRY_TTL_MS. Default 4h.
+   * @deprecated Ignored. Idle time no longer ends access: an entry lasts until its
+   * grant expires, is rejected, loses its revision, or is disconnected. Memory is
+   * bounded by maxClients. (ELIZA_REGISTRY_TTL_MS is likewise no longer read.)
    */
   ttlMs?: number;
 }
 
 const DEFAULT_MAX_CLIENTS = Number(process.env.ELIZA_REGISTRY_MAX_CLIENTS) || 256;
-const DEFAULT_TTL_MS = Number(process.env.ELIZA_REGISTRY_TTL_MS) || 4 * 60 * 60 * 1000;
 
 /**
  * Maps entityId → AgentClient and roomId → entityId for per-user delegation routing.
@@ -131,7 +136,6 @@ export class EntityClientRegistry {
   private readonly host?: string;
   private readonly dbHandle: string;
   private readonly maxClients: number;
-  private readonly ttlMs: number;
   /**
    * Candidate registrations. Only identical grants with current ownership coalesce.
    */
@@ -160,7 +164,6 @@ export class EntityClientRegistry {
     this.host = deps.host;
     this.dbHandle = deps.dbHandle ?? MEMORY_DB_HANDLE;
     this.maxClients = deps.maxClients ?? DEFAULT_MAX_CLIENTS;
-    this.ttlMs = deps.ttlMs ?? DEFAULT_TTL_MS;
 
     // Populate from pre-built clients (T1 test seam).
     const now = Date.now();
@@ -237,10 +240,12 @@ export class EntityClientRegistry {
 
   /**
    * Return the AgentClient registered for entityId.
-   * Updates lastUsed (LRU touch) on success.
+   * Updates lastUsed (LRU touch) on success. Idle time alone never fails this call.
    *
-   * @throws {NoDelegationError} when no client is registered for this entity.
-   * @throws {DelegationExpiredError} when the entry's idle TTL has lapsed.
+   * @throws {NoDelegationError} when no client is registered for this entity, or
+   *   its owner revision is no longer current/usable.
+   * @throws {DelegationExpiredError} when the signed delegation has expired or the
+   *   client's session rejected it.
    */
   clientFor(entityId: string): AgentClient {
     const entry = this.entries.get(entityId);
@@ -255,12 +260,6 @@ export class EntityClientRegistry {
       throw new DelegationExpiredError(entityId);
     }
 
-    if (Date.now() - entry.lastUsed > this.ttlMs) {
-      // Evict async (fire and forget) — the entry is gone from the caller's perspective.
-      void this._evict(entityId);
-      throw new DelegationExpiredError(entityId);
-    }
-
     entry.lastUsed = Date.now();
     return entry.client;
   }
@@ -270,7 +269,7 @@ export class EntityClientRegistry {
    *
    * @throws {NoDelegationError} when the room has no entity mapping, or the
    *   mapped entity has no registered client.
-   * @throws {DelegationExpiredError} when the mapped entity's TTL has lapsed.
+   * @throws {DelegationExpiredError} when the mapped entity's delegation expired.
    */
   clientForRoom(roomId: string): AgentClient {
     const entityId = this.roomToEntity.get(roomId);
@@ -301,11 +300,15 @@ export class EntityClientRegistry {
       .map(entityId => this.disconnectEntity(entityId)));
   }
 
+  /**
+   * True while the entry's grant is usable: registered, current, not rejected,
+   * and before its signed expiry. Deliberately independent of idle time (lastUsed
+   * only orders LRU eviction), so a 30-day grant is not lost after a quiet period.
+   */
   hasDelegation(entityId: string): boolean {
     const entry = this.entries.get(entityId);
     return !!entry && entry.isCurrent?.() !== false && !entry.rejected &&
-      (!entry.delegationExpiry || Date.now() < entry.delegationExpiry.getTime()) &&
-      Date.now() - entry.lastUsed <= this.ttlMs;
+      (!entry.delegationExpiry || Date.now() < entry.delegationExpiry.getTime());
   }
 
   entityForRoom(roomId: string): string | undefined {

@@ -31,7 +31,7 @@ import {
   DelegationPolicyError,
 } from "@tinycloud/agent-client";
 import { MEMORY_DB_HANDLE } from "@tinycloud/eliza-plugin-memory";
-import type { SessionStore, SessionScope } from "../session-store.js";
+import type { SessionRecord, SessionStore, SessionScope } from "../session-store.js";
 
 /**
  * Minimal host interface consumed by sessions handlers.
@@ -223,7 +223,10 @@ export async function handleGetSessions(
   const snapshot = scope?.appId === "tinychat" ? store.snapshot(scope, entityId) : undefined;
   const metadata = snapshot ? { revision: snapshot.revision, state: snapshot.state } : {};
   const record = snapshot ? snapshot.record : store.get(entityId);
-  if (snapshot && (snapshot.state !== "active" || !host.privateAccessAvailable?.(scope!.agentId, entityId))) {
+  // Installed access is gone. A lapsed signed grant still reports "expired" (the
+  // reconnect reason) through the evaluation below; anything else stays "none".
+  if (snapshot && (snapshot.state !== "active"
+    || (!host.privateAccessAvailable?.(scope!.agentId, entityId) && !(record && storedGrantExpired(record, host.agentDid))))) {
     return { status: 404, body: { status: "none", ...metadata } };
   }
   if (!record) {
@@ -284,6 +287,22 @@ export async function handleDeleteSessions(entityId: string, host: SessionHandle
     return { status: 503, body: { error: "disconnect_unconfirmed", revision: snapshot.revision } };
   }
   return { status: 200, body: { entityId, status: "none", revision: snapshot.revision, state: "disconnected" } };
+}
+
+/**
+ * True when either stored signed grant has passed its expiry. Explains why
+ * private access is unavailable; it never grants or restores access.
+ */
+export function storedGrantExpired(record: SessionRecord, agentDid: string): boolean {
+  const expired = (status: () => string): boolean => {
+    try { return status() === "expired"; } catch (e) { return e instanceof DelegationPolicyError && e.reason === "EXPIRED"; }
+  };
+  const transcript = record.serializedTranscriptDelegation;
+  return expired(() => evaluateDelegationStatus({
+    delegation: deserializeDelegationSafe(record.serializedDelegation), policy: defaultElizaMemoryPolicy(), agentDID: agentDid,
+  })) || (transcript !== undefined && expired(() => evaluateDelegationStatus({
+    delegation: deserializeTranscriptDelegationForActivation(transcript), policy: defaultTinychatTranscriptPolicy(), agentDID: agentDid,
+  })));
 }
 
 /** Map a policy rejection to a stable, non-revealing session error code. */
