@@ -41,7 +41,8 @@ function makeValidSerialized(opts: {
     spaceId: "tinycloud:pkh:eip155:1:0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2:default",
     path: opts.path ?? MEMORY_DB_HANDLE,
     actions: opts.actions ?? ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"],
-    expiry: opts.expiry ?? new Date("2099-01-01T00:00:00.000Z").toISOString(),
+    // Within the 30-day registration ceiling.
+    expiry: opts.expiry ?? new Date(Date.now() + 29 * 24 * 60 * 60 * 1000).toISOString(),
     ownerAddress: "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2",
     chainId: 1,
     host: "https://node.tinycloud.xyz",
@@ -282,5 +283,40 @@ describe("handleGetSessions — expired delegation", () => {
 
     expect(result.status).toBe(200);
     expect((result.body as { status: string }).status).toBe("expired");
+  });
+});
+
+describe("handlePostSessions — 30-day ceiling on memory grants", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  it("rejects a memory-only grant that outlives 30 days", async () => {
+    const { host, storage } = makeHost();
+    const result = await handlePostSessions(
+      { agentId: TEST_AGENT_ID, entityId: TEST_ENTITY_ID, serializedDelegation: makeValidSerialized({ expiry: new Date(Date.now() + 31 * DAY).toISOString() }) },
+      host, new SessionStore(),
+    );
+    expect(result).toEqual({ status: 400, body: { error: "delegation_expiry_too_long" } });
+    expect(storage.calls).toHaveLength(0);
+  });
+
+  it("reads the ceiling from the signed exp, not the unsigned summary", async () => {
+    const { host, storage } = makeHost();
+    const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    const longSigned = JSON.stringify({
+      ...JSON.parse(makeValidSerialized()),
+      delegationHeader: { Authorization: `Bearer ${b64({ alg: "EdDSA" })}.${b64({ exp: Math.floor((Date.now() + 365 * DAY) / 1000) })}.sig` },
+    });
+    const result = await handlePostSessions({ agentId: TEST_AGENT_ID, entityId: TEST_ENTITY_ID, serializedDelegation: longSigned }, host, new SessionStore());
+    expect(result).toEqual({ status: 400, body: { error: "delegation_expiry_too_long" } });
+    expect(storage.calls).toHaveLength(0);
+  });
+
+  it("accepts a memory grant within 30 days", async () => {
+    const { host, storage } = makeHost();
+    const result = await handlePostSessions(
+      { agentId: TEST_AGENT_ID, entityId: TEST_ENTITY_ID, serializedDelegation: makeValidSerialized({ expiry: new Date(Date.now() + 30 * DAY - 60_000).toISOString() }) },
+      host, new SessionStore(),
+    );
+    expect(result.status).toBe(200);
+    expect(storage.calls).toHaveLength(1);
   });
 });

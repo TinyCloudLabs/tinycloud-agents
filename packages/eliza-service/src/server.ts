@@ -15,6 +15,7 @@ import { checkServiceAuth } from "./auth/service-auth.js";
 import { defaultRateLimiter } from "./rate-limit.js";
 import { TaskHandler } from "./handlers/tasks.js";
 import type { TaskConfig } from "./tasks/contract.js";
+import type { HeldSessions } from "./held-sessions.js";
 
 interface BunServer {
   hostname: string;
@@ -38,7 +39,14 @@ export interface ElizaServiceOptions {
   host: ElizaServiceHost;
   sessions: SessionStore;
   tasks?: TaskConfig;
+  /** Durable TinyChat grants (persist, restore after restart). Absent: memory only. */
+  held?: HeldSessions;
+  /** Override how long requests wait for a reloading grant (ms). */
+  restoreWaitMs?: { status?: number; access?: number };
 }
+
+/** How long a request waits for its entity's grant to finish reloading. */
+const RESTORE_WAIT_MS = { status: 1_000, access: 10_000 } as const;
 
 export interface StartElizaServiceOptions extends ElizaServiceOptions {
   hostname?: string;
@@ -61,7 +69,21 @@ export function startElizaService(opts: StartElizaServiceOptions): BunServer {
 }
 
 export function createElizaServiceFetch(opts: ElizaServiceOptions) {
-  const tasks = new TaskHandler(opts.tasks, opts.host, opts.sessions);
+  const wait = { ...RESTORE_WAIT_MS, ...opts.restoreWaitMs };
+  const tasks = new TaskHandler(opts.tasks, opts.host, opts.sessions, opts.held
+    ? (scope, entityId) => opts.held!.settled(scope, entityId, wait.access)
+    : undefined);
+  // While an entity's stored grant is reloading, answer 503, never "none" or
+  // a denial; the request moves that entity to the front of the queue.
+  const restoring = async (scope: SessionScope, entityId: string, waitMs: number, reconnecting = false): Promise<Response | null> => {
+    if (!opts.held || scope.appId !== TINYCHAT_APP_ID) return null;
+    if (await opts.held.settled(scope, entityId, waitMs)) return null;
+    const current = opts.sessions.peek(scope, entityId);
+    // Once the persisted revision is known, a reconnect may replace a reload
+    // that keeps failing; reserve() fences the reload. Never lock a user out.
+    if (reconnecting && current?.state === "restoring") return null;
+    return json(503, { error: "private_access_restoring", ...(current?.state === "restoring" ? { revision: current.revision, state: "restoring" } : {}) });
+  };
   const messages = new Map<string, Set<AbortController>>();
   opts.sessions.onInvalidate((scope, entityId) => {
     tasks.cancelEntity(scope, entityId);
@@ -72,7 +94,7 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
       const url = new URL(request.url);
 
       if (request.method === "GET" && url.pathname === "/health") {
-        return json(200, { ok: true, agentDid: opts.host.agentDid });
+        return json(200, { ok: true, agentDid: opts.host.agentDid, ...(opts.held ? { grants: opts.held.health() } : {}) });
       }
 
       if (request.method === "GET" && url.pathname === "/capabilities") {
@@ -108,7 +130,9 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
         // agentId is server-trusted: override caller-supplied value with the identity
         // resolved from the credential map so callers cannot route into another app's space.
         const sessionsBody: PostSessionsBody = { ...parsed.value, agentId: auth.resolved.agentId };
-        const result = await handlePostSessions(sessionsBody, opts.host, opts.sessions, auth.resolved);
+        const waiting = await restoring(auth.resolved, sessionsBody.entityId, wait.access, true);
+        if (waiting) return waiting;
+        const result = await handlePostSessions(sessionsBody, opts.host, opts.sessions, auth.resolved, opts.held);
         return json(result.status, result.body);
       }
 
@@ -119,8 +143,13 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
         const entityId = decodeURIComponent(url.pathname.slice("/sessions/".length));
         if (!entityId || entityId.includes("/")) return json(404, { error: "not_found" });
 
+        // A Disconnect never waits for a reload: it wins over it.
+        if (request.method === "GET") {
+          const waiting = await restoring(auth.resolved, entityId, wait.status);
+          if (waiting) return waiting;
+        }
         const result = request.method === "DELETE"
-          ? await handleDeleteSessions(entityId, opts.host, opts.sessions, auth.resolved)
+          ? await handleDeleteSessions(entityId, opts.host, opts.sessions, auth.resolved, opts.held)
           : await handleGetSessions(entityId, opts.host, opts.sessions, auth.resolved);
         return json(result.status, result.body);
       }
@@ -144,6 +173,8 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
           return json(429, { error: "rate_limit_exceeded" });
         }
 
+        const waiting = await restoring(auth.resolved, messagesBody.entityId, wait.access);
+        if (waiting) return waiting;
         const lease = auth.resolved.appId === TINYCHAT_APP_ID ? opts.sessions.lease(auth.resolved, messagesBody.entityId) : undefined;
         if (lease && (!lease.active || !lease.isActive() || !opts.host.privateAccessAvailable?.(auth.resolved.agentId, messagesBody.entityId))) {
           return json(409, { error: privateAccessDenial(opts, auth.resolved, messagesBody.entityId, lease) });
@@ -187,6 +218,10 @@ export function createElizaServiceFetch(opts: ElizaServiceOptions) {
 
         // agentId is server-trusted: resolved from the credential, never caller-supplied.
         const toolBody: PostToolBody = parsed.value;
+        if (toolBody.entityId !== undefined) {
+          const waiting = await restoring(auth.resolved, toolBody.entityId, wait.access);
+          if (waiting) return waiting;
+        }
         const lease = auth.resolved.appId === TINYCHAT_APP_ID ? opts.sessions.lease(auth.resolved, toolBody.entityId ?? "") : undefined;
         const access = lease ? { isCurrent: lease.isCurrent, isActive: () => lease.active && lease.isActive() && opts.host.privateAccessAvailable?.(auth.resolved.agentId, toolBody.entityId ?? "") === true && (toolBody.accessRevision === undefined || toolBody.accessRevision === lease.revision) } : undefined;
         const result = await handlePostTool(toolName, auth.resolved.agentId, parsed.value, opts.host, { signal: request.signal, access });
@@ -219,7 +254,10 @@ const SPECIFIC_DELEGATION_ERRORS = new Set(["delegation_expired", "delegation_re
  * a current, active session whose stored signed grant lapsed reports
  * delegation_expired. Purely explanatory: callers have already denied access.
  */
-function privateAccessDenial(opts: ElizaServiceOptions, scope: SessionScope, entityId: string, lease: SessionLease, accessRevision?: string): DelegationErrorCode {
+function privateAccessDenial(opts: ElizaServiceOptions, scope: SessionScope, entityId: string, lease: SessionLease, accessRevision?: string): DelegationErrorCode | "delegation_revoked" {
+  // A reloaded grant the node reported revoked stays explained until reconnect.
+  if (lease.isCurrent() && (accessRevision === undefined || accessRevision === lease.revision)
+    && opts.sessions.peek(scope, entityId)?.state === "revoked") return "delegation_revoked";
   if (!lease.active || !lease.isActive() || (accessRevision !== undefined && accessRevision !== lease.revision)) return "delegation_required";
   const record = opts.sessions.snapshot(scope, entityId).record;
   return record && storedGrantExpired(record, opts.host.agentDid) ? "delegation_expired" : "delegation_required";

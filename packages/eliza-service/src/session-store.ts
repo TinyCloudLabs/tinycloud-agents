@@ -18,13 +18,26 @@ export interface SessionRecord {
   /** V2 only: independently scoped transcript delegation. */
   serializedTranscriptDelegation?: string;
   roomId?: string;
+  /** Earliest signed expiry of the bundle (epoch ms), when known. */
+  exp?: number;
+  /** Signed expiry of each grant (epoch ms), when known. */
+  expiries?: { memory?: number; transcripts?: number };
 }
 
 export interface SessionScope { appId: string; agentId: string }
 export interface SessionSnapshot {
   revision: string;
-  state: "none" | "activating" | "active" | "disconnected";
+  /**
+   * "restoring": a persisted grant is being reloaded after a restart; its
+   * revision is the persisted one. "revoked": a reloaded grant the node
+   * reported revoked (a tombstone, no delegation material).
+   */
+  state: "none" | "activating" | "active" | "disconnected" | "restoring" | "revoked";
   record?: SessionRecord;
+  /** Tombstones only: expiry of the revoked bundle, for garbage collection. */
+  exp?: number;
+  /** Tombstones only: when the revocation was observed (epoch ms). */
+  revokedAt?: number;
 }
 export interface SessionLease {
   revision: string;
@@ -39,6 +52,8 @@ export class SessionStore {
   private readonly instance = crypto.randomUUID();
   private sequence = 0;
   private readonly access = new Map<string, SessionSnapshot>();
+  /** Activation records awaiting a durable write before commit (POST /sessions). */
+  private readonly persisting = new Map<string, { revision: string; record: SessionRecord }>();
   private readonly listeners = new Set<(scope: SessionScope, entityId: string) => void>();
 
   snapshot(scope: SessionScope, entityId: string): SessionSnapshot {
@@ -71,7 +86,70 @@ export class SessionStore {
   commit(scope: SessionScope, entityId: string, lease: SessionLease, record: SessionRecord): boolean {
     if (!lease.isCurrent() || this.snapshot(scope, entityId).state !== "activating") return false;
     this.access.set(this.key(scope, entityId), { revision: lease.revision, state: "active", record });
+    this.persisting.delete(this.key(scope, entityId));
     return true;
+  }
+
+  /**
+   * Mark an activated, not yet committed record as the state to persist. The
+   * grant store writes it only while this lease is still current.
+   */
+  stage(scope: SessionScope, entityId: string, lease: SessionLease, record: SessionRecord): boolean {
+    if (!lease.isCurrent() || this.snapshot(scope, entityId).state !== "activating") return false;
+    this.persisting.set(this.key(scope, entityId), { revision: lease.revision, record });
+    return true;
+  }
+
+  /** Record staged by stage() for the current activating revision, if any. */
+  staged(scope: SessionScope, entityId: string): { revision: string; record: SessionRecord } | undefined {
+    const current = this.peek(scope, entityId);
+    const staged = this.persisting.get(this.key(scope, entityId));
+    return current?.state === "activating" && staged?.revision === current.revision ? staged : undefined;
+  }
+
+  /** Current state without creating an entry. */
+  peek(scope: SessionScope, entityId: string): SessionSnapshot | undefined {
+    const state = this.access.get(this.key(scope, entityId));
+    return state ? { ...state } : undefined;
+  }
+
+  /** True once this process has any access state for the entity. */
+  known(scope: SessionScope, entityId: string): boolean {
+    return this.access.has(this.key(scope, entityId));
+  }
+
+  /**
+   * Begin reloading a persisted grant under its persisted revision. Refuses
+   * when the entity already has state in this process (for example a
+   * Disconnect or a new connection), so a reload can never override either.
+   */
+  beginRestore(scope: SessionScope, entityId: string, revision: string): SessionLease | null {
+    if (this.known(scope, entityId)) return null;
+    this.access.set(this.key(scope, entityId), { revision, state: "restoring" });
+    return this.lease(scope, entityId);
+  }
+
+  /**
+   * Finish a reload with the persisted revision. Expired bundles are restored
+   * the same way but are never registered, so they report "expired".
+   */
+  restore(scope: SessionScope, entityId: string, lease: SessionLease, record: SessionRecord): boolean {
+    if (!lease.isCurrent() || this.snapshot(scope, entityId).state !== "restoring") return false;
+    this.access.set(this.key(scope, entityId), { revision: lease.revision, state: "active", record });
+    return true;
+  }
+
+  /** Keep a revoked grant as a tombstone so revocation is still reported. */
+  tombstone(scope: SessionScope, entityId: string, lease: SessionLease, marks: { exp?: number; revokedAt: number }): boolean {
+    const state = this.snapshot(scope, entityId).state;
+    if (!lease.isCurrent() || (state !== "restoring" && state !== "revoked")) return false;
+    this.access.set(this.key(scope, entityId), { revision: lease.revision, state: "revoked", ...marks });
+    return true;
+  }
+
+  /** Abandon a reload that can never succeed; the entity reads as never connected. */
+  abandonRestore(scope: SessionScope, entityId: string, lease: SessionLease): void {
+    if (lease.isCurrent() && this.snapshot(scope, entityId).state === "restoring") this.replace(scope, entityId, "none");
   }
 
   fail(scope: SessionScope, entityId: string, lease: SessionLease): void {
@@ -89,6 +167,7 @@ export class SessionStore {
   }
 
   private replace(scope: SessionScope, entityId: string, state: SessionSnapshot["state"]): void {
+    this.persisting.delete(this.key(scope, entityId));
     this.access.set(this.key(scope, entityId), { revision: this.nextRevision(), state });
     for (const listener of this.listeners) listener(scope, entityId);
   }

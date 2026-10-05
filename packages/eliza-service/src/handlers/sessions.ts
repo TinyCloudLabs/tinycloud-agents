@@ -8,6 +8,11 @@
 //   5. store.set(entityId, record)      → C-local liveness cache (no B-registry accessor)
 //   6. evaluateDelegationStatus         → { entityId, status } in 200 body
 //
+// TinyChat bundles are persisted before POST confirms and deleted before DELETE
+// confirms (SessionPersistence, see held-sessions.ts), so a restart neither
+// loses a connection nor undoes a Disconnect. validateBundle() is shared with
+// the reload path.
+//
 // GET /sessions/:entityId re-deserializes from the C-local store. Non-EXPIRED
 // DelegationPolicyErrors from evaluateDelegationStatus are rethrown → 400.
 //
@@ -31,7 +36,15 @@ import {
   DelegationPolicyError,
 } from "@tinycloud/agent-client";
 import { MEMORY_DB_HANDLE } from "@tinycloud/eliza-plugin-memory";
-import type { SessionRecord, SessionStore, SessionScope } from "../session-store.js";
+import type { SessionLease, SessionRecord, SessionStore, SessionScope } from "../session-store.js";
+
+/** Durable publication of an entity's session state (see held-sessions.ts). */
+export interface SessionPersistence {
+  /** Resolves true once the entity's latest state is durable. */
+  sync(scope: SessionScope, entityId: string): Promise<boolean>;
+  /** Stop restoring this entity (a Disconnect arrived first). */
+  forget?(scope: SessionScope, entityId: string): void;
+}
 
 /**
  * Minimal host interface consumed by sessions handlers.
@@ -65,11 +78,148 @@ export interface HandlerResult {
   body: unknown;
 }
 
+/** A bundle that passed every registration check. */
+export interface ValidatedBundle {
+  memory: string;
+  transcripts?: string;
+  roomId?: string;
+  /** Effective signed expiries, epoch ms. */
+  expiries: { memory?: number; transcripts?: number };
+}
+
+export type BundleValidation = { ok: true; bundle: ValidatedBundle } | { ok: false; result: HandlerResult };
+
+/**
+ * Every registration check, shared by POST /sessions and by reloading a stored
+ * grant after a restart (stored records are untrusted input):
+ *   1. deserializeDelegationSafe         → 400 "malformed"
+ *   2. transcript exact policy, 30-day ceiling and owner match
+ *   3. validateDelegationShape           → 400 "invalid_shape"
+ *   4. validateDelegationPolicy          → 400 (reason)
+ *   5. memory 30-day ceiling             → 400 "delegation_expiry_too_long"
+ * Signatures are verified by the node when the grants are activated.
+ */
+export function validateBundle(input: { memory: string; transcripts?: string; roomId?: string }, agentDid: string): BundleValidation {
+  const { memory: serializedDelegation, transcripts: serializedTranscriptDelegation } = input;
+  const policy = defaultElizaMemoryPolicy();
+  const fail = (status: number, body: unknown): BundleValidation => ({ ok: false, result: { status, body } });
+
+  // 1. Deserialize
+  let deleg;
+  try {
+    deleg = deserializeDelegationSafe(serializedDelegation);
+  } catch {
+    return fail(400, { error: "malformed" });
+  }
+
+  // V2 has a separately activated fixed-policy transcript grant. Compact UCANs
+  // are normalized from signed att; current CID-backed children are policy-
+  // checked here and cryptographically verified by the host during activation.
+  let transcriptExpiry: number | undefined;
+  if (serializedTranscriptDelegation !== undefined) {
+    try {
+      const transcriptDelegation = deserializeTranscriptDelegationForActivation(serializedTranscriptDelegation);
+      validateExactDelegationPolicy(transcriptDelegation, {
+        agentDID: agentDid,
+        policy: defaultTinychatTranscriptPolicy(),
+      });
+      // The 30-day ceiling is read from the SIGNED `exp` claim when the UCAN
+      // carries one; the top-level `expiry` summary is unsigned and forgeable,
+      // so a short summary must not launder a long-lived signed grant.
+      transcriptExpiry = effectiveExpiry(serializedTranscriptDelegation, transcriptDelegation) ?? undefined;
+      if (transcriptExpiry === undefined || transcriptExpiry - Date.now() > MAX_GRANT_EXPIRY_MS) {
+        return fail(400, { error: "delegation_expiry_too_long" });
+      }
+      const memoryOwner = signedOwnerAddress(deserializeAndNormalize(serializedDelegation));
+      const transcriptOwner = signedOwnerAddress(transcriptDelegation);
+      if (!memoryOwner || !transcriptOwner || memoryOwner.toLowerCase() !== transcriptOwner.toLowerCase()) {
+        return fail(400, { error: "wrong_delegator" });
+      }
+    } catch (e) {
+      if (e instanceof DelegationPolicyError) return fail(400, { error: transcriptErrorCode(e) });
+      return fail(400, { error: "malformed" });
+    }
+  }
+
+  // 2. Shape validation (shallow: ownerAddress, delegateDID, expiry, SQL presence)
+  try {
+    validateDelegationShape(deleg, { agentDid, dbHandle: MEMORY_DB_HANDLE });
+  } catch (e) {
+    if (e instanceof DelegationShapeError) return fail(400, { error: "invalid_shape", message: e.message });
+    throw e;
+  }
+
+  // 3. Policy validation — delegateDID==agentDID + expiry + resource path + actions
+  try {
+    validateDelegationPolicy(deleg, { agentDID: agentDid, policy });
+  } catch (e) {
+    if (e instanceof DelegationPolicyError) {
+      return fail(400, { error: (e.reason as string).toLowerCase(), message: e.message });
+    }
+    throw e;
+  }
+
+  // 4. The memory grant has the same 30-day ceiling as the transcript grant.
+  //    Without it a memory-only grant had no maximum lifetime once idle
+  //    expiry was removed, and persisting grants would extend that further.
+  const memoryExpiry = effectiveExpiry(serializedDelegation, deleg);
+  if (memoryExpiry === null || memoryExpiry - Date.now() > MAX_GRANT_EXPIRY_MS) {
+    return fail(400, { error: "delegation_expiry_too_long" });
+  }
+
+  return { ok: true, bundle: {
+    memory: serializedDelegation,
+    transcripts: serializedTranscriptDelegation,
+    roomId: input.roomId,
+    expiries: { memory: memoryExpiry, ...(transcriptExpiry !== undefined ? { transcripts: transcriptExpiry } : {}) },
+  } };
+}
+
+/**
+ * Activate a validated TinyChat bundle under a reserved lease: detach any old
+ * candidates, register memory then transcripts, and require both installed.
+ * Returns false when the lease was superseded. Throws activation failures.
+ */
+export async function activateBundle(
+  host: SessionHandlerHost,
+  agentId: string,
+  entityId: string,
+  lease: SessionLease,
+  bundle: ValidatedBundle,
+): Promise<boolean> {
+  if (!host.disconnectEntity || !host.registerTranscriptDelegation || !host.privateAccessAvailable || bundle.transcripts === undefined) {
+    throw new Error("private access unavailable");
+  }
+  await host.disconnectEntity(agentId, entityId);
+  if (!lease.isCurrent()) return false;
+  const storage = await host.storageFor(agentId);
+  if (!lease.isCurrent()) return false;
+  await storage.registerDelegation(entityId, bundle.memory, bundle.roomId, lease.isCurrent, lease.isActive);
+  if (!lease.isCurrent()) return false;
+  await host.registerTranscriptDelegation(agentId, entityId, bundle.transcripts, bundle.roomId, lease.isCurrent, lease.isActive);
+  if (!lease.isCurrent()) return false;
+  if (!host.privateAccessAvailable(agentId, entityId)) throw new Error("private access unavailable");
+  return true;
+}
+
+export function bundleRecord(agentId: string, bundle: ValidatedBundle): SessionRecord {
+  const expiries = [bundle.expiries.memory, bundle.expiries.transcripts].filter((value): value is number => value !== undefined);
+  return {
+    agentId,
+    serializedDelegation: bundle.memory,
+    serializedTranscriptDelegation: bundle.transcripts,
+    roomId: bundle.roomId,
+    ...(expiries.length ? { exp: Math.min(...expiries) } : {}),
+    expiries: { ...bundle.expiries },
+  };
+}
+
 export async function handlePostSessions(
   body: PostSessionsBody,
   host: SessionHandlerHost,
   store: SessionStore,
   scope?: SessionScope,
+  persistence?: SessionPersistence,
 ): Promise<HandlerResult> {
   const { agentId, entityId } = body;
   const envelope = body.session;
@@ -86,66 +236,10 @@ export async function handlePostSessions(
   const serializedTranscriptDelegation = envelope?.delegations.transcripts;
   const roomId = envelope?.roomId ?? body.roomId;
   if (typeof serializedDelegation !== "string") return { status: 400, body: { error: "invalid_body" } };
-  const policy = defaultElizaMemoryPolicy();
 
-  // 1. Deserialize
-  let deleg;
-  try {
-    deleg = deserializeDelegationSafe(serializedDelegation);
-  } catch {
-    return { status: 400, body: { error: "malformed" } };
-  }
-
-  // V2 has a separately activated fixed-policy transcript grant. Compact UCANs
-  // are normalized from signed att; current CID-backed children are policy-
-  // checked here and cryptographically verified by the host during activation.
-  let transcriptDelegation: ReturnType<typeof deserializeTranscriptDelegationForActivation> | undefined;
-  if (serializedTranscriptDelegation !== undefined) {
-    try {
-      transcriptDelegation = deserializeTranscriptDelegationForActivation(serializedTranscriptDelegation);
-      validateExactDelegationPolicy(transcriptDelegation, {
-        agentDID: host.agentDid,
-        policy: defaultTinychatTranscriptPolicy(),
-      });
-      // The 30-day ceiling is read from the SIGNED `exp` claim when the UCAN
-      // carries one; the top-level `expiry` summary is unsigned and forgeable,
-      // so a short summary must not launder a long-lived signed grant.
-      if (!withinTranscriptExpiryCeiling(serializedTranscriptDelegation, transcriptDelegation)) {
-        return { status: 400, body: { error: "delegation_expiry_too_long" } };
-      }
-      const memoryOwner = signedOwnerAddress(deserializeAndNormalize(serializedDelegation));
-      const transcriptOwner = signedOwnerAddress(transcriptDelegation);
-      if (!memoryOwner || !transcriptOwner || memoryOwner.toLowerCase() !== transcriptOwner.toLowerCase()) {
-        return { status: 400, body: { error: "wrong_delegator" } };
-      }
-    } catch (e) {
-      if (e instanceof DelegationPolicyError) return { status: 400, body: { error: transcriptErrorCode(e) } };
-      return { status: 400, body: { error: "malformed" } };
-    }
-  }
-
-  // 2. Shape validation (shallow: ownerAddress, delegateDID, expiry, SQL presence)
-  try {
-    validateDelegationShape(deleg, { agentDid: host.agentDid, dbHandle: MEMORY_DB_HANDLE });
-  } catch (e) {
-    if (e instanceof DelegationShapeError) {
-      return { status: 400, body: { error: "invalid_shape", message: e.message } };
-    }
-    throw e;
-  }
-
-  // 3. Policy validation — delegateDID==agentDID + expiry + resource path + actions
-  try {
-    validateDelegationPolicy(deleg, { agentDID: host.agentDid, policy });
-  } catch (e) {
-    if (e instanceof DelegationPolicyError) {
-      return {
-        status: 400,
-        body: { error: (e.reason as string).toLowerCase(), message: e.message },
-      };
-    }
-    throw e;
-  }
+  const validation = validateBundle({ memory: serializedDelegation, transcripts: serializedTranscriptDelegation, roomId }, host.agentDid);
+  if (!validation.ok) return validation.result;
+  const bundle = validation.bundle;
 
   if (bundled) {
     if (!host.disconnectEntity || !host.registerTranscriptDelegation || !host.privateAccessAvailable) {
@@ -155,24 +249,30 @@ export async function handlePostSessions(
     // lease are unusable from this point, including during bounded cleanup.
     const lease = store.reserve(scope, entityId, body.revision);
     if (!lease) return { status: 409, body: { error: "stale_revision" } };
+    // A new ceremony replaces any pending reload of the stored grant.
+    persistence?.forget?.(scope, entityId);
     const stale = () => ({ status: 409, body: { error: "stale_revision" } });
     try {
-      await host.disconnectEntity(agentId, entityId);
-      if (!lease.isCurrent()) return stale();
-      const storage = await host.storageFor(agentId);
-      if (!lease.isCurrent()) return stale();
-      await storage.registerDelegation(entityId, serializedDelegation, roomId, lease.isCurrent, lease.isActive);
-      if (!lease.isCurrent()) return stale();
-      await host.registerTranscriptDelegation(agentId, entityId, serializedTranscriptDelegation!, roomId, lease.isCurrent, lease.isActive);
-      if (!lease.isCurrent()) return stale();
-      if (!host.privateAccessAvailable(agentId, entityId)) throw new Error("private access unavailable");
-      if (!store.commit(scope, entityId, lease, { agentId, serializedDelegation, serializedTranscriptDelegation, roomId })) return stale();
+      if (!await activateBundle(host, agentId, entityId, lease, bundle)) return stale();
+      const record = bundleRecord(agentId, bundle);
+      // Persist before confirming: a connection a restart would lose is never
+      // reported as connected. The write publishes this record only while the
+      // lease is current, ordered after every earlier write for the entity.
+      if (persistence) {
+        if (!store.stage(scope, entityId, lease, record)) return stale();
+        const durable = await persistence.sync(scope, entityId);
+        if (!lease.isCurrent()) return stale();
+        if (!durable) throw new Error("private access not persisted");
+      }
+      if (!store.commit(scope, entityId, lease, record)) return stale();
       return { status: 200, body: { entityId, status: "active", transcriptStatus: "active", revision: lease.revision, state: "active" } };
     } catch (error) {
       // Cleanup can only own the current generation. Detachment is synchronous
       // so a new ceremony cannot be deleted by this operation after an await.
       if (!lease.isCurrent()) return stale();
       store.fail(scope, entityId, lease);
+      // Publish "none" so a write that landed late cannot be restored later.
+      if (persistence) void persistence.sync(scope, entityId);
       try { await host.disconnectEntity(agentId, entityId); } catch { /* inactive; report failure below */ }
       return { status: error instanceof DelegationPolicyError ? 400 : 503,
         body: { error: error instanceof DelegationPolicyError ? transcriptErrorCode(error) : "private_access_unavailable" } };
@@ -200,7 +300,7 @@ export async function handlePostSessions(
   store.set(entityId, { agentId, serializedDelegation, serializedTranscriptDelegation, roomId });
 
   // 6. Return liveness status
-  const status = evaluateDelegationStatus({ delegation: deleg, policy, agentDID: host.agentDid });
+  const status = evaluateDelegationStatus({ delegation: deserializeDelegationSafe(serializedDelegation), policy: defaultElizaMemoryPolicy(), agentDID: host.agentDid });
   return {
     status: 200,
     body: {
@@ -222,6 +322,14 @@ export async function handleGetSessions(
 ): Promise<HandlerResult> {
   const snapshot = scope?.appId === "tinychat" ? store.snapshot(scope, entityId) : undefined;
   const metadata = snapshot ? { revision: snapshot.revision, state: snapshot.state } : {};
+  // A stored grant is still being reloaded after a restart: never report "none".
+  if (snapshot?.state === "restoring") {
+    return { status: 503, body: { error: "private_access_restoring", ...metadata } };
+  }
+  // A reloaded grant the node reported revoked stays reported until reconnect.
+  if (snapshot?.state === "revoked") {
+    return { status: 200, body: { entityId, status: "revoked", ...metadata } };
+  }
   const record = snapshot ? snapshot.record : store.get(entityId);
   // Installed access is gone. A lapsed signed grant still reports "expired" (the
   // reconnect reason) through the evaluation below; anything else stays "none".
@@ -277,13 +385,22 @@ export async function handleGetSessions(
   return { status: 200, body: { entityId, status: delegStatus, ...(transcriptStatus ? { transcriptStatus } : {}), ...metadata } };
 }
 
-export async function handleDeleteSessions(entityId: string, host: SessionHandlerHost, store: SessionStore, scope: SessionScope): Promise<HandlerResult> {
+export async function handleDeleteSessions(entityId: string, host: SessionHandlerHost, store: SessionStore, scope: SessionScope, persistence?: SessionPersistence): Promise<HandlerResult> {
   if (scope.appId !== "tinychat") return { status: 404, body: { error: "not_found" } };
   const snapshot = store.disconnect(scope, entityId);
+  // Remove the stored grant before confirming, so a restart never undoes a
+  // Disconnect. A failed delete keeps retrying in the background; in-memory
+  // access is detached regardless.
+  persistence?.forget?.(scope, entityId);
+  const removed = persistence ? persistence.sync(scope, entityId) : Promise.resolve(true);
+  let detached = true;
   try {
     if (!host.disconnectEntity) throw new Error("private access unavailable");
     await host.disconnectEntity(scope.agentId, entityId);
   } catch {
+    detached = false;
+  }
+  if (!await removed || !detached) {
     return { status: 503, body: { error: "disconnect_unconfirmed", revision: snapshot.revision } };
   }
   return { status: 200, body: { entityId, status: "none", revision: snapshot.revision, state: "disconnected" } };
@@ -315,27 +432,27 @@ function transcriptErrorCode(error: DelegationPolicyError): string {
   }
 }
 
-/** tinychat mints its agent delegations for 30 days; allow up to that. */
-const MAX_TRANSCRIPT_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
+/** TinyChat mints its agent delegations for at most 30 days; allow up to that. */
+const MAX_GRANT_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
- * Enforce the transcript grant's 30-day ceiling against the signed UCAN `exp`
- * claim, falling back to the (already policy-validated) top-level expiry only
- * when the token carries no `exp`. Never throws and never echoes token bytes.
+ * Effective expiry (epoch ms) for ceiling checks: the later of the signed UCAN
+ * `exp` claim and the top-level summary, so a short unsigned summary cannot
+ * launder a long-lived signed grant. Null when the summary is unreadable.
+ * Never throws and never echoes token bytes.
  */
-function withinTranscriptExpiryCeiling(
+function effectiveExpiry(
   serialized: string,
   delegation: { expiry?: unknown },
-): boolean {
+): number | null {
   const summary = delegation.expiry instanceof Date
     ? delegation.expiry
     : new Date(delegation.expiry as unknown as string);
-  if (!Number.isFinite(summary.getTime())) return false;
+  if (!Number.isFinite(summary.getTime())) return null;
   const signedExpSecs = signedExpirySeconds(serialized);
-  const effective = signedExpSecs === null
+  return signedExpSecs === null
     ? summary.getTime()
     : Math.max(summary.getTime(), signedExpSecs * 1_000);
-  return effective - Date.now() <= MAX_TRANSCRIPT_EXPIRY_MS;
 }
 
 function signedExpirySeconds(serialized: string): number | null {

@@ -19,6 +19,9 @@ by TinyCloud delegated memory.
   There is **no local SQLite file** in the CVM — the single-writer-SQLite
   constraint lives on the node, not here. The container is safe to restart and
   needs **no data volume** (only the ingress holds a TLS-cert volume).
+- **Connected TinyChat grants survive restarts.** They are stored in the agent's
+  own TinyCloud space on `TINYCLOUD_HOST` (see "Agent grants across restarts"
+  below), not in the container.
 - **Build context is the repo root** (the Bun workspace), not this package dir —
   the Dockerfile builds the two workspace deps (`@tinycloud/agent-client`,
   `@tinycloud/eliza-plugin-memory`) before the service, because Bun resolves the
@@ -62,7 +65,8 @@ enabling the new controller.
   are still capped at 1 hour by the SDK and by the user's delegation expiry, so
   the service keeps re-activating every ~50 minutes.
 - Incoming transcript grants are accepted up to 30 days (tinychat's agent
-  delegation lifetime). Memory grants have no service-side ceiling.
+  delegation lifetime). Memory grants have the same 30-day ceiling, read from the
+  signed `exp` claim; longer grants are rejected with `delegation_expiry_too_long`.
 - When a stored user delegation expires, the session stops its proactive refresh,
   logs `stored delegation rejected; stopping proactive refresh` once, and reports
   `delegation_expired` so the user is asked to reconnect. Transient failures keep
@@ -71,6 +75,41 @@ enabling the new controller.
   node, compared with ~20s and a one-time ~55s bootstrap "repair" otherwise).
 - Live check with throwaway keys (no production secrets):
   `TINYCLOUD_LIVE=1 bun --bun run scripts/live-session-probe.ts`.
+
+### Agent grants across restarts
+
+The delegations the agent holds are kept in the agent's own TinyCloud space
+(space name `eliza-delegations`, owned by `TINYCLOUD_AGENT_KEY`) on
+`TINYCLOUD_HOST`. TinyChat "Connect agent" bundles are stored as plain JSON under
+`delegations/v1/{appId}/{agentId}/{entityId}`: the two serialized delegations,
+the access revision, state, expiries and room id. They are not encrypted: only
+the agent can invoke a delegation, because invoking needs the agent key's
+signature. The store never holds the agent key, session keys or invocations.
+
+- **Connect** is confirmed only after the grant is stored. If the write fails,
+  `POST /sessions` returns 503 `private_access_unavailable`.
+- **Disconnect** deletes the stored grant before it is confirmed. If the delete
+  fails, access is still detached in memory, the response is 503
+  `disconnect_unconfirmed`, and the delete is retried in the background (and
+  flushed for up to 5 s on SIGTERM).
+- **After a restart** the service lists stored grants and reloads them in the
+  background, 8 at a time, eagerly up to the registry capacity and on first
+  request after that. Every reload re-runs the registration checks and
+  re-activates the grants on the node, under the stored revision. Until an
+  entity is reloaded, its requests return 503 `private_access_restoring` (never
+  `none`); a request moves that entity to the front of the queue.
+  - Expired grants report `expired` and are deleted 7 days after expiry.
+  - Grants the node reports revoked become tombstones; `GET /sessions` reports
+    `status: "revoked"` and tools return `delegation_revoked` until reconnect.
+  - Node errors are retried with backoff.
+- `GET /health` includes `grants: { state, restoring }`, where `state` is
+  `indexing`, `restoring` or `ready`, and `restoring` counts stored grants not yet
+  reloaded.
+- `ELIZA_DELEGATION_STORE=off` disables persistence; it is accepted only with
+  `NODE_ENV=development` or `test`. Local validation mode is memory-only unless
+  `ELIZA_DELEGATION_STORE=on`.
+- The first deploy of this version starts with an empty store: grants
+  connected before it are not persisted, so those users reconnect once.
 
 ## 2. Push to GHCR
 
