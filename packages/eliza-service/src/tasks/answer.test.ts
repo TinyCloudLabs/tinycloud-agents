@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { admitMeetingToolData, createRunEvidence, packRunEvidence, type MeetingOutcome, type PackedMeetingEvidence } from "./evidence.js";
 import * as answerModule from "./answer.js";
+import { readMeetingEvidence } from "../meeting-evidence.js";
+import type { TranscriptMetadata, TranscriptReader } from "../actions/tinycloud-search-transcripts.js";
 
 async function answer() {
   return answerModule;
@@ -190,5 +192,76 @@ describe("task prose answer policy", () => {
     expect(final.outcome).toBe("success");
     expect(final.answer.text).not.toContain("private-access-context");
     expect(final.answer.text).not.toContain("storage-record-");
+  });
+});
+
+describe("recap-only answers are a choice, not a failure", () => {
+  // The live question was "tell me about my last few meetings for which there is a transcript";
+  // each summary read was answered from its stored recap, so no body was requested.
+  async function recapOnly() {
+    const rows: TranscriptMetadata[] = [1, 2, 3].map(n => ({ meetingRef: `recap-record-${n}`, source: "fireflies", sourceId: `source-${n}`, title: `Planning ${n}`,
+      startedAt: `2026-09-0${n}T10:00:00Z`, organizerEmail: null, participantNames: ["Ava"], participantEmails: [], summaryOverview: `Recap ${n}: the team chose cobalt for launch ${n}.`, summaryActionItems: null }));
+    let bodyReads = 0;
+    const reader: TranscriptReader = { listMetadata: async () => rows, getTranscript: async () => { bodyReads++; return [{ text: "unused" }]; } };
+    const outcomes = [];
+    for (const row of rows) outcomes.push(await readMeetingEvidence(reader, row.meetingRef, { focus: "summary" }));
+    const run = admitMeetingToolData(createRunEvidence("recap-access-context"), { toolName: "tinycloud_read_meeting", arguments: { focus: "summary" }, data: { contractVersion: 2, outcomes } });
+    return { evidence: packRunEvidence(run, { contextWindowTokens: 128_000, contextText: "Question and fixed instructions" }), bodyReads };
+  }
+  const prose = "Here is what the stored recaps say: the team chose cobalt for launch 1 [M1:E1], launch 2 [M2:E1] and launch 3 [M3:E1]. Ask about a specific meeting for transcript detail.";
+  const failure = /this round|wasn['’]t able|unable|couldn['’]t|could not|failed|do not establish|not requested/i;
+
+  it("is a sufficient, non-partial success with recap wording in the coverage section", async () => {
+    const { validateMeetingAnswer, finalizeMeetingAnswer } = await answer();
+    const { evidence, bodyReads } = await recapOnly();
+    expect(bodyReads).toBe(0);
+    expect(evidence.meetings.map(meeting => [meeting.body.state, meeting.coverage.support])).toEqual(Array(3).fill(["not_requested", "sufficient"]));
+    const validation = validateMeetingAnswer(prose, evidence, { requireContent: true });
+    expect(validation).toMatchObject({ ok: true, codes: [] });
+    const final = finalizeMeetingAnswer(validation, evidence);
+    expect(final.outcome).toBe("success");
+    expect(final.answer.text).toContain("M1 — Content was read; this answer cites this record. Based on the stored recap.");
+    expect(final.answer.text).toContain("ask about a specific meeting for transcript detail");
+    expect(final.answer.text.slice(final.answer.text.indexOf("### Coverage"))).not.toMatch(failure);
+  });
+
+  it("keeps the full-coverage and exhaustive-decision guards for recap-only evidence", async () => {
+    const { validateMeetingAnswer } = await answer();
+    const { evidence } = await recapOnly();
+    for (const claim of ["This is full transcript coverage.", "Coverage for this meeting is complete.", "The only decision was cobalt [M1:E1].", "No other decisions were recorded."]) {
+      expect(validateMeetingAnswer(`${prose} ${claim}`, evidence, { requireContent: true }).codes).toContain("coverage_conflict");
+    }
+    // Discovery and per-meeting read guards are unchanged by recap-only reads.
+    const narrowed = await recapOnly();
+    narrowed.evidence.meetings[2] = { ...narrowed.evidence.meetings[2]!, state: "not_read", evidence: [], coverage: { ...narrowed.evidence.meetings[2]!.coverage, support: "none" } };
+    expect(validateMeetingAnswer("Cobalt [M1:E1]. I read all 3 meetings.", narrowed.evidence, { requireContent: true }).codes).toContain("coverage_conflict");
+  });
+
+  it("keeps recap-only, unread and earlier-body statuses distinct", async () => {
+    const { buildCoverage } = await answer();
+    const text = buildCoverage(packed([
+      meeting("M1"),
+      meeting("M2", "metadata", { evidence: [] }),
+      meeting("M3", "read", { evidence: [{ id: "M3:E1", meetingRef: "storage-record-M3", source: "fireflies", kind: "transcript_excerpt", text: "Earlier body read.", offsets: { start: 0, end: 18 }, truncated: false }] }),
+    ]), ["M1"]);
+    expect(text).toContain("M1 — Content was read; this answer cites this record. Based on the stored recap.");
+    expect(text).toContain("M2 — Discovered; content was not read. Body was not requested.");
+    expect(text).toContain("M3 — Content was read, but this answer does not cite it. Body was not requested.");
+  });
+
+  it("synthesis presents recaps as a choice and never mentions rounds, while still forbidding more tool calls", async () => {
+    const { buildSynthesisMessages } = await answer();
+    const { evidence } = await recapOnly();
+    for (const allowWebSearch of [true, false]) {
+      const system = buildSynthesisMessages({ question: "Tell me about my last few meetings for which there is a transcript.", evidence, allowWebSearch })[0]!.content;
+      expect(system).not.toMatch(/this round|No private tools are available/i);
+      expect(system).toContain("based on the stored recaps");
+      expect(system).toContain("ask about a specific meeting for transcript detail");
+      expect(system).toContain("not a retrieval failure");
+      expect(system).toContain("never claim complete or full coverage");
+      expect(system).toContain(allowWebSearch ? "Do not request private meeting tools." : "Do not request another tool call.");
+    }
+    const repair = buildSynthesisMessages({ question: "Summarize.", evidence, allowWebSearch: true, repairCodes: ["coverage_conflict"] })[0]!.content;
+    expect(repair).toContain("Do not request another tool call.");
   });
 });

@@ -97,11 +97,30 @@ export function meetingMetadata(row: TranscriptMetadata): MeetingMetadata {
   return { meetingRef: row.meetingRef, source: row.source, title: row.title === null ? null : bounded(row.title, 160), startedAt: row.startedAt,
     participants: row.participantNames.slice(0, 20).map(name => bounded(name, 120)), organizerEmail: row.organizerEmail === null ? null : bounded(row.organizerEmail, 254) };
 }
+/** Provider notices that a recap was not produced. Anchored or paired so a real recap that mentions these words still counts. */
+const PLACEHOLDER_RECAPS = [
+  /^(?:n\/?a|none|null|nil|tb[ad]|pending|empty|unavailable|not\s+available|no\s+(?:summary|notes|recap|overview)(?:\s+(?:yet|available|provided))?)[.!]?$/i,
+  /^(?:(?:a|the|this)\s+)?(?:meeting\s+)?(?:summary|notes|recap|overview)\s+(?:(?:(?:was|were|is|are|could|can|has|have)(?:\s+not|n['’]t)|cannot)(?:\s+be(?:en)?)?|not)\s+(?:produced|generated|created|available|taken)\b/i,
+  /^(?:(?:a|the|this)\s+)?(?:meeting\s+)?(?:summary|notes|recap|overview)\s+(?:is\s+)?unavailable\b/i,
+  /^no\s+(?:meeting\s+)?(?:summary|notes|recap|overview)\s+(?:(?:was|were|is|has\s+been)\s+)?(?:produced|generated|created|available)\b/i,
+  /(?:\bnot|n['’]t)\s+enough\s+(?:conversation|speech|discussion|dialog(?:ue)?|audio|talking)\b[^.!?]{0,80}?\b(?:supported\s+language|to\s+(?:produce|generate|create|take|write|make)\s+(?:a\s+|the\s+|any\s+)?(?:summary|notes|recap))/i,
+];
+/**
+ * Stored overview text, or null when it is missing or carries no meeting content. Conservative:
+ * fewer than four letters/digits, a bare null token, or a short "summary not produced" or
+ * "not enough conversation" notice (e.g. Gemini notes for a meeting with too little speech).
+ */
+export function storedRecap(value: string | null | undefined): string | null {
+  const text = value?.trim();
+  if (!text || (text.match(/[\p{L}\p{N}]/gu)?.length ?? 0) < 4) return null;
+  const lead = text.replace(/^[^\p{L}\p{N}]+/u, "");
+  return text.length <= 600 && PLACEHOLDER_RECAPS.some(pattern => pattern.test(lead)) ? null : text;
+}
 function baseOutcome(row: TranscriptMetadata, request: EvidenceRequest): MeetingOutcome {
   const metadataLimited = row.participantNames.length > 20 || row.participantNames.some(name => name.length > 120) || (row.title?.length ?? 0) > 160 || (row.organizerEmail?.length ?? 0) > 254 || row.metadataLimited;
   return { meetingRef: row.meetingRef, source: row.source, meeting: meetingMetadata(row), state: request.focus === "metadata" ? "metadata" : "read", body: { state: "not_requested" },
     search: { state: "not_requested", storedFieldsExamined: false, bodyExamined: false, examinedMatches: 0, retainedMatches: 0 }, evidence: [],
-    coverage: { purpose: request.focus, overviewPresent: Boolean(row.summaryOverview?.trim()), actionsPresent: Boolean(row.summaryActionItems?.trim()), bodyAttempted: false, bodyRequired: Boolean(request.includeBody) || ["topic", "speaker", "decisions", "transcript"].includes(request.focus), evidenceRetained: 0, omittedEvidenceCount: metadataLimited ? 1 : 0, omissionReasons: metadataLimited ? ["metadata_limit"] : [], support: "none" } };
+    coverage: { purpose: request.focus, overviewPresent: storedRecap(row.summaryOverview) !== null, actionsPresent: Boolean(row.summaryActionItems?.trim()), bodyAttempted: false, bodyRequired: Boolean(request.includeBody) || ["topic", "speaker", "decisions", "transcript"].includes(request.focus), evidenceRetained: 0, omittedEvidenceCount: metadataLimited ? 1 : 0, omissionReasons: metadataLimited ? ["metadata_limit"] : [], support: "none" } };
 }
 export function metadataOutcome(row: TranscriptMetadata): MeetingOutcome {
   const outcome = baseOutcome(row, { focus: "metadata" });
@@ -225,14 +244,16 @@ export async function readMeetingEvidence(reader: TranscriptReader, reference: s
   const topic = request.focus === "topic";
   const focused = ["topic", "decisions", "speaker", "actions"].includes(request.focus);
   const storedAllowed = !request.speaker;
-  if (row.summaryOverview?.trim() && storedAllowed && (!topic || matches(row.summaryOverview, request.query))) add(notesProvenance(row) ? "notes" : "summary", row.summaryOverview.trim(), "summary");
+  // A placeholder recap counts as missing: it is neither evidence nor a reason to skip the body.
+  const overview = storedRecap(row.summaryOverview);
+  if (overview && storedAllowed && (!topic || matches(overview, request.query))) add(notesProvenance(row) ? "notes" : "summary", overview, "summary");
   const allActions = actionItemsOf(row.summaryActionItems).filter(item => !request.assignee || item.toLowerCase().includes(request.assignee.toLowerCase()));
   if ((row.summaryActionItems?.length ?? 0) > 64_000 || allActions.length > 100) outcome.coverage.omissionReasons.push("action_input_limit");
   const retainedActions = allActions.filter(item => storedAllowed && (!topic || matches(item, request.query)));
   for (const [index, text] of retainedActions.slice(0, 8).entries()) add("action", text, `action-${index + 1}`, {}, 800);
   if (retainedActions.length > 8) { outcome.coverage.omittedEvidenceCount += retainedActions.length - 8; outcome.coverage.omissionReasons.push("action_limit"); }
   const needsBody = Boolean(request.includeBody) || ["topic", "speaker", "transcript", "decisions"].includes(request.focus)
-    || (request.focus === "summary" && !row.summaryOverview?.trim()) || (request.focus === "actions" && !allActions.length);
+    || (request.focus === "summary" && !overview) || (request.focus === "actions" && !allActions.length);
   if (focused) { outcome.search.state = "no_match"; outcome.search.storedFieldsExamined = storedAllowed && (topic || request.focus === "actions"); }
   if (needsBody) {
     outcome.coverage.bodyAttempted = true;
@@ -251,7 +272,8 @@ export async function readMeetingEvidence(reader: TranscriptReader, reference: s
     if (body.state === "present") {
       let sentences = bodySentences(value);
       outcome.search.bodyExamined = focused;
-      const knownTranscript = row.source === "fireflies" || row.source === "tinycloud-transcriber" || Number(row.metadata?.transcript_count ?? 0) > 0;
+      // Exo Local bodies are local You/Others channel transcripts, written in the Fireflies sentence shape.
+      const knownTranscript = row.source === "fireflies" || row.source === "tinycloud-transcriber" || row.source === "exo-local" || Number(row.metadata?.transcript_count ?? 0) > 0;
       const notesBody = notesProvenance(row) && row.metadata?.notes_association !== "conference" && !Number(row.metadata?.transcript_count ?? 0);
       const sourceKind = notesBody ? "notes" : knownTranscript ? "transcript_excerpt" : "body_excerpt";
       if (request.focus === "summary" || (request.focus === "transcript" && !request.query && !request.speaker)) {

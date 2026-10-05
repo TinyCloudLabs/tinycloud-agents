@@ -1,7 +1,8 @@
 // Fixed TinyChat tool definitions copied from main bad9c0e; no shared package dependency.
+// SOURCE_SCHEMA adds `exo-local`; TinyChat backend/src/transcripts/tool-contract.ts must match.
 const SOURCE_SCHEMA = {
   type: "string",
-  enum: ["fireflies", "google-meet", "tinycloud-transcriber"],
+  enum: ["fireflies", "google-meet", "tinycloud-transcriber", "exo-local"],
 } as const;
 
 export const FILTER_PROPERTIES = {

@@ -8,7 +8,9 @@ export const TINYCLOUD_READ_MEETING = "tinycloud_read_meeting";
 export const TINYCLOUD_SEARCH_TRANSCRIPTS = "tinycloud_search_transcripts";
 export const TINYCLOUD_LIST_MEETING_ACTIONS = "tinycloud_list_meeting_actions";
 
-export type TranscriptSource = "fireflies" | "google-meet" | "tinycloud-transcriber";
+/** `connector_meeting.source` values the agent reads. TinyChat writes Exo Local recordings as `exo-local`. */
+export const TRANSCRIPT_SOURCES = ["fireflies", "google-meet", "tinycloud-transcriber", "exo-local"] as const;
+export type TranscriptSource = typeof TRANSCRIPT_SOURCES[number];
 type SortOrder = "newest" | "oldest";
 
 export interface MeetingFilters {
@@ -31,8 +33,6 @@ export interface ReadMeetingArgs {
 export interface TranscriptSearchArgs extends MeetingFilters { query: string; speaker?: string; meetingRef?: string; sort?: SortOrder }
 export interface ListMeetingActionsArgs extends MeetingFilters { assignee?: string; includeBody?: boolean; sort?: SortOrder }
 
-const SOURCES = ["fireflies", "google-meet", "tinycloud-transcriber"] as const;
-
 function parseBoundedString(value: unknown, max: number): string | undefined | null {
   if (value === undefined) return undefined;
   if (typeof value !== "string") return null;
@@ -47,7 +47,7 @@ function parseFilters(args: Record<string, unknown>): MeetingFilters | null {
   if (args.from !== undefined && (typeof args.from !== "string" || !validDate(args.from))) return null;
   if (args.to !== undefined && (typeof args.to !== "string" || !validDate(args.to))) return null;
   if (typeof args.from === "string" && typeof args.to === "string" && args.from > args.to) return null;
-  if (args.source !== undefined && !SOURCES.includes(args.source as TranscriptSource)) return null;
+  if (args.source !== undefined && !TRANSCRIPT_SOURCES.includes(args.source as TranscriptSource)) return null;
   return {
     ...(title ? { title } : {}),
     ...(participant ? { participant } : {}),
