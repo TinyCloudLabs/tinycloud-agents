@@ -18,7 +18,9 @@
 # SQLite file to mount. The single-writer-SQLite constraint lives on the node.
 # The only persistent artifacts are: (1) the ingress TLS certs (named volume
 # below) and (2) the agent key file, materialized by the entrypoint from the
-# encrypted TINYCLOUD_AGENT_KEY environment value. See DEPLOY.md.
+# encrypted TINYCLOUD_AGENT_KEY environment value. Connected user grants survive
+# restarts because they are stored in the agent's own TinyCloud space on
+# TINYCLOUD_HOST, not in this container. See DEPLOY.md.
 services:
   eliza-service:
     image: ${ELIZA_SERVICE_IMAGE:-ghcr.io/tinycloudlabs/eliza-service:latest}

@@ -25,7 +25,8 @@ function makeValidSerialized(): string {
     spaceId: "tinycloud:pkh:eip155:1:0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2:default",
     path: MEMORY_DB_HANDLE,
     actions: ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"],
-    expiry: new Date("2099-01-01T00:00:00.000Z").toISOString(),
+    // Within the 30-day registration ceiling.
+    expiry: new Date(Date.now() + 29 * 24 * 60 * 60 * 1000).toISOString(),
     ownerAddress: "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2",
     chainId: 1,
     host: "https://node.tinycloud.xyz",

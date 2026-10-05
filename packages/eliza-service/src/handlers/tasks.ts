@@ -15,7 +15,13 @@ const json = (status: number, body: unknown) => new Response(JSON.stringify(body
 export class TaskHandler {
   private readonly registrations = new Map<string, Registration>();
   private readonly activeRooms = new Set<string>();
-  constructor(private readonly config?: TaskConfig, private readonly host?: ToolHandlerHost, private readonly sessions?: SessionStore) { if (config) assertTaskConfig(config); }
+  constructor(
+    private readonly config?: TaskConfig,
+    private readonly host?: ToolHandlerHost,
+    private readonly sessions?: SessionStore,
+    /** Waits (bounded) for an entity's stored grant to finish reloading after a restart. */
+    private readonly awaitRestore?: (scope: ResolvedApp, entityId: string) => Promise<unknown>,
+  ) { if (config) assertTaskConfig(config); }
 
   capabilities(app: ResolvedApp) {
     const enabled = app.appId === TINYCHAT_APP_ID && this.config !== undefined;
@@ -28,6 +34,9 @@ export class TaskHandler {
     try {
       if (request.signal.aborted) throw new TaskError("cancelled_before_admission");
       const body = validateTask(await readBody(request, TASK_BODY_BYTES), this.config, app.appId);
+      if (request.signal.aborted) throw new TaskError("cancelled_before_admission");
+      // Before any admission state: a reloading grant should not silently drop private tools.
+      await this.awaitRestore?.(app, body.entityId);
       if (request.signal.aborted) throw new TaskError("cancelled_before_admission");
       const duration = Math.min(body.deadlineAt - Date.now(), this.config.maxDurationMs ?? 300_000);
       if (duration <= 0) throw new TaskError("expired_task");
