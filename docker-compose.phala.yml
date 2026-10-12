@@ -1,13 +1,14 @@
 # Phala CVM deployment for @tinycloud/eliza-service.
 #
 # Mirrors the org's standard two-service shape (service + dstack-ingress TLS
-# sidecar; see listen/tinychat). The operator runs `phala cvms create` with this
+# sidecar; see listen/tinychat). The operator runs `phala deploy` with this
 # compose and sets the env vars / secrets below.
 #
-#   phala cvms create \
-#     --name eliza-service \
-#     --compose docker-compose.phala.yml \
-#     --env-file .env.phala
+#   phala deploy \
+#     -n eliza-service \
+#     -c docker-compose.phala.yml \
+#     -e .env.phala \
+#     --no-public-logs
 #
 # ── PERSISTENCE NOTE (important) ──────────────────────────────────────────────
 # eliza-service holds NO local durable state. The Eliza AgentRuntime boots with

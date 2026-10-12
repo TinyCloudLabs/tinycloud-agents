@@ -1,12 +1,12 @@
 # Deploying `@tinycloud/eliza-service` to a Phala CVM
 
 This runbook mirrors how tinychat / listen deploy: build a Bun image, push to
-GHCR, then `phala cvms create` with `docker-compose.phala.yml` and a TLS
+GHCR, then `phala deploy` with `docker-compose.phala.yml` and a TLS
 `dstack-ingress` sidecar. The agent (eliza-service) hosts ElizaOS runtimes backed
 by TinyCloud delegated memory.
 
 > **Who runs what:** the artifacts (Dockerfile, compose, this runbook) are
-> committed. The **operator** runs `docker build/push`, `phala cvms create`, and
+> committed. The **operator** runs `docker build/push`, `phala deploy`, and
 > sets the secrets below. Nothing here hardcodes a key.
 
 ---
@@ -174,13 +174,15 @@ A bind-mounted key is an alternative for local Docker only.
 ## 5. Create the CVM
 
 ```bash
-phala cvms create \
-  --name eliza-service \
-  --compose docker-compose.phala.yml \
-  --env-file .env.phala
+phala deploy \
+  -n eliza-service \
+  -c docker-compose.phala.yml \
+  -e .env.phala \
+  --no-public-logs
 ```
 
-> Use `phala cvms create` to bootstrap a NEW CVM. For subsequent rollouts of a
+> Use `phala deploy -n <name>` (Phala CLI 1.1.x has no `phala cvms create`) to bootstrap a NEW CVM.
+> New CVMs default to public logs; keep `--no-public-logs` so container logs are never exposed. For subsequent rollouts of a
 > new image, use the Phala update/deploy flow rather than re-creating.
 
 ### Updating an existing service
