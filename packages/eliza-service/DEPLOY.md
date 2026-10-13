@@ -26,8 +26,10 @@ by TinyCloud delegated memory.
   the Dockerfile builds the two workspace deps (`@tinycloud/agent-client`,
   `@tinycloud/eliza-plugin-memory`) before the service, because Bun resolves the
   `@tinycloud/*` imports to each package's built `dist/index.js`.
-- **Port 3000.** The service binds `0.0.0.0:3000`; the ingress terminates TLS on
-  `:443` and forwards to it.
+- **Port 3000.** The service binds `0.0.0.0:3000` inside the container; the
+  ingress terminates TLS on `:443` and forwards to it over the compose network.
+  Port 3000 is deliberately NOT published (TC-1012), so the Phala gateway cannot
+  serve it directly; always use `https://eliza.tinycloud.xyz`.
 
 ---
 
@@ -214,6 +216,20 @@ models than TinyChat offers causes explicit rejection for unsupported selections
 # health — confirm the agentDid matches tinychat's AGENT_DID
 curl -s https://eliza.tinycloud.xyz/health
 # => {"ok":true,"agentDid":"did:pkh:eip155:1:0x…"}
+```
+
+TC-1012 check (run after every deploy): the ingress must answer 200 and the raw
+gateway app port must give NO HTTP response (`000`). Any HTTP status from the
+`-3000` URL means port 3000 is published again and bypasses the ingress.
+
+```bash
+APP_ID=ef2c3c721828d3544ef9fcc48a45ac718d71b32c   # eliza-service CVM
+GATEWAY=dstack-pha-prod5.phala.network
+ingress=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://eliza.tinycloud.xyz/health)
+raw=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://${APP_ID}-3000.${GATEWAY}/health")
+[ "$ingress" = 200 ] || { echo "TC-1012: ingress /health returned $ingress, expected 200"; exit 1; }
+[ "$raw" = 000 ] || { echo "TC-1012: raw port 3000 answered HTTP $raw; it must not be published"; exit 1; }
+echo "TC-1012 OK: ingress 200, raw port 3000 unreachable"
 ```
 
 ---

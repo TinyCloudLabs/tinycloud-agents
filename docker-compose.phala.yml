@@ -26,8 +26,9 @@ services:
   eliza-service:
     image: ${ELIZA_SERVICE_IMAGE:-ghcr.io/tinycloudlabs/eliza-service:latest}
     platform: linux/amd64
-    ports:
-      - "3000:3000"
+    # TC-1012: no `ports:`. Publishing 3000 let the Phala gateway serve it at
+    # <app_id>-3000.<gateway> and bypass the ingress. dstack-ingress reaches
+    # the app over the compose network (TARGET_ENDPOINT below).
     environment:
       # ── Layer-1 service auth (REQUIRED) ──
       # Must be byte-identical to tinychat's ELIZA_SERVICE_SECRET.
