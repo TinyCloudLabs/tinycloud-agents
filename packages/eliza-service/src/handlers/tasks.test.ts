@@ -150,6 +150,9 @@ describe("TinyChat task HTTP seam", () => {
     const handler = service(async (_input, init) => { seen = JSON.parse(init!.body as string); return new Response(new ReadableStream({ start(c) { controller = c; } })); });
     const response = await handler(request());
     expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/event-stream");
+    expect(response.headers.get("cache-control")).toBe("no-cache");
+    expect(response.headers.get("x-accel-buffering")).toBe("no");
     const reader = response.body!.getReader();
     let observed = new TextDecoder().decode((await reader.read()).value);
     expect(observed).toContain('"type":"accepted"');
