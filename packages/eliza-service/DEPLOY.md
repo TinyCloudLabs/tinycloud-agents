@@ -195,6 +195,9 @@ then update only the application image and required environment forwarding. Keep
 the current ingress, identity, service credential, storage host and other settings.
 Do not substitute this bootstrap example for a deployed composition with different
 ingress or routing.
+For TC-1012, apply the `eliza-service` ports removal to the composition actually
+deployed, keeping its ingress image and settings; do not swap in the repo compose
+wholesale.
 
 Supply the full preserved environment through the existing encrypted-env update
 path, adding `REDPILL_API_KEY`, `REDPILL_BASE_URL` and `ELIZA_TASK_MODELS_JSON`.
@@ -218,18 +221,46 @@ curl -s https://eliza.tinycloud.xyz/health
 # => {"ok":true,"agentDid":"did:pkh:eip155:1:0x…"}
 ```
 
-TC-1012 check (run after every deploy): the ingress must answer 200 and the raw
-gateway app port must give NO HTTP response (`000`). Any HTTP status from the
-`-3000` URL means port 3000 is published again and bypasses the ingress.
+TC-1012 check (run after every deploy): the ingress must answer 200, and the raw
+gateway app port must give no HTTP response. For a closed port the gateway accepts
+TLS and then closes the stream (curl exit 52/56, no HTTP status). Any HTTP status
+from the `-3000` URL means port 3000 is published again and bypasses the ingress.
+Other curl errors (DNS, connect, TLS, timeout) prove nothing and are retried. The
+script is safe under `bash -e`.
 
 ```bash
-APP_ID=ef2c3c721828d3544ef9fcc48a45ac718d71b32c   # eliza-service CVM
-GATEWAY=dstack-pha-prod5.phala.network
-ingress=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://eliza.tinycloud.xyz/health)
-raw=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://${APP_ID}-3000.${GATEWAY}/health")
-[ "$ingress" = 200 ] || { echo "TC-1012: ingress /health returned $ingress, expected 200"; exit 1; }
-[ "$raw" = 000 ] || { echo "TC-1012: raw port 3000 answered HTTP $raw; it must not be published"; exit 1; }
-echo "TC-1012 OK: ingress 200, raw port 3000 unreachable"
+# TC-1012: wait for the ingress, then require the raw app port to be closed.
+ingress_url="https://eliza.tinycloud.xyz/health"
+raw_url="https://ef2c3c721828d3544ef9fcc48a45ac718d71b32c-3000.dstack-pha-prod5.phala.network/health"
+ok=0
+for attempt in $(seq 1 30); do
+  code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$ingress_url") || true
+  if [ "$code" = 200 ]; then ok=1; break; fi
+  sleep 10
+done
+[ "$ok" = 1 ] || { echo "TC-1012: $ingress_url never returned 200 (last $code)"; exit 1; }
+closed=0
+for attempt in $(seq 1 10); do
+  rc=0
+  code=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' "$raw_url" 2>/tmp/tc1012-curl.err) || rc=$?
+  if [ "$code" != "000" ]; then
+    echo "TC-1012: $raw_url answered HTTP $code; port 3000 is published on the Phala gateway"
+    exit 1
+  fi
+  if [ "$rc" = 52 ] || [ "$rc" = 56 ]; then
+    closed=$((closed + 1))
+    [ "$closed" -ge 3 ] && break
+  else
+    echo "TC-1012 probe inconclusive (curl exit $rc): $(cat /tmp/tc1012-curl.err)"
+    closed=0
+  fi
+  sleep 5
+done
+if [ "$closed" -lt 3 ]; then
+  echo "TC-1012: could not confirm $raw_url is closed (last curl exit $rc)"
+  exit 1
+fi
+echo "TC-1012 OK: ingress 200; $raw_url closed (curl exit $rc, $closed consecutive)"
 ```
 
 ---
