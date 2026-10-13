@@ -201,7 +201,14 @@ wholesale.
 The one ingress change is `CLIENT_MAX_BODY_SIZE=2m` (at least 1,064,960 bytes)
 on an ingress image that supports it: task bodies go up to 1 MiB + 16 KiB
 (`TASK_BODY_BYTES`), above nginx's default 1 MiB cap. Set it before tinychat's
-`ELIZA_SERVICE_URL` points at the ingress.
+`ELIZA_SERVICE_URL` points at the ingress. An older ingress image ignores the
+variable silently, so check it with an unauthenticated ~1.5 MB POST: expect `401`
+(eliza rejects the missing auth before reading the body), not `413` (nginx cap
+still 1 MiB):
+
+```bash
+head -c 1500000 /dev/zero | curl -sS -o /dev/null -w '%{http_code}\n' -X POST --data-binary @- https://eliza.tinycloud.xyz/tasks
+```
 
 Supply the full preserved environment through the existing encrypted-env update
 path, adding `REDPILL_API_KEY`, `REDPILL_BASE_URL` and `ELIZA_TASK_MODELS_JSON`.
