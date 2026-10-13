@@ -255,6 +255,7 @@ env:
 
 - `AGENT_DID` = the DID from `/health` (step 6).
 - `ELIZA_SERVICE_URL` = `https://eliza.tinycloud.xyz` (your `PHALA_INGRESS_DOMAIN`).
+  Prod currently deviates from this (TC-1012): tinychat's `vars.ELIZA_SERVICE_URL` is the raw `ef2c3c72…-3000` gateway URL, so switch it to `https://eliza.tinycloud.xyz` and redeploy tinychat-backend before deploying this compose.
 - `ELIZA_SERVICE_SECRET` = the **same** secret you set in `.env.phala` (byte-identical).
 
 Redeploy tinychat's CVM so it picks up the new env, then run a tinychat chat turn
