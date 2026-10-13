@@ -26,8 +26,10 @@ by TinyCloud delegated memory.
   the Dockerfile builds the two workspace deps (`@tinycloud/agent-client`,
   `@tinycloud/eliza-plugin-memory`) before the service, because Bun resolves the
   `@tinycloud/*` imports to each package's built `dist/index.js`.
-- **Port 3000.** The service binds `0.0.0.0:3000`; the ingress terminates TLS on
-  `:443` and forwards to it.
+- **Port 3000.** The service binds `0.0.0.0:3000` inside the container; the
+  ingress terminates TLS on `:443` and forwards to it over the compose network.
+  Port 3000 is deliberately NOT published (TC-1012), so the Phala gateway cannot
+  serve it directly; always use `https://eliza.tinycloud.xyz`.
 
 ---
 
@@ -193,6 +195,13 @@ then update only the application image and required environment forwarding. Keep
 the current ingress, identity, service credential, storage host and other settings.
 Do not substitute this bootstrap example for a deployed composition with different
 ingress or routing.
+For TC-1012, apply the `eliza-service` ports removal to the composition actually
+deployed, keeping its ingress image and settings; do not swap in the repo compose
+wholesale.
+The one ingress change is `CLIENT_MAX_BODY_SIZE=2m` (at least 1,064,960 bytes)
+on an ingress image that supports it: task bodies go up to 1 MiB + 16 KiB
+(`TASK_BODY_BYTES`), above nginx's default 1 MiB cap. Set it before tinychat's
+`ELIZA_SERVICE_URL` points at the ingress.
 
 Supply the full preserved environment through the existing encrypted-env update
 path, adding `REDPILL_API_KEY`, `REDPILL_BASE_URL` and `ELIZA_TASK_MODELS_JSON`.
@@ -214,6 +223,52 @@ models than TinyChat offers causes explicit rejection for unsupported selections
 # health — confirm the agentDid matches tinychat's AGENT_DID
 curl -s https://eliza.tinycloud.xyz/health
 # => {"ok":true,"agentDid":"did:pkh:eip155:1:0x…"}
+```
+
+TC-1012 check (run after every deploy): the ingress must answer 200, and the raw
+gateway app port must give no HTTP response. For a closed port the gateway accepts
+TLS and then closes the stream (curl exit 52/56, no HTTP status). Any HTTP status
+from the `-3000` URL means port 3000 is published again and bypasses the ingress.
+Other curl errors (DNS, connect, TLS, timeout) prove nothing and are retried. The
+check runs in a `( set -e; … )` subshell, so pasting it into an interactive shell
+is safe: a failure exits the subshell with status 1, not your shell.
+
+```bash
+# TC-1012: wait for the ingress, then require the raw app port to be closed.
+(
+  set -e
+  ingress_url="https://eliza.tinycloud.xyz/health"
+  raw_url="https://ef2c3c721828d3544ef9fcc48a45ac718d71b32c-3000.dstack-pha-prod5.phala.network/health"
+  ok=0
+  for attempt in $(seq 1 30); do
+    code=$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$ingress_url") || true
+    if [ "$code" = 200 ]; then ok=1; break; fi
+    sleep 10
+  done
+  [ "$ok" = 1 ] || { echo "TC-1012: $ingress_url never returned 200 (last $code)"; exit 1; }
+  closed=0
+  for attempt in $(seq 1 10); do
+    rc=0
+    code=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' "$raw_url" 2>/tmp/tc1012-curl.err) || rc=$?
+    if [ "$code" != "000" ]; then
+      echo "TC-1012: $raw_url answered HTTP $code; port 3000 is published on the Phala gateway"
+      exit 1
+    fi
+    if [ "$rc" = 52 ] || [ "$rc" = 56 ]; then
+      closed=$((closed + 1))
+      [ "$closed" -ge 3 ] && break
+    else
+      echo "TC-1012 probe inconclusive (curl exit $rc): $(cat /tmp/tc1012-curl.err)"
+      closed=0
+    fi
+    sleep 5
+  done
+  if [ "$closed" -lt 3 ]; then
+    echo "TC-1012: could not confirm $raw_url is closed (last curl exit $rc)"
+    exit 1
+  fi
+  echo "TC-1012 OK: ingress 200; $raw_url closed (curl exit $rc, $closed consecutive)"
+)
 ```
 
 ---
@@ -239,6 +294,7 @@ env:
 
 - `AGENT_DID` = the DID from `/health` (step 6).
 - `ELIZA_SERVICE_URL` = `https://eliza.tinycloud.xyz` (your `PHALA_INGRESS_DOMAIN`).
+  Prod currently deviates from this (TC-1012): tinychat's `vars.ELIZA_SERVICE_URL` is the raw `ef2c3c72…-3000` gateway URL, so switch it to `https://eliza.tinycloud.xyz` and redeploy tinychat-backend before deploying this compose.
 - `ELIZA_SERVICE_SECRET` = the **same** secret you set in `.env.phala` (byte-identical).
 
 Redeploy tinychat's CVM so it picks up the new env, then run a tinychat chat turn

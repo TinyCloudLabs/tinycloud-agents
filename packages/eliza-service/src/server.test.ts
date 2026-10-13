@@ -237,6 +237,8 @@ describe("eliza-service HTTP server", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/event-stream");
+    expect(res.headers.get("cache-control")).toBe("no-cache");
+    expect(res.headers.get("x-accel-buffering")).toBe("no");
     expect(await res.text()).toBe(
       `data: ${JSON.stringify({ text: "one" })}\n\n`
         + `data: ${JSON.stringify({ text: "two" })}\n\n`
