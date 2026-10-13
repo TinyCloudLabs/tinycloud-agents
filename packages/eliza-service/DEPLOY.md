@@ -198,6 +198,10 @@ ingress or routing.
 For TC-1012, apply the `eliza-service` ports removal to the composition actually
 deployed, keeping its ingress image and settings; do not swap in the repo compose
 wholesale.
+The one ingress change is `CLIENT_MAX_BODY_SIZE=2m` (at least 1,064,960 bytes)
+on an ingress image that supports it: task bodies go up to 1 MiB + 16 KiB
+(`TASK_BODY_BYTES`), above nginx's default 1 MiB cap. Set it before tinychat's
+`ELIZA_SERVICE_URL` points at the ingress.
 
 Supply the full preserved environment through the existing encrypted-env update
 path, adding `REDPILL_API_KEY`, `REDPILL_BASE_URL` and `ELIZA_TASK_MODELS_JSON`.
