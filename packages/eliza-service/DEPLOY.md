@@ -178,11 +178,12 @@ phala deploy \
   -n eliza-service \
   -c docker-compose.phala.yml \
   -e .env.phala \
-  --no-public-logs
+  --no-public-logs \
+  --no-public-sysinfo
 ```
 
 > Use `phala deploy -n <name>` (Phala CLI 1.1.x has no `phala cvms create`) to bootstrap a NEW CVM.
-> New CVMs default to public logs; keep `--no-public-logs` so container logs are never exposed. For subsequent rollouts of a
+> New CVMs default to public logs; keep `--no-public-logs --no-public-sysinfo` so container logs and system info are never exposed. For subsequent rollouts of a
 > new image, use the Phala update/deploy flow rather than re-creating.
 
 ### Updating an existing service
