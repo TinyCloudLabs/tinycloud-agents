@@ -191,6 +191,15 @@ describe("meeting evidence v2", () => {
     const result = await readMeeting(source, { meetingRef: "old", focus: "speaker", speaker: "Sam" });
     expect(result.data.outcomes[0].evidence.some(item => item.kind === "transcript_excerpt" && item.speaker === "Sam")).toBe(true);
   });
+  test("a combined meeting body answers speaker questions as attributed transcript evidence", async () => {
+    const body = [{ text: "We chose cobalt for launch.", speaker: "Alice" }, { text: "Agreed.", speaker: "Bob" }];
+    const combined = await readMeeting(reader({ source: "exo-merged" }, body), { meetingRef: "old", focus: "speaker", speaker: "Alice" });
+    const member = await readMeeting(reader({ source: "fireflies" }, body), { meetingRef: "old", focus: "speaker", speaker: "Alice" });
+    expect(combined.data.outcomes[0].search.state).toBe("matched");
+    const shape = (outcome: { evidence: Array<{ kind: string; speaker?: string; text: string }> }) => outcome.evidence.map(({ kind, speaker, text }) => ({ kind, speaker, text }));
+    expect(shape(combined.data.outcomes[0])).toEqual(shape(member.data.outcomes[0]));
+    expect(combined.data.outcomes[0].evidence).toEqual([expect.objectContaining({ kind: "transcript_excerpt", speaker: "Alice" })]);
+  });
   test("range aggregation retains eight ordered records with at most three body reads in flight", async () => {
     let active = 0; let peak = 0; let reads = 0;
     const source = reader();
@@ -205,7 +214,7 @@ describe("meeting evidence v2", () => {
 describe("storage classification and scoped discovery", () => {
   function storage(body: unknown, rows: unknown[][] = [["old", "fireflies", "old-source", "Design", "2025-01-01T10:00:00Z", null, [], null, null]]) {
     const calls: Array<{ sql: string; params: unknown }> = [];
-    const source = createReader({ sql: { db: () => ({ query: async (sql, params) => { calls.push({ sql, params }); return { ok: true, data: { rows } }; } }) }, kv: { get: async () => body } });
+    const source = createReader({ sql: { db: () => ({ query: async (sql, params) => { if (!sql.startsWith("SELECT source, source_id, metadata")) calls.push({ sql, params }); return { ok: true, data: { rows } }; } }) }, kv: { get: async () => body } });
     return { source, calls };
   }
   test.each([

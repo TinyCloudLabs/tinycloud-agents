@@ -273,7 +273,7 @@ export async function readMeetingEvidence(reader: TranscriptReader, reference: s
       let sentences = bodySentences(value);
       outcome.search.bodyExamined = focused;
       // Exo Local bodies are local You/Others channel transcripts, written in the Fireflies sentence shape.
-      const knownTranscript = row.source === "fireflies" || row.source === "tinycloud-transcriber" || row.source === "exo-local" || Number(row.metadata?.transcript_count ?? 0) > 0;
+      const knownTranscript = row.source === "fireflies" || row.source === "tinycloud-transcriber" || row.source === "exo-local" || row.source === "exo-merged" || Number(row.metadata?.transcript_count ?? 0) > 0;
       const notesBody = notesProvenance(row) && row.metadata?.notes_association !== "conference" && !Number(row.metadata?.transcript_count ?? 0);
       const sourceKind = notesBody ? "notes" : knownTranscript ? "transcript_excerpt" : "body_excerpt";
       if (request.focus === "summary" || (request.focus === "transcript" && !request.query && !request.speaker)) {
