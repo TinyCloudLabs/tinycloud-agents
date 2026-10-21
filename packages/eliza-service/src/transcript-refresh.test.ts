@@ -58,8 +58,9 @@ function fixture(parentMs = 7 * 24 * HOUR) {
           // node-sdk 2.6.0 useDelegation caps each activated child at one hour,
           // independently of the portable parent's longer expiry.
           const expiresAt = Math.min(Date.now() + HOUR, delegation.expiry.getTime());
-          const result = (operation: string, data: unknown) => {
-            reads.push(`${node}:${operation}`);
+          // The combined-member key read still counts toward expiry, but is not an ordering assertion target.
+          const result = (operation: string, data: unknown, record = true) => {
+            if (record) reads.push(`${node}:${operation}`);
             return Date.now() >= expiresAt
               ? { ok: false, error: { code: "AUTH_UNAUTHORIZED", meta: { status: 401 } } }
               : { ok: true, data };
@@ -67,7 +68,7 @@ function fixture(parentMs = 7 * 24 * HOUR) {
           return {
             sql: { db(name: string) {
               expect(name).toBe(PATH);
-              return { query: async () => result("sql", { rows: [["meeting", "fireflies", "source", delegation.cid, "2030-01-01T00:00:00Z", null, "[]", null, null]] }) };
+              return { query: async (sql: string) => result("sql", { rows: [["meeting", "fireflies", "source", delegation.cid, "2030-01-01T00:00:00Z", null, "[]", null, null]] }, !sql.startsWith("SELECT source, source_id, metadata")) };
             } },
             kv: { get: async (key: string, options?: { prefix?: string }) => {
               expect(key).toBe(`${PATH}/fireflies/transcript/source`);

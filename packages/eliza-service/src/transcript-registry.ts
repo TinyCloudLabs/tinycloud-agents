@@ -10,6 +10,7 @@ import type { TranscriptMetadata, TranscriptReader, TranscriptRegistry } from ".
 import { checkContext, decodeBody, discoveryResult, MeetingRetrievalError, withinContext } from "./meeting-evidence.js";
 import type { BodyResult, MeetingSelection, RetrievalContext } from "./meeting-evidence.js";
 import { createTranscriptNode, TranscriptResponseLimitError } from "./transcript-transport.js";
+import { COMBINED_SOURCE, combinedMemberKeys, isCombinedMember, readCombinedMembers } from "./combined-meetings.js";
 
 const SQL_PATH = "xyz.tinycloud.tinychat/connectors";
 const MAX_ENTRIES = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_MAX_CLIENTS) || 256;
@@ -308,17 +309,38 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     const body = response?.ok === true ? decodeBody(response.data?.data) : classifyBodyFailure(response?.error);
     enforceAccess(body); return body;
   };
+  // Member keys come from every combined row, never from the page being listed: a source filter or
+  // date window could otherwise return members whose combined row is outside the result.
+  // If this read fails the list proceeds without exclusion: a duplicate is recoverable, a hidden meeting is not.
+  // Access and cancellation errors still propagate.
+  // Projections for combined-meetings.ts: combined-key rows are (source, source_id, metadata); listed rows follow COLUMNS.
+  const combinedColumns = (row: unknown[]) => ({ source: row[0], sourceId: row[1], metadata: row[2] });
+  const listedColumns = (row: unknown[]) => ({ source: row[1], sourceId: row[2], metadata: row[9] });
+  const combinedKeys = async (context: RetrievalContext = {}): Promise<Set<string>> => {
+    try {
+      return combinedMemberKeys(await query("SELECT source, source_id, metadata FROM connector_meeting WHERE source = ?", [COMBINED_SOURCE], context), combinedColumns);
+    } catch (error) {
+      // Only the generic unavailable failure fails open; access, timeout and cancellation errors propagate.
+      if (error instanceof MeetingRetrievalError && error.code === "transcript_unavailable") return new Set();
+      throw error;
+    }
+  };
+  // Drops unreadable combined rows and every capture named by a readable combined row.
+  const visibleRows = (rows: unknown[][], hidden: ReadonlySet<string>): unknown[][] => rows.filter(row =>
+    !(row[1] === COMBINED_SOURCE && readCombinedMembers(row[9]) === null) && !isCombinedMember(row, hidden, listedColumns));
   return {
     assertAccess,
     async listMetadata() {
       const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) DESC, id ASC LIMIT ${METADATA_ROW_LIMIT}`);
-      return rows.flatMap(row => { const decoded = decodeMetadata(row); return decoded ? [decoded] : []; });
+      const hidden = await combinedKeys();
+      return visibleRows(rows, hidden).flatMap(row => { const decoded = decodeMetadata(row); return decoded ? [decoded] : []; });
     },
     async getMetadata(reference, context = {}) {
       if (!safeMeetingRef(reference)) throw new MeetingRetrievalError("invalid_args", 400);
       const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting WHERE id = ? LIMIT 1`, [reference], context);
+      const hidden = await combinedKeys(context);
       // Check identity even when a faulty upstream ignores its predicate.
-      return rows.map(decodeMetadata).find(row => row?.meetingRef === reference) ?? null;
+      return visibleRows(rows, hidden).map(decodeMetadata).find(row => row?.meetingRef === reference) ?? null;
     },
     async discoverMetadata(args, context = {}) {
       const clauses: string[] = []; const params: Array<string | number | null> = [];
@@ -327,7 +349,9 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       if (args.from) { clauses.push("julianday(started_at) >= julianday(?)"); params.push(new Date(Date.parse(args.from) - 86_400_000).toISOString()); }
       if (args.to) { clauses.push("julianday(started_at) < julianday(?)"); params.push(new Date(Date.parse(args.to) + 2 * 86_400_000).toISOString()); }
       const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) ${args.sort === "oldest" ? "ASC" : "DESC"}, id ASC LIMIT ${METADATA_ROW_LIMIT}`, params, context);
-      const decoded = rows.slice(0, 500).flatMap(row => { const value = decodeMetadata(row); return value ? [value] : []; });
+      const hidden = await combinedKeys(context);
+      // The raw row count (before exclusion) decides scanLimited, so rows past the read window stay counted as unseen.
+      const decoded = visibleRows(rows.slice(0, 500), hidden).flatMap(row => { const value = decodeMetadata(row); return value ? [value] : []; });
       return discoveryResult(decoded, rows.length, args, context);
     },
     readBody,

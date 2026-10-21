@@ -157,9 +157,11 @@ function fakeNodeFactory(corpusFor: (privateKey: string) => Corpus, trace: NodeT
       return {
         sql: {
           db(name: string) {
-            trace.dbs.push(name);
             return {
               async query(sql: string, params?: unknown[]) {
+                // Combined-member key reads are projected to (source, source_id, metadata) and kept out of the trace.
+                if (sql.startsWith("SELECT source, source_id, metadata")) return { ok: true, data: { rows: corpus.rows.filter(row => row[1] === params?.[0]).map(row => [row[1], row[2], row[9]]) } };
+                trace.dbs.push(name);
                 trace.sql.push(sql);
                 return { ok: true, data: { rows: sql.includes("WHERE id = ?") ? corpus.rows.filter(row => row[0] === params?.[0]) : corpus.rows } };
               },
