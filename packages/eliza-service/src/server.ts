@@ -320,6 +320,8 @@ function streamMessageResponse(host: ElizaServiceHost, body: PostMessagesBody, a
     headers: {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
+      // Stop the dstack-ingress nginx (proxy_buffering on) batching SSE frames.
+      "x-accel-buffering": "no",
       connection: "keep-alive",
     },
   });

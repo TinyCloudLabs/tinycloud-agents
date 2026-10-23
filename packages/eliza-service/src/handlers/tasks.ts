@@ -150,7 +150,7 @@ export class TaskHandler {
       },
       cancel: () => { closed = true; this.abort(entry, "transport_failed"); },
     }, { highWaterMark: 262_144, size: chunk => chunk!.byteLength });
-    return new Response(fenceTaskStream(stream, entry.lease), { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } });
+    return new Response(fenceTaskStream(stream, entry.lease), { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no", connection: "keep-alive" } });
   }
 }
 

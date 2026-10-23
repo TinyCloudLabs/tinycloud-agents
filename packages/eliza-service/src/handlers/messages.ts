@@ -12,6 +12,7 @@
 // SSE headers (set by the HTTP layer before calling this handler):
 //   Content-Type: text/event-stream
 //   Cache-Control: no-cache
+//   X-Accel-Buffering: no   (stops the dstack-ingress nginx batching frames)
 //   Connection: keep-alive
 //
 // Error mapping (pre-stream 409, not terminal SSE):
