@@ -8,8 +8,8 @@ export const TINYCLOUD_READ_MEETING = "tinycloud_read_meeting";
 export const TINYCLOUD_SEARCH_TRANSCRIPTS = "tinycloud_search_transcripts";
 export const TINYCLOUD_LIST_MEETING_ACTIONS = "tinycloud_list_meeting_actions";
 
-/** `connector_meeting.source` values the agent reads. TinyChat writes Exo Local recordings as `exo-local` and combined meetings as `exo-merged`. */
-export const TRANSCRIPT_SOURCES = ["fireflies", "google-meet", "tinycloud-transcriber", "exo-local", "exo-merged"] as const;
+/** `connector_meeting.source` values the agent reads. TinyChat writes Exo Local recordings as `exo-local`, combined meetings as `exo-merged`, and voice notes as `exo-voice-note` (readable once a transcript is saved). */
+export const TRANSCRIPT_SOURCES = ["fireflies", "google-meet", "tinycloud-transcriber", "exo-local", "exo-merged", "exo-voice-note"] as const;
 export type TranscriptSource = typeof TRANSCRIPT_SOURCES[number];
 type SortOrder = "newest" | "oldest";
 
