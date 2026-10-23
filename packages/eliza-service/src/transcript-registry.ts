@@ -19,6 +19,12 @@ const MAX_ENTRIES = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_MAX_CLIENTS) ||
 const SESSION_REFRESH_MS = 50 * 60 * 1000;
 /** Bounded discovery: one row over the policy ceiling is the overflow sentinel. */
 const METADATA_ROW_LIMIT = 501;
+/** Voice notes: the commit index names the one readable revision (see readBody). */
+const VOICE_NOTE_SOURCE = "exo-voice-note";
+const VOICE_NOTE_INDEX = "voice_note_transcript";
+const VOICE_NOTE_REV_PREFIX = `${SQL_PATH}/${VOICE_NOTE_SOURCE}/transcript-rev/`;
+// Metadata mirror, used only where the commit index is absent. A row with no outcome counts once it carries transcript text.
+const VOICE_NOTE_MIRROR_READABLE = "(CASE WHEN json_valid(metadata) THEN (json_extract(metadata, '$.transcription_outcome') = 'transcribed' OR (json_extract(metadata, '$.transcription_outcome') IS NULL AND COALESCE(json_extract(metadata, '$.transcript_text'), '') <> '')) ELSE 0 END)";
 
 type Access = {
   sql: { db(name: string): { query(sql: string, params?: Array<string | number | null>, options?: { signal?: AbortSignal }): Promise<unknown> } };
@@ -299,15 +305,27 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     }
     return response.data.rows;
   };
-  const readBody = async (source: TranscriptMetadata["source"], sourceId: string, context: RetrievalContext = {}): Promise<BodyResult> => {
-    if (!isSource(source) || !safeSegment(sourceId)) throw new MeetingRetrievalError("invalid_stored_metadata");
-    assertAccess();
+  const readKey = async (key: string, context: RetrievalContext): Promise<BodyResult> => {
     // Transcript-only transport caps decoded bytes before SDK buffering. Retain
     // the decoded-value check for injected readers and UTF-8 replacement growth.
-    const response = await withinContext(signal => withAccess(signal, active => active.kv.get(`${SQL_PATH}/${source}/transcript/${sourceId}`, { prefix: "", raw: true, signal })), context) as { ok?: boolean; error?: unknown; data?: { data?: unknown } };
+    const response = await withinContext(signal => withAccess(signal, active => active.kv.get(key, { prefix: "", raw: true, signal })), context) as { ok?: boolean; error?: unknown; data?: { data?: unknown } };
     assertAccess();
     const body = response?.ok === true ? decodeBody(response.data?.data) : classifyBodyFailure(response?.error);
     enforceAccess(body); return body;
+  };
+  const readBody = async (source: TranscriptMetadata["source"], sourceId: string, context: RetrievalContext = {}): Promise<BodyResult> => {
+    if (!isSource(source) || !safeSegment(sourceId)) throw new MeetingRetrievalError("invalid_stored_metadata");
+    assertAccess();
+    if (source === VOICE_NOTE_SOURCE && await hasVoiceNoteIndex(context)) {
+      const [commit] = await query(`SELECT outcome, body_key FROM ${VOICE_NOTE_INDEX} WHERE source_id = ? LIMIT 1`, [sourceId], context);
+      if (commit) {
+        const [outcome, bodyKey] = commit;
+        // The index names the one committed revision. Any other outcome, including no_speech, has no readable body.
+        if (outcome !== "transcribed" || typeof bodyKey !== "string" || !bodyKey.startsWith(VOICE_NOTE_REV_PREFIX)) return { state: "missing" };
+        return readKey(bodyKey, context);
+      }
+    }
+    return readKey(`${SQL_PATH}/${source}/transcript/${sourceId}`, context);
   };
   // Member keys come from every combined row, never from the page being listed: a source filter or
   // date window could otherwise return members whose combined row is outside the result.
@@ -328,16 +346,26 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
   // Drops unreadable combined rows and every capture named by a readable combined row.
   const visibleRows = (rows: unknown[][], hidden: ReadonlySet<string>): unknown[][] => rows.filter(row =>
     !(row[1] === COMBINED_SOURCE && readCombinedMembers(row[9]) === null) && !isCombinedMember(row, hidden, listedColumns));
+  // The commit index is absent in spaces that never saved a voice note; recheck until found.
+  let voiceNoteIndexFound = false;
+  const hasVoiceNoteIndex = async (context: RetrievalContext = {}): Promise<boolean> => {
+    if (!voiceNoteIndexFound) voiceNoteIndexFound = (await query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", [VOICE_NOTE_INDEX], context)).length > 0;
+    return voiceNoteIndexFound;
+  };
+  // Listing uses the metadata mirror, which commit keeps at the latest outcome. Other sources are unaffected.
+  const readableClause = (): string => `(source IS NOT '${VOICE_NOTE_SOURCE}' OR ${VOICE_NOTE_MIRROR_READABLE})`;
   return {
     assertAccess,
     async listMetadata() {
-      const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) DESC, id ASC LIMIT ${METADATA_ROW_LIMIT}`);
+      const readable = readableClause();
+      const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting WHERE ${readable} ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) DESC, id ASC LIMIT ${METADATA_ROW_LIMIT}`);
       const hidden = await combinedKeys();
       return visibleRows(rows, hidden).flatMap(row => { const decoded = decodeMetadata(row); return decoded ? [decoded] : []; });
     },
     async getMetadata(reference, context = {}) {
       if (!safeMeetingRef(reference)) throw new MeetingRetrievalError("invalid_args", 400);
-      const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting WHERE id = ? LIMIT 1`, [reference], context);
+      const readable = readableClause();
+      const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting WHERE id = ? AND ${readable} LIMIT 1`, [reference], context);
       const hidden = await combinedKeys(context);
       // Check identity even when a faulty upstream ignores its predicate.
       return visibleRows(rows, hidden).map(decodeMetadata).find(row => row?.meetingRef === reference) ?? null;
@@ -348,6 +376,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       // Conservative UTC superset for every IANA offset, followed by exact local-day checks.
       if (args.from) { clauses.push("julianday(started_at) >= julianday(?)"); params.push(new Date(Date.parse(args.from) - 86_400_000).toISOString()); }
       if (args.to) { clauses.push("julianday(started_at) < julianday(?)"); params.push(new Date(Date.parse(args.to) + 2 * 86_400_000).toISOString()); }
+      clauses.push(readableClause());
       const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) ${args.sort === "oldest" ? "ASC" : "DESC"}, id ASC LIMIT ${METADATA_ROW_LIMIT}`, params, context);
       const hidden = await combinedKeys(context);
       // The raw row count (before exclusion) decides scanLimited, so rows past the read window stay counted as unseen.
