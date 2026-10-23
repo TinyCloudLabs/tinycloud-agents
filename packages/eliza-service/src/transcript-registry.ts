@@ -23,8 +23,10 @@ const METADATA_ROW_LIMIT = 501;
 const VOICE_NOTE_SOURCE = "exo-voice-note";
 const VOICE_NOTE_INDEX = "voice_note_transcript";
 const VOICE_NOTE_REV_PREFIX = `${SQL_PATH}/${VOICE_NOTE_SOURCE}/transcript-rev/`;
-// Metadata mirror, used only where the commit index is absent. A row with no outcome counts once it carries transcript text.
-const VOICE_NOTE_MIRROR_READABLE = "(CASE WHEN json_valid(metadata) THEN (json_extract(metadata, '$.transcription_outcome') = 'transcribed' OR (json_extract(metadata, '$.transcription_outcome') IS NULL AND COALESCE(json_extract(metadata, '$.transcript_text'), '') <> '')) ELSE 0 END)";
+// Revision hash shape written by transcriptHash: first 32 hex characters of a SHA-256 digest.
+const VOICE_NOTE_REV_HASH = /^[0-9a-f]{32}$/;
+// Metadata mirror for listing and lookup. Lists only a transcribed outcome; readBody still requires the commit index.
+const VOICE_NOTE_MIRROR_READABLE = "(CASE WHEN json_valid(metadata) THEN (json_extract(metadata, '$.transcription_outcome') = 'transcribed') ELSE 0 END)";
 
 type Access = {
   sql: { db(name: string): { query(sql: string, params?: Array<string | number | null>, options?: { signal?: AbortSignal }): Promise<unknown> } };
@@ -317,13 +319,14 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     if (!isSource(source) || !safeSegment(sourceId)) throw new MeetingRetrievalError("invalid_stored_metadata");
     assertAccess();
     if (source === VOICE_NOTE_SOURCE && await hasVoiceNoteIndex(context)) {
-      const [commit] = await query(`SELECT outcome, body_key FROM ${VOICE_NOTE_INDEX} WHERE source_id = ? LIMIT 1`, [sourceId], context);
-      if (commit) {
-        const [outcome, bodyKey] = commit;
-        // The index names the one committed revision. Any other outcome, including no_speech, has no readable body.
-        if (outcome !== "transcribed" || typeof bodyKey !== "string" || !bodyKey.startsWith(VOICE_NOTE_REV_PREFIX)) return { state: "missing" };
-        return readKey(bodyKey, context);
-      }
+      const [commit] = await query(`SELECT outcome, hash, body_key FROM ${VOICE_NOTE_INDEX} WHERE source_id = ? LIMIT 1`, [sourceId], context);
+      // The index names the one committed revision. No commit row, or any outcome other than transcribed, has no readable body.
+      if (!commit) return { state: "missing" };
+      const [outcome, hash, bodyKey] = commit;
+      // The body key must be exactly the writer's key for this source id and hash, so the index cannot reach any other KV key.
+      if (outcome !== "transcribed" || typeof hash !== "string" || !VOICE_NOTE_REV_HASH.test(hash)
+        || bodyKey !== `${VOICE_NOTE_REV_PREFIX}${sourceId}/${hash}`) return { state: "missing" };
+      return readKey(bodyKey, context);
     }
     return readKey(`${SQL_PATH}/${source}/transcript/${sourceId}`, context);
   };
