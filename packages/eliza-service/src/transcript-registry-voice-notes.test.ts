@@ -140,6 +140,25 @@ describe("voice notes in the registry", () => {
     db.close();
   });
 
+  // List and read must agree: a note whose metadata mirror says transcribed but whose commit says otherwise has no readable body.
+  test("a mirror-transcribed note the commit index does not make readable is not listed or found", async () => {
+    const db = fixture({ index: true });
+    const silentKey = revKey("silent-1", SILENT_HASH);
+    insertMeeting(db, "vn-silent", "exo-voice-note", "silent-1", { transcription_outcome: "transcribed" });
+    insertCommit(db, "silent-1", SILENT_HASH, "no_speech", silentKey);
+    insertMeeting(db, "vn-forged", "exo-voice-note", SOURCE_ID, { transcription_outcome: "transcribed" });
+    insertCommit(db, SOURCE_ID, HASH, "transcribed", `${REV_PREFIX}${OTHER_ID}/${HASH}`);
+    insertMeeting(db, "vn-good", "exo-voice-note", OTHER_ID, { transcription_outcome: "transcribed" });
+    insertCommit(db, OTHER_ID, HASH, "transcribed", revKey(OTHER_ID, HASH));
+    const r = reader(db, new Map<string, unknown>([[revKey(OTHER_ID, HASH), sentences("good body")]]));
+    expect((await r.listMetadata()).map(row => row.meetingRef)).toEqual(["vn-good"]);
+    expect(await r.getMetadata("vn-silent")).toBeNull();
+    expect(await r.getMetadata("vn-forged")).toBeNull();
+    expect((await r.getMetadata("vn-good"))?.meetingRef).toBe("vn-good");
+    expect((await findMeetings(r, { source: "exo-voice-note" } as never)).data.meetings.map(meeting => meeting.meetingRef)).toEqual(["vn-good"]);
+    db.close();
+  });
+
   test("other sources are listed regardless of voice-note state", async () => {
     const db = fixture({ index: true });
     insertMeeting(db, "ff-meeting", "fireflies", "ff-1", null);

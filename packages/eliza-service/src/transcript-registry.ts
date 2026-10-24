@@ -25,7 +25,7 @@ const VOICE_NOTE_INDEX = "voice_note_transcript";
 const VOICE_NOTE_REV_PREFIX = `${SQL_PATH}/${VOICE_NOTE_SOURCE}/transcript-rev/`;
 // Revision hash shape written by transcriptHash: first 32 hex characters of a SHA-256 digest.
 const VOICE_NOTE_REV_HASH = /^[0-9a-f]{32}$/;
-// Metadata mirror for listing and lookup. Lists only a transcribed outcome; readBody still requires the commit index.
+// Metadata mirror for listing and lookup. Prefilters to a transcribed outcome; with the commit index present, commitReadable then requires the commit row too.
 const VOICE_NOTE_MIRROR_READABLE = "(CASE WHEN json_valid(metadata) THEN (json_extract(metadata, '$.transcription_outcome') = 'transcribed') ELSE 0 END)";
 
 type Access = {
@@ -355,15 +355,27 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     if (!voiceNoteIndexFound) voiceNoteIndexFound = (await query("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", [VOICE_NOTE_INDEX], context)).length > 0;
     return voiceNoteIndexFound;
   };
-  // Listing uses the metadata mirror, which commit keeps at the latest outcome. Other sources are unaffected.
+  // SQL prefilter: the metadata mirror, which is also the whole readable test when the commit index table is absent. Other sources are unaffected.
   const readableClause = (): string => `(source IS NOT '${VOICE_NOTE_SOURCE}' OR ${VOICE_NOTE_MIRROR_READABLE})`;
+  // With the commit index present, a listed voice note must be one readBody can read: same predicate (transcribed outcome,
+  // writer-shaped hash, writer's exact body key), so a mirror/commit disagreement never lists an unreadable note.
+  // The index is queried only when the page holds a voice note, so other sources cost no extra round trip.
+  const commitReadable = async (rows: unknown[][], context: RetrievalContext = {}): Promise<unknown[][]> => {
+    const ids = rows.flatMap(row => row[1] === VOICE_NOTE_SOURCE && typeof row[2] === "string" ? [row[2]] : []);
+    if (ids.length === 0 || !await hasVoiceNoteIndex(context)) return rows;
+    const committed = await query(
+      `SELECT source_id FROM ${VOICE_NOTE_INDEX} WHERE outcome = 'transcribed' AND length(hash) = 32 AND hash NOT GLOB '*[^0-9a-f]*' AND body_key = '${VOICE_NOTE_REV_PREFIX}' || source_id || '/' || hash AND source_id IN (${ids.map(() => "?").join(", ")})`,
+      ids, context);
+    const readable = new Set(committed.map(row => row[0]));
+    return rows.filter(row => row[1] !== VOICE_NOTE_SOURCE || readable.has(row[2]));
+  };
   return {
     assertAccess,
     async listMetadata() {
       const readable = readableClause();
       const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting WHERE ${readable} ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) DESC, id ASC LIMIT ${METADATA_ROW_LIMIT}`);
       const hidden = await combinedKeys();
-      return visibleRows(rows, hidden).flatMap(row => { const decoded = decodeMetadata(row); return decoded ? [decoded] : []; });
+      return visibleRows(await commitReadable(rows), hidden).flatMap(row => { const decoded = decodeMetadata(row); return decoded ? [decoded] : []; });
     },
     async getMetadata(reference, context = {}) {
       if (!safeMeetingRef(reference)) throw new MeetingRetrievalError("invalid_args", 400);
@@ -371,7 +383,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting WHERE id = ? AND ${readable} LIMIT 1`, [reference], context);
       const hidden = await combinedKeys(context);
       // Check identity even when a faulty upstream ignores its predicate.
-      return visibleRows(rows, hidden).map(decodeMetadata).find(row => row?.meetingRef === reference) ?? null;
+      return visibleRows(await commitReadable(rows, context), hidden).map(decodeMetadata).find(row => row?.meetingRef === reference) ?? null;
     },
     async discoverMetadata(args, context = {}) {
       const clauses: string[] = []; const params: Array<string | number | null> = [];
@@ -383,7 +395,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) ${args.sort === "oldest" ? "ASC" : "DESC"}, id ASC LIMIT ${METADATA_ROW_LIMIT}`, params, context);
       const hidden = await combinedKeys(context);
       // The raw row count (before exclusion) decides scanLimited, so rows past the read window stay counted as unseen.
-      const decoded = visibleRows(rows.slice(0, 500), hidden).flatMap(row => { const value = decodeMetadata(row); return value ? [value] : []; });
+      const decoded = visibleRows(await commitReadable(rows.slice(0, 500), context), hidden).flatMap(row => { const value = decodeMetadata(row); return value ? [value] : []; });
       return discoveryResult(decoded, rows.length, args, context);
     },
     readBody,
