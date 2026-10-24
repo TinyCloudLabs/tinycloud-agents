@@ -298,8 +298,11 @@ describe("session registration reaches the production transcript action", () => 
 
     expect(trace.dbs).toEqual([SQL_PATH, SQL_PATH]);
     expect(trace.sql).toHaveLength(2);
-    expect(trace.sql[0]).toContain("FROM connector_meeting ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) DESC, id ASC LIMIT 501");
-    expect(trace.sql[1]).toContain("FROM connector_meeting WHERE id = ? LIMIT 1");
+    // Replacement for the two removed whole-query assertions (test-ruling: TC-1816): one per clause of the new query.
+    for (const sql of trace.sql) expect(sql).toContain("source IS NOT 'exo-voice-note' OR");
+    for (const sql of trace.sql) expect(sql).toContain("json_extract(metadata, '$.transcription_outcome') = 'transcribed'");
+    expect(trace.sql[0]).toMatch(/ORDER BY julianday\(started_at\) IS NULL ASC, julianday\(started_at\) DESC, id ASC LIMIT 501$/);
+    expect(trace.sql[1]).toMatch(/FROM connector_meeting WHERE id = \? AND .* LIMIT 1$/);
     expect(trace.kvKeys).toEqual([`${KV_PATH}fireflies/transcript/canary-1`]);
   });
 
