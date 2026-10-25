@@ -363,10 +363,11 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
   const commitReadable = async (rows: unknown[][], context: RetrievalContext = {}): Promise<unknown[][]> => {
     const ids = rows.flatMap(row => row[1] === VOICE_NOTE_SOURCE && typeof row[2] === "string" ? [row[2]] : []);
     if (ids.length === 0 || !await hasVoiceNoteIndex(context)) return rows;
+    // The node SQL parser has no GLOB/REGEXP, so the lowercase-hex shape of the hash is checked here, not in SQL.
     const committed = await query(
-      `SELECT source_id FROM ${VOICE_NOTE_INDEX} WHERE outcome = 'transcribed' AND length(hash) = 32 AND hash NOT GLOB '*[^0-9a-f]*' AND body_key = '${VOICE_NOTE_REV_PREFIX}' || source_id || '/' || hash AND source_id IN (${ids.map(() => "?").join(", ")})`,
+      `SELECT source_id, hash FROM ${VOICE_NOTE_INDEX} WHERE outcome = 'transcribed' AND length(hash) = 32 AND body_key = '${VOICE_NOTE_REV_PREFIX}' || source_id || '/' || hash AND source_id IN (${ids.map(() => "?").join(", ")})`,
       ids, context);
-    const readable = new Set(committed.map(row => row[0]));
+    const readable = new Set(committed.filter(row => typeof row[1] === "string" && /^[0-9a-f]{32}$/.test(row[1])).map(row => row[0]));
     return rows.filter(row => row[1] !== VOICE_NOTE_SOURCE || readable.has(row[2]));
   };
   return {
