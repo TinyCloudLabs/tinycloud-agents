@@ -168,3 +168,58 @@ describe("voice notes in the registry", () => {
     db.close();
   });
 });
+
+// Captures every statement the reader sends, while still executing it on bun:sqlite.
+function tracingReader(db: Database, kv: Map<string, unknown> = new Map()) {
+  const sqls: string[] = [];
+  const r = createReader({
+    sql: { db: () => ({ query: async (sql: string, params?: unknown[]) => { sqls.push(sql); return { ok: true, data: { rows: db.query(sql).values(...((params ?? []) as never[])) } }; } }) },
+    kv: { get: async (key: string) => (kv.has(key) ? { ok: true, data: { data: kv.get(key) } } : { ok: false, error: { code: "KV_NOT_FOUND" } }) },
+  } as never);
+  return { r, sqls };
+}
+
+describe("voice-note readable clause on the node SQL dialect", () => {
+  test("rows with NULL source, a mirror-readable voice note, an unreadable voice note and another source", async () => {
+    const db = fixture({ index: false });
+    insertMeeting(db, "null-src", null as never, "n-1", null);
+    insertMeeting(db, "vn-ok", "exo-voice-note", "vn-ok-1", { transcription_outcome: "transcribed" });
+    insertMeeting(db, "vn-pending", "exo-voice-note", "vn-p-1", { transcription_outcome: "pending" });
+    insertMeeting(db, "vn-nometa", "exo-voice-note", "vn-n-1", null);
+    insertMeeting(db, "vn-badjson", "exo-voice-note", "vn-b-1", "{not json" as never);
+    insertMeeting(db, "ff", "fireflies", "ff-1", null);
+    const { r, sqls } = tracingReader(db);
+    await r.listMetadata();
+    await r.getMetadata("null-src");
+    const listSql = sqls.find(sql => sql.includes("ORDER BY"))!;
+    const lookupSql = sqls.find(sql => sql.includes("WHERE id = ?"))!;
+    const ids = (sql: string, ...params: string[]) => (db.query(sql).values(...params) as unknown[][]).map(row => row[0]).sort();
+    // Executed directly: the reader's own row shaping would reject a NULL source and hide a clause bug.
+    expect(ids(listSql)).toEqual(["ff", "null-src", "vn-ok"]);
+    for (const id of ["null-src", "vn-ok", "ff"]) expect(ids(lookupSql, id)).toEqual([id]);
+    for (const id of ["vn-pending", "vn-nometa", "vn-badjson"]) expect(ids(lookupSql, id)).toEqual([]);
+    db.close();
+  });
+
+  test("no statement the reader issues uses an IS form the node SQL parser rejects", async () => {
+    // Offline stand-in, NOT the node's sqlparser-rs: after IS [NOT] only NULL, TRUE, FALSE or DISTINCT FROM is accepted.
+    const REJECTED = /\bIS\s+(?:NOT\s+)?(?!(?:NOT\s+)?(?:NULL|TRUE|FALSE|DISTINCT)\b)/i;
+    for (const index of [false, true]) {
+      const db = fixture({ index });
+      insertMeeting(db, "ff", "fireflies", "ff-1", null);
+      insertMeeting(db, "vn-ok", "exo-voice-note", SOURCE_ID, { transcription_outcome: "transcribed" });
+      if (index) insertCommit(db, SOURCE_ID, HASH, "transcribed", revKey(SOURCE_ID, HASH));
+      const { r, sqls } = tracingReader(db, new Map<string, unknown>([[revKey(SOURCE_ID, HASH), sentences("body")]]));
+      await r.listMetadata();
+      await r.getMetadata("vn-ok");
+      await findMeetings(r, {} as never);
+      await findMeetings(r, { source: "exo-voice-note", from: "2026-03-01", to: "2026-03-03", sort: "oldest" } as never);
+      expect(sqls.length).toBeGreaterThan(4);
+      for (const sql of sqls) {
+        expect(sql).not.toContain("IS NOT '");
+        expect(sql).not.toMatch(REJECTED);
+      }
+      db.close();
+    }
+  });
+});
