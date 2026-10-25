@@ -223,3 +223,48 @@ describe("voice-note readable clause on the node SQL dialect", () => {
     }
   });
 });
+
+describe("voice-note commit index hash shape (node SQL parser has no GLOB)", () => {
+  const HEX = "3f9a1c2e7b4d8f05a6e1c3b2d9f04e7a";
+  const cases: Array<[string, string, string]> = [
+    ["valid", HEX, revKey("vn-valid", HEX)],
+    ["upper", HEX.toUpperCase(), revKey("vn-upper", HEX.toUpperCase())],
+    ["nonhex", `zz${HEX.slice(2)}`, revKey("vn-nonhex", `zz${HEX.slice(2)}`)],
+    ["short", HEX.slice(1), revKey("vn-short", HEX.slice(1))],
+    ["wrongkey", HEX, revKey("vn-other", HEX)],
+  ];
+
+  function seeded() {
+    const db = fixture({ index: true });
+    const kv = new Map<string, unknown>();
+    for (const [name, hash, bodyKey] of cases) {
+      insertMeeting(db, `id-${name}`, "exo-voice-note", `vn-${name}`, { transcription_outcome: "transcribed" });
+      insertCommit(db, `vn-${name}`, hash, "transcribed", bodyKey);
+      kv.set(bodyKey, sentences(`body ${name}`));
+    }
+    return { db, kv };
+  }
+
+  test("only a 32-char lowercase-hex hash with the writer's body key is readable", async () => {
+    const { db, kv } = seeded();
+    const { r } = tracingReader(db, kv);
+    expect((await r.listMetadata()).map(row => row.meetingRef)).toEqual(["id-valid"]);
+    expect(await r.getMetadata("id-upper")).toBeNull();
+    expect(await r.getMetadata("id-nonhex")).toBeNull();
+    expect(await r.getMetadata("id-short")).toBeNull();
+    expect(await r.getMetadata("id-wrongkey")).toBeNull();
+    expect((await r.getMetadata("id-valid"))?.meetingRef).toBe("id-valid");
+    db.close();
+  });
+
+  test("no statement the reader issues uses an operator the node SQL parser lacks", async () => {
+    const { db, kv } = seeded();
+    const { r, sqls } = tracingReader(db, kv);
+    await r.listMetadata();
+    await r.getMetadata("id-valid");
+    await findMeetings(r, { source: "exo-voice-note" } as never);
+    expect(sqls.some(sql => sql.includes("voice_note_transcript"))).toBe(true);
+    for (const sql of sqls) expect(sql).not.toMatch(/\b(?:GLOB|REGEXP|ILIKE|MATCH)\b/i);
+    db.close();
+  });
+});
