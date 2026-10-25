@@ -356,7 +356,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     return voiceNoteIndexFound;
   };
   // SQL prefilter: the metadata mirror, which is also the whole readable test when the commit index table is absent. Other sources are unaffected.
-  const readableClause = (): string => `(source IS NOT '${VOICE_NOTE_SOURCE}' OR ${VOICE_NOTE_MIRROR_READABLE})`;
+  const readableClause = (): string => `(source != '${VOICE_NOTE_SOURCE}' OR source IS NULL OR ${VOICE_NOTE_MIRROR_READABLE})`;
   // With the commit index present, a listed voice note must be one readBody can read: same predicate (transcribed outcome,
   // writer-shaped hash, writer's exact body key), so a mirror/commit disagreement never lists an unreadable note.
   // The index is queried only when the page holds a voice note, so other sources cost no extra round trip.
