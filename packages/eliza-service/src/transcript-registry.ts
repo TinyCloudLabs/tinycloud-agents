@@ -244,6 +244,7 @@ const MARKER_KEYS = ["artifactType", "artifact_type", "type", "kind", "documentT
 /** Combined member refs are small; oversized combined rows fall back to listing their member rows. */
 const COMBINED_MEMBERS_MAX_BYTES = 128;
 const COMBINED_METADATA_MAX_BYTES = 512;
+const COMBINED_ROWS_PER_QUERY = 100;
 const METADATA_PROJECTION = `CASE WHEN json_valid(metadata) THEN json_object(${[
   ...MARKER_KEYS.map(key => `'${key}', CASE WHEN json_type(metadata, '$.${key}') = 'text' AND length(json_extract(metadata, '$.${key}')) < 100 THEN json_extract(metadata, '$.${key}') END`),
   "'transcript_count', CASE WHEN json_type(metadata, '$.transcript_count') IN ('integer', 'real') THEN json_extract(metadata, '$.transcript_count') END",
@@ -348,7 +349,16 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
   const listedColumns = (row: unknown[]) => ({ source: row[1], sourceId: row[2], metadata: row[9] });
   const combinedKeys = async (context: RetrievalContext = {}): Promise<Set<string>> => {
     try {
-      return combinedMemberKeys(await query(`SELECT source, source_id, metadata FROM connector_meeting WHERE source = ? AND length(CAST(metadata AS BLOB)) <= ${COMBINED_METADATA_MAX_BYTES} AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} ELSE 0 END`, [COMBINED_SOURCE], context), combinedColumns);
+      const keys = new Set<string>();
+      let cursor = "";
+      while (true) {
+        const rows = await query(`SELECT source, source_id, metadata, id FROM connector_meeting WHERE source = ? AND id > ? AND length(CAST(source_id AS BLOB)) <= 512 AND length(CAST(metadata AS BLOB)) <= ${COMBINED_METADATA_MAX_BYTES} AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} ELSE 0 END ORDER BY id LIMIT ${COMBINED_ROWS_PER_QUERY}`, [COMBINED_SOURCE, cursor], context);
+        for (const key of combinedMemberKeys(rows, combinedColumns)) keys.add(key);
+        if (rows.length < COMBINED_ROWS_PER_QUERY) return keys;
+        const nextCursor = rows[rows.length - 1]?.[3];
+        if (typeof nextCursor !== "string" || nextCursor <= cursor) return keys;
+        cursor = nextCursor;
+      }
     } catch (error) {
       // Only the generic unavailable failure fails open; access, timeout and cancellation errors propagate.
       if (error instanceof MeetingRetrievalError && error.code === "transcript_unavailable") return new Set();

@@ -100,4 +100,13 @@ describe("meeting listing keeps transcripts stored in metadata out of the respon
     expect(Math.max(...sizes)).toBeLessThan(TRANSCRIPT_RESPONSE_BYTE_LIMIT);
     db.close();
   });
+  test("combined exclusions page through more rows than one capped response", async () => {
+    const rows: Row[] = Array.from({ length: 3_000 }, (_, i) => [`merged-${i}`, "exo-merged", `merged-${i}`, day(i),
+      JSON.stringify({ merge: { v: 1, members: [{ source: "fireflies", source_id: `capture-${i}` }] }, padding: "x".repeat(300) })]);
+    const db = fixture(rows);
+    const { instance, sizes } = reader(db);
+    expect(await instance.listMetadata()).toHaveLength(501);
+    expect(Math.max(...sizes)).toBeLessThan(TRANSCRIPT_RESPONSE_BYTE_LIMIT);
+    db.close();
+  });
 });
