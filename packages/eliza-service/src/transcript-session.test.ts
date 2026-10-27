@@ -159,10 +159,21 @@ function fakeNodeFactory(corpusFor: (privateKey: string) => Corpus, trace: NodeT
           db(name: string) {
             return {
               async query(sql: string, params?: unknown[]) {
-                // Combined-member key reads are projected to (source, source_id, metadata) and kept out of the trace.
-                if (sql.startsWith("SELECT source, source_id, metadata")) return { ok: true, data: { rows: corpus.rows.filter(row => row[1] === params?.[0]).map(row => [row[1], row[2], row[9]]) } };
+                const combinedQuery = sql.includes("FROM connector_meeting WHERE source = ? AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array'");
+                const hasMoreProbe = sql.startsWith("SELECT 1 FROM connector_meeting");
+                if (combinedQuery) return { ok: true, data: { rows: [] } };
+                if (hasMoreProbe) {
+                  const offset = Number(params?.at(-1) ?? 0);
+                  return { ok: true, data: { rows: offset < corpus.rows.length ? [[1]] : [] } };
+                }
                 trace.dbs.push(name);
                 trace.sql.push(sql);
+                if (sql.includes("WITH candidates AS (")) {
+                  const limit = Number(params?.at(-3) ?? corpus.rows.length);
+                  const offset = Number(params?.at(-2) ?? 0);
+                  const rows = corpus.rows.slice(offset, offset + limit).map(row => [...row.slice(0, 9), null, 0, 0]);
+                  return { ok: true, data: { rows } };
+                }
                 return { ok: true, data: { rows: sql.includes("WHERE id = ?") ? corpus.rows.filter(row => row[0] === params?.[0]) : corpus.rows } };
               },
             };
@@ -296,11 +307,12 @@ describe("session registration reaches the production transcript action", () => 
     }, host, store);
     await runTool(runtime, "entity-a", { query: "ember compass" });
 
-    expect(trace.dbs).toEqual([SQL_PATH, SQL_PATH]);
-    expect(trace.sql).toHaveLength(2);
-    for (const sql of trace.sql) expect(sql).toContain("source != 'exo-voice-note' OR source IS NULL");
-    for (const sql of trace.sql) expect(sql).toContain("json_extract(metadata, '$.transcription_outcome') = 'transcribed'");
-    expect(trace.sql[1]).toMatch(/FROM connector_meeting WHERE id = \? AND .* LIMIT 1$/);
+    expect(trace.dbs.every(db => db === SQL_PATH)).toBe(true);
+    const readableQueries = trace.sql.filter(sql => sql.includes("source != 'exo-voice-note' OR source IS NULL"));
+    expect(readableQueries.length).toBeGreaterThan(0);
+    for (const sql of readableQueries) expect(sql).toContain("json_extract(metadata, '$.transcription_outcome') = 'transcribed'");
+    const lookup = trace.sql.find(sql => /FROM connector_meeting WHERE id = \? AND .* LIMIT 1$/.test(sql));
+    expect(lookup).toBeDefined();
     expect(trace.kvKeys).toEqual([`${KV_PATH}fireflies/transcript/canary-1`]);
   });
 

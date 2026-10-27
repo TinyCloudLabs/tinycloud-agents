@@ -7,7 +7,7 @@ import type { PortableDelegation } from "@tinycloud/agent-client";
 import { currentPrivateAccess, DelegationExpiredError, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
 import { TRANSCRIPT_SOURCES } from "./actions/tinycloud-search-transcripts.js";
 import type { TranscriptMetadata, TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
-import { checkContext, decodeBody, discoveryResult, MeetingRetrievalError, withinContext } from "./meeting-evidence.js";
+import { checkContext, decodeBody, discoveryResult, MeetingRetrievalError, scopedRows, withinContext } from "./meeting-evidence.js";
 import type { BodyResult, MeetingSelection, RetrievalContext } from "./meeting-evidence.js";
 import { createTranscriptNode, TranscriptResponseLimitError, TRANSCRIPT_RESPONSE_BYTE_LIMIT } from "./transcript-transport.js";
 import { COMBINED_SOURCE, combinedMemberKeys, isCombinedMember, readCombinedMembers } from "./combined-meetings.js";
@@ -19,6 +19,7 @@ const MAX_ENTRIES = Number(process.env.ELIZA_TRANSCRIPT_REGISTRY_MAX_CLIENTS) ||
 const SESSION_REFRESH_MS = 50 * 60 * 1000;
 /** Bounded discovery: one row over the policy ceiling is the overflow sentinel. */
 const METADATA_ROW_LIMIT = 501;
+const METADATA_DISCOVERY_SCAN_LIMIT = 500;
 /** Voice notes: the commit index names the one readable revision (see readBody). */
 const VOICE_NOTE_SOURCE = "exo-voice-note";
 const VOICE_NOTE_INDEX = "voice_note_transcript";
@@ -243,14 +244,12 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
 const MARKER_KEYS = ["artifactType", "artifact_type", "type", "kind", "documentType", "document_type", "notes_kind", "notes_association"] as const;
 /** Combined member refs are small; oversized combined rows fall back to listing their member rows. */
 const COMBINED_MEMBERS_MAX_BYTES = 128;
-const COMBINED_METADATA_MAX_BYTES = 512;
-const LISTING_ROW_MAX_BYTES = 256 * 1024; // Field caps bound JSON-escaped rows below this, including 12 bytes per Unicode scalar.
-const LIST_PAGE_BYTE_BUDGET = Math.floor(TRANSCRIPT_RESPONSE_BYTE_LIMIT * 0.75);
-const LISTING_PAGE_ROWS = Math.floor(LIST_PAGE_BYTE_BUDGET / LISTING_ROW_MAX_BYTES);
-const COMBINED_ROW_MAX_BYTES = 8 * 1024;
-const COMBINED_PAGE_ROWS = Math.floor(LIST_PAGE_BYTE_BUDGET / COMBINED_ROW_MAX_BYTES);
+const SQL_PAGE_MAX_ROWS = 500;
+const SQL_PAGE_BYTE_BUDGET = Math.floor(TRANSCRIPT_RESPONSE_BYTE_LIMIT * 0.75);
+const SQL_PAGE_ROW_OVERHEAD_BYTES = 32;
 const MEETING_REF_MAX_LENGTH = 128;
 const SOURCE_ID_MAX_LENGTH = 512;
+const LIST_SOURCE_MAX_BYTES = 64;
 const LIST_TITLE_MAX_LENGTH = 512;
 const LIST_STARTED_AT_MAX_LENGTH = 64;
 const LIST_ORGANIZER_MAX_LENGTH = 254;
@@ -261,6 +260,7 @@ const METADATA_PROJECTION = `CASE WHEN json_valid(metadata) THEN json_object(${[
   "'transcript_count', CASE WHEN json_type(metadata, '$.transcript_count') IN ('integer', 'real') THEN json_extract(metadata, '$.transcript_count') END",
   `'merge', CASE WHEN source = '${COMBINED_SOURCE}' AND json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} THEN json_object('members', json(json_extract(metadata, '$.merge.members'))) END`,
 ].join(", ")}) END`;
+const COMBINED_KEYS_METADATA_PROJECTION = `json_object('merge', json_object('members', json(json_extract(metadata, '$.merge.members'))))`;
 const LISTING_METADATA_PROJECTION = `CASE WHEN json_valid(metadata) THEN json_object(${[
   ...MARKER_KEYS.map(key => `'${key}', CASE WHEN json_type(metadata, '$.${key}') = 'text' THEN substr(json_extract(metadata, '$.${key}'), 1, 99) END`),
   "'transcript_count', CASE WHEN json_type(metadata, '$.transcript_count') IN ('integer', 'real') THEN json_extract(metadata, '$.transcript_count') END",
@@ -268,16 +268,17 @@ const LISTING_METADATA_PROJECTION = `CASE WHEN json_valid(metadata) THEN json_ob
 ].join(", ")}) END`;
 const COLUMNS = `id, source, source_id, title, started_at, organizer_email, participants, summary_overview, summary_action_items, ${METADATA_PROJECTION}`;
 const LISTING_ID = `CASE WHEN length(CAST(id AS BLOB)) <= ${MEETING_REF_MAX_LENGTH} THEN id END`;
-const LISTING_SOURCE_ID = `CASE WHEN length(source_id) <= ${SOURCE_ID_MAX_LENGTH} THEN source_id END`;
+const LISTING_SOURCE = `CASE WHEN length(CAST(source AS BLOB)) <= ${LIST_SOURCE_MAX_BYTES} THEN source END`;
+const LISTING_SOURCE_ID = `CASE WHEN length(CAST(source_id AS BLOB)) <= ${SOURCE_ID_MAX_LENGTH} THEN source_id END`;
 const LISTING_TITLE = `substr(title, 1, ${LIST_TITLE_MAX_LENGTH})`;
 const LISTING_STARTED_AT = `substr(started_at, 1, ${LIST_STARTED_AT_MAX_LENGTH})`;
 const LISTING_ORGANIZER = `substr(organizer_email, 1, ${LIST_ORGANIZER_MAX_LENGTH})`;
 const LISTING_PARTICIPANTS = `CASE WHEN participants IS NULL THEN NULL WHEN json_valid(participants) AND length(CAST(participants AS BLOB)) <= ${LIST_PARTICIPANTS_MAX_BYTES} THEN participants ELSE '[]' END`;
 const LISTING_OVERVIEW = `substr(summary_overview, 1, ${LIST_SUMMARY_MAX_LENGTH})`;
 const LISTING_ACTIONS = `substr(summary_action_items, 1, ${LIST_SUMMARY_MAX_LENGTH})`;
-const LISTING_TRUNCATED = `CASE WHEN length(id) > ${MEETING_REF_MAX_LENGTH} OR length(source_id) > ${SOURCE_ID_MAX_LENGTH} OR length(title) > ${LIST_TITLE_MAX_LENGTH} OR length(started_at) > ${LIST_STARTED_AT_MAX_LENGTH} OR length(organizer_email) > ${LIST_ORGANIZER_MAX_LENGTH} OR (participants IS NOT NULL AND (NOT json_valid(participants) OR length(CAST(participants AS BLOB)) > ${LIST_PARTICIPANTS_MAX_BYTES})) OR length(summary_overview) > ${LIST_SUMMARY_MAX_LENGTH} OR length(summary_action_items) > ${LIST_SUMMARY_MAX_LENGTH}${MARKER_KEYS.map(key => ` OR (json_valid(metadata) AND json_type(metadata, '$.${key}') = 'text' AND length(json_extract(metadata, '$.${key}')) >= 100)`).join("")} OR (source = '${COMBINED_SOURCE}' AND json_valid(metadata) AND json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) > ${COMBINED_MEMBERS_MAX_BYTES}) THEN 1 ELSE 0 END`;
+const LISTING_TRUNCATED = `CASE WHEN length(CAST(id AS BLOB)) > ${MEETING_REF_MAX_LENGTH} OR length(CAST(source AS BLOB)) > ${LIST_SOURCE_MAX_BYTES} OR length(CAST(source_id AS BLOB)) > ${SOURCE_ID_MAX_LENGTH} OR length(title) > ${LIST_TITLE_MAX_LENGTH} OR length(started_at) > ${LIST_STARTED_AT_MAX_LENGTH} OR length(organizer_email) > ${LIST_ORGANIZER_MAX_LENGTH} OR (participants IS NOT NULL AND (NOT json_valid(participants) OR length(CAST(participants AS BLOB)) > ${LIST_PARTICIPANTS_MAX_BYTES})) OR length(summary_overview) > ${LIST_SUMMARY_MAX_LENGTH} OR length(summary_action_items) > ${LIST_SUMMARY_MAX_LENGTH}${MARKER_KEYS.map(key => ` OR (json_valid(metadata) AND json_type(metadata, '$.${key}') = 'text' AND length(json_extract(metadata, '$.${key}')) >= 100)`).join("")} OR (source = '${COMBINED_SOURCE}' AND json_valid(metadata) AND json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) > ${COMBINED_MEMBERS_MAX_BYTES}) THEN 1 ELSE 0 END`;
 const LISTING_ID_OVERSIZED = `CASE WHEN length(CAST(id AS BLOB)) > ${MEETING_REF_MAX_LENGTH} THEN 1 ELSE 0 END`;
-const LISTING_COLUMNS = `${LISTING_ID}, source, ${LISTING_SOURCE_ID}, ${LISTING_TITLE}, ${LISTING_STARTED_AT}, ${LISTING_ORGANIZER}, ${LISTING_PARTICIPANTS}, ${LISTING_OVERVIEW}, ${LISTING_ACTIONS}, ${LISTING_METADATA_PROJECTION}, ${LISTING_TRUNCATED}, ${LISTING_ID_OVERSIZED}`;
+const LISTING_COLUMNS = `${LISTING_ID}, ${LISTING_SOURCE}, ${LISTING_SOURCE_ID}, ${LISTING_TITLE}, ${LISTING_STARTED_AT}, ${LISTING_ORGANIZER}, ${LISTING_PARTICIPANTS}, ${LISTING_OVERVIEW}, ${LISTING_ACTIONS}, ${LISTING_METADATA_PROJECTION}, ${LISTING_TRUNCATED}, ${LISTING_ID_OVERSIZED}`;
 function decodeMetadata(row: unknown): TranscriptMetadata | null {
   if (!Array.isArray(row)) return null;
   const [meetingRef, source, sourceId, title, startedAt, organizerEmail, participants, summaryOverview, summaryActionItems, metadata, listingTruncated] = row;
@@ -348,8 +349,10 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     }
     return response.data.rows;
   };
+  // Measure serialized projection bytes in SQL; the cursor advances only over emitted rows so callers can continue partial pages.
   const queryPage = async (
     columns: string,
+    columnCount: number,
     where: string,
     params: Array<string | number | null>,
     order: string,
@@ -357,12 +360,27 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     pageRows: number,
     context: RetrievalContext = {},
   ): Promise<{ rows: unknown[][]; cursor: number | null }> => {
-    const rows = await query(
-      `SELECT ${columns} FROM connector_meeting WHERE ${where} ORDER BY ${order} LIMIT ${pageRows} OFFSET ?`,
-      [...params, cursor], context);
-    const page = rows.slice(0, pageRows);
-    const hasMore = rows.length > pageRows || (page.length === pageRows
-      && (await query(`SELECT 1 FROM connector_meeting WHERE ${where} LIMIT 1 OFFSET ?`, [...params, cursor + pageRows], context)).length > 0);
+    const measured = await query(
+      `WITH candidates AS (
+         SELECT ${columns},
+           length(CAST(json_array(${columns}) AS BLOB)) AS __page_row_bytes,
+           ROW_NUMBER() OVER (ORDER BY ${order}) AS __page_order
+         FROM connector_meeting WHERE ${where}
+         ORDER BY ${order} LIMIT ? OFFSET ?
+       ), budgeted AS (
+         SELECT *, SUM(__page_row_bytes + ${SQL_PAGE_ROW_OVERHEAD_BYTES}) OVER (
+           ORDER BY __page_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+         ) AS __page_total_bytes
+         FROM candidates
+       )
+       SELECT * FROM budgeted
+       WHERE __page_total_bytes <= ?
+       ORDER BY __page_order`,
+      [...params, pageRows, cursor, SQL_PAGE_BYTE_BUDGET], context);
+    const page = measured.map(row => row.slice(0, columnCount));
+    const hasMore = (await query(
+      `SELECT 1 FROM connector_meeting WHERE ${where} LIMIT 1 OFFSET ?`,
+      [...params, cursor + page.length], context)).length > 0;
     return { rows: page, cursor: hasMore ? cursor + page.length : null };
   };
   const readKey = async (key: string, context: RetrievalContext): Promise<BodyResult> => {
@@ -392,7 +410,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
   // date window could otherwise return members whose combined row is outside the result.
   // If this read fails the list proceeds without exclusion: a duplicate is recoverable, a hidden meeting is not.
   // Access and cancellation errors still propagate.
-  // Projections for combined-meetings.ts: combined-key rows are (source, source_id, metadata); listed rows follow COLUMNS.
+  // Projections for combined-meetings.ts: combined-key rows are (source, NULL, metadata); listed rows follow LISTING_COLUMNS.
   const combinedColumns = (row: unknown[]) => ({ source: row[0], sourceId: row[1], metadata: row[2] });
   const listedColumns = (row: unknown[]) => ({ source: row[1], sourceId: row[2], metadata: row[9] });
   const combinedKeys = async (context: RetrievalContext = {}): Promise<Set<string>> => {
@@ -401,9 +419,10 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       let cursor = 0;
       while (true) {
         const page = await queryPage(
-          "source, source_id, metadata",
-          `source = ? AND length(CAST(source_id AS BLOB)) <= 512 AND length(CAST(metadata AS BLOB)) <= ${COMBINED_METADATA_MAX_BYTES} AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} ELSE 0 END`,
-          [COMBINED_SOURCE], "id ASC", cursor, COMBINED_PAGE_ROWS, context);
+          `source, NULL, ${COMBINED_KEYS_METADATA_PROJECTION}`,
+          3,
+          `source = ? AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} ELSE 0 END`,
+          [COMBINED_SOURCE], "id ASC", cursor, SQL_PAGE_MAX_ROWS, context);
         for (const key of combinedMemberKeys(page.rows, combinedColumns)) keys.add(key);
         if (page.cursor === null) return keys;
         if (page.cursor <= cursor) return keys;
@@ -447,8 +466,8 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       const rows: unknown[][] = [];
       let cursor = 0;
       while (rows.length < METADATA_ROW_LIMIT) {
-        const pageRows = Math.min(LISTING_PAGE_ROWS, METADATA_ROW_LIMIT - rows.length);
-        const page = await queryPage(LISTING_COLUMNS, readable, [], order, cursor, pageRows);
+        const pageRows = Math.min(SQL_PAGE_MAX_ROWS, METADATA_ROW_LIMIT - rows.length);
+        const page = await queryPage(LISTING_COLUMNS, 12, readable, [], order, cursor, pageRows);
         rows.push(...page.rows);
         if (page.cursor === null) break;
         cursor = page.cursor;
@@ -474,22 +493,33 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       if (args.to) { clauses.push("julianday(started_at) < julianday(?)"); params.push(new Date(Date.parse(args.to) + 2 * 86_400_000).toISOString()); }
       clauses.push(readableClause());
       const order = `julianday(started_at) IS NULL ASC, julianday(started_at) ${args.sort === "oldest" ? "ASC" : "DESC"}, id ASC`;
-      const scanStart = args.cursor ?? 0;
-      const scannedRows: unknown[][] = [];
-      let cursor: number | null = scanStart;
-      while (scannedRows.length < 12 && cursor !== null) {
-        const page = await queryPage(
-          LISTING_COLUMNS, clauses.join(" AND "), params, order, cursor,
-          Math.min(LISTING_PAGE_ROWS, 12 - scannedRows.length), context);
-        scannedRows.push(...page.rows);
-        cursor = page.cursor;
-      }
-      logSkippedOversizedIds(scannedRows.filter(row => row[11] === 1).length);
-      const usableRows = scannedRows.filter(row => row[11] !== 1);
       const hidden = await combinedKeys(context);
-      // Discovery returns up to twelve scanned rows across byte-bounded SQL pages; callers may continue.
-      const decoded = visibleRows(await commitReadable(usableRows, context), hidden).flatMap(row => { const value = decodeMetadata(row); return value ? [value] : []; });
-      const result = discoveryResult(decoded, cursor !== null || scanStart > 0 ? METADATA_ROW_LIMIT : usableRows.length, args, context);
+      const scanStart = args.cursor ?? 0;
+      let scannedRows = 0;
+      let skippedIds = 0;
+      let cursor: number | null = scanStart;
+      const decoded: TranscriptMetadata[] = [];
+      const requestedCount = args.limit ?? 5;
+      while (scannedRows < METADATA_DISCOVERY_SCAN_LIMIT && cursor !== null
+        && scopedRows(decoded, args, context.timeZone, args.sort).length < requestedCount) {
+        const visibleCount = scopedRows(decoded, args, context.timeZone, args.sort).length;
+        const page = await queryPage(
+          LISTING_COLUMNS, 12, clauses.join(" AND "), params, order, cursor,
+          Math.min(requestedCount - visibleCount, SQL_PAGE_MAX_ROWS, METADATA_DISCOVERY_SCAN_LIMIT - scannedRows), context);
+        scannedRows += page.rows.length;
+        cursor = page.cursor;
+        skippedIds += page.rows.filter(row => row[11] === 1).length;
+        const usableRows = page.rows.filter(row => row[11] !== 1);
+        const visible = visibleRows(await commitReadable(usableRows, context), hidden);
+        for (const row of visible) {
+          const value = decodeMetadata(row);
+          if (value) decoded.push(value);
+        }
+      }
+      logSkippedOversizedIds(skippedIds);
+      // Discovery fills the requested visible result count across byte-bounded SQL pages; callers may continue.
+      const rawCount = cursor !== null || scanStart > 0 ? METADATA_ROW_LIMIT : scannedRows;
+      const result = discoveryResult(decoded, rawCount, args, context);
       return { ...result, discovery: { ...result.discovery, ...(cursor === null ? {} : { nextCursor: cursor }) } };
     },
     readBody,

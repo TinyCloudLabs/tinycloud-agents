@@ -20,7 +20,7 @@ function fixture(rows: Row[]) {
 
 const reader = (db: Database, failCombinedRead?: { code: string }) => createReader({
   sql: { db: () => ({ query: async (sql: string, params?: unknown[]) => {
-    if (failCombinedRead && sql.startsWith("SELECT source, source_id, metadata")) return { ok: false, error: failCombinedRead };
+    if (failCombinedRead && sql.includes("FROM connector_meeting WHERE source = ? AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array'")) return { ok: false, error: failCombinedRead };
     return { ok: true, data: { rows: db.query(sql).values(...((params ?? []) as never[])) } };
   } }) },
   kv: { get: async () => ({ ok: false, error: { code: "KV_NOT_FOUND" } }) },

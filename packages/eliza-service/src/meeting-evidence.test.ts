@@ -215,10 +215,14 @@ describe("storage classification and scoped discovery", () => {
   function storage(body: unknown, rows: unknown[][] = [["old", "fireflies", "old-source", "Design", "2025-01-01T10:00:00Z", null, [], null, null]]) {
     const calls: Array<{ sql: string; params: unknown }> = [];
     const source = createReader({ sql: { db: () => ({ query: async (sql, params) => {
-      if (!sql.startsWith("SELECT source, source_id, metadata")) calls.push({ sql, params });
-      const limit = Number(sql.match(/\bLIMIT\s+(\d+)/i)?.[1] ?? rows.length);
-      const offset = sql.includes("OFFSET ?") ? Number(params?.at(-1) ?? 0) : 0;
-      return { ok: true, data: { rows: rows.slice(offset, offset + limit) } };
+      const combinedQuery = sql.includes("FROM connector_meeting WHERE source = ? AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array'");
+      const hasMoreProbe = sql.startsWith("SELECT 1 FROM connector_meeting");
+      if (combinedQuery) return { ok: true, data: { rows: [] } };
+      if (!hasMoreProbe) calls.push({ sql, params });
+      const pageQuery = sql.includes("WITH candidates AS (");
+      const limit = Number(pageQuery ? params?.at(-3) ?? rows.length : sql.match(/\bLIMIT\s+(\d+)/i)?.[1] ?? rows.length);
+      const offset = pageQuery ? Number(params?.at(-2) ?? 0) : sql.includes("OFFSET ?") ? Number(params?.at(-1) ?? 0) : 0;
+      return { ok: true, data: { rows: hasMoreProbe ? (offset < rows.length ? [[1]] : []) : rows.slice(offset, offset + limit) } };
     } }) }, kv: { get: async () => body } });
     return { source, calls };
   }

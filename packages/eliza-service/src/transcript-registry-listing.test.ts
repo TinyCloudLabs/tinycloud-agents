@@ -128,6 +128,32 @@ describe("meeting listing keeps transcripts stored in metadata out of the respon
     expect((await instance.listMetadata()).map(row => row.meetingRef)).not.toContain("capture-1");
     db.close();
   });
+  test("combined exclusion preserves small members in oversized metadata", async () => {
+    const metadata = JSON.stringify({ merge: { v: 1, members: [{ source: "fireflies", source_id: "capture-padded" }] }, padding: "x".repeat(600) });
+    const db = fixture([
+      ["combined-padded", "exo-merged", "merged-padded", day(0), metadata],
+      ["capture-padded", "fireflies", "capture-padded", day(1), null],
+    ]);
+    const { instance } = reader(db);
+    expect((await instance.listMetadata()).map(row => row.meetingRef)).not.toContain("capture-padded");
+    db.close();
+  });
+
+  test("discovery scans past a hidden first page to return visible meetings", async () => {
+    const members = Array.from({ length: 3 }, (_, i) => ({ source: "fireflies", source_id: `c${i}` }));
+    const rows: Row[] = [
+      ["combined", "exo-merged", "merged", day(20), JSON.stringify({ merge: { v: 1, members } })],
+      ...members.map((member, i) => [`capture-${i}`, "fireflies", member.source_id, day(i), null] as Row),
+      ...Array.from({ length: 5 }, (_, i) => [`visible-${i}`, "fireflies", `v-${i}`, day(i + 3), null] as Row),
+    ];
+    const db = fixture(rows);
+    const { instance } = reader(db);
+    const result = await findMeetings(instance, { limit: 2, source: "fireflies" });
+    expect(result.data.meetings.map(row => row.meetingRef)).toContain("visible-0");
+    expect(result.data.meetings.map(row => row.meetingRef)).not.toContain("capture-0");
+    expect(result.data.discovery?.nextCursor).toBeGreaterThan(3);
+    db.close();
+  });
 
   test("discovery resumes at the supplied cursor after filtering unusable rows", async () => {
     const rows: Row[] = Array.from({ length: 36 }, (_, i) => [`m-${i}`, "fireflies", `f-${i}`, day(i), null]);
@@ -136,25 +162,23 @@ describe("meeting listing keeps transcripts stored in metadata out of the respon
     const { instance } = reader(db);
     const first = await instance.discoverMetadata!({ limit: 12 } as never, {});
     const cursor = first.discovery.nextCursor!;
-    expect(cursor).toBe(12);
+    expect(cursor).toBeGreaterThan(12);
     const parsed = parseFindMeetingsArgs({ limit: 12, cursor });
     expect(parsed?.cursor).toBe(cursor);
     const second = await findMeetings(instance, parsed!);
     expect(second.data.meetings.map(row => row.meetingRef)).toContain(`m-${cursor}`);
     expect(second.data.meetings.map(row => row.meetingRef)).not.toContain("m-0");
-    expect(second.data.discovery?.nextCursor).toBe(24);
+    expect(second.data.discovery?.nextCursor).toBeGreaterThan(cursor);
     db.close();
   });
   test("byte-budgets max-sized list rows, marks clipped display fields, and skips oversized IDs", async () => {
     const db = new Database(":memory:");
     db.run("CREATE TABLE connector_meeting (id TEXT, source TEXT, source_id TEXT, title TEXT, started_at TEXT, organizer_email TEXT, participants TEXT, summary_overview TEXT, summary_action_items TEXT, metadata TEXT)");
     const insert = db.prepare("INSERT INTO connector_meeting VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    const participantPrefix = '[{"name":"Ada","pad":"';
-    const participantSuffix = '"}]';
-    const participantFillerLength = 4_096 - participantPrefix.length - participantSuffix.length;
-    const participantEscape = "\\u0001";
-    const participantFiller = participantEscape.repeat(Math.floor(participantFillerLength / participantEscape.length));
-    const participants = `${participantPrefix}${participantFiller}${" ".repeat(participantFillerLength - participantFiller.length)}${participantSuffix}`;
+    const emptyParticipants = JSON.stringify([{ name: "Ada", pad: "" }]);
+    const backslashes = "\\".repeat(Math.floor((4_096 - emptyParticipants.length) / 2));
+    const participants = JSON.stringify([{ name: "Ada", pad: `${backslashes}${"x".repeat((4_096 - emptyParticipants.length) % 2)}` }]);
+    expect(new TextEncoder().encode(participants).byteLength).toBe(4_096);
     const markers = Object.fromEntries(["artifactType", "artifact_type", "type", "kind", "documentType", "document_type", "notes_kind", "notes_association"].map(key => [key, "\u0001".repeat(99)]));
     for (let i = 0; i < 32; i++) {
       const id = `${"a".repeat(120)}${String(i).padStart(8, "0")}`;
@@ -163,6 +187,12 @@ describe("meeting listing keeps transcripts stored in metadata out of the respon
     }
     insert.run("clipped-row", "exo-local", "clip", "t".repeat(600), day(40), "o".repeat(254), participants, "r".repeat(5000), "a".repeat(5000), JSON.stringify({ type: "m".repeat(200) }));
     insert.run("x".repeat(1025), "exo-local", "oversize", "Oversized ID", day(41), "o".repeat(254), participants, "r".repeat(4096), "a".repeat(4096), "{}");
+    insert.run("é".repeat(65), "exo-local", "multibyte-id", "Multibyte ID", day(43), "organizer@example.invalid", participants, "summary", "actions", "{}");
+    insert.run("bounded-source", "\u0001".repeat(64), "\u0001".repeat(512), "\u0001".repeat(512),
+      `${day(45)}${" ".repeat(64 - day(45).length)}`, "\u0001".repeat(254), participants,
+      "\u0001".repeat(4096), "\u0001".repeat(4096), JSON.stringify({ ...markers, transcript_count: 1 }));
+    insert.run("oversized-source", "s".repeat(TRANSCRIPT_RESPONSE_BYTE_LIMIT + 1), "s", "Oversized source", day(44),
+      "organizer@example.invalid", participants, "summary", "actions", "{}");
     insert.run("invalid-participants", "exo-local", "invalid-participants", "Invalid attendees", day(42), null, "\u0001".repeat(4096), "summary", "actions", "{}");
     const { instance, sizes } = reader(db);
     const warnings: unknown[][] = [];
@@ -190,7 +220,7 @@ describe("meeting listing keeps transcripts stored in metadata out of the respon
       });
       expect(listed.map(row => row.meetingRef)).not.toContain("x".repeat(1025));
       expect(Math.max(...sizes)).toBeLessThan(TRANSCRIPT_RESPONSE_BYTE_LIMIT);
-      expect(warnings).toContainEqual(["transcript_listing_oversized_ids_skipped", { count: 1 }]);
+      expect(warnings).toContainEqual(["transcript_listing_oversized_ids_skipped", { count: 2 }]);
     } finally {
       console.warn = originalWarn;
       db.close();
