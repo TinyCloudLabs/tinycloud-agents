@@ -243,7 +243,7 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
 const MARKER_KEYS = ["artifactType", "artifact_type", "type", "kind", "documentType", "document_type", "notes_kind", "notes_association"] as const;
 /** Keep whole transcripts stored in `metadata` out of meeting-list responses. */
 const METADATA_PROJECTION = `CASE WHEN json_valid(metadata) THEN json_object(${[
-  ...MARKER_KEYS.map(key => `'${key}', CASE json_type(metadata, '$.${key}') WHEN 'text' THEN json_extract(metadata, '$.${key}') END`),
+  ...MARKER_KEYS.map(key => `'${key}', CASE WHEN json_type(metadata, '$.${key}') = 'text' AND length(json_extract(metadata, '$.${key}')) < 100 THEN json_extract(metadata, '$.${key}') END`),
   "'transcript_count', CASE WHEN json_type(metadata, '$.transcript_count') IN ('integer', 'real') THEN json_extract(metadata, '$.transcript_count') END",
   "'merge', json_object('members', CASE json_type(metadata, '$.merge.members') WHEN 'array' THEN json(json_extract(metadata, '$.merge.members')) END)",
 ].join(", ")}) END`;

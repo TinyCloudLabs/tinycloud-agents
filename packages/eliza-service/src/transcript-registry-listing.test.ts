@@ -73,4 +73,13 @@ describe("meeting listing keeps transcripts stored in metadata out of the respon
     }
     db.close();
   });
+  test("oversized provenance markers are discarded before SQL responses are serialized", async () => {
+    const db = fixture([["large-marker", "fireflies", "f-large", day(0),
+      JSON.stringify({ type: "x".repeat(TRANSCRIPT_RESPONSE_BYTE_LIMIT + 1) })]]);
+    const { instance, sizes } = reader(db);
+    const [listed] = await instance.listMetadata();
+    expect(listed.metadata).toBeUndefined();
+    expect(Math.max(...sizes)).toBeLessThan(TRANSCRIPT_RESPONSE_BYTE_LIMIT);
+    db.close();
+  });
 });
