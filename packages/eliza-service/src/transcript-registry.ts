@@ -244,8 +244,8 @@ const MARKER_KEYS = ["artifactType", "artifact_type", "type", "kind", "documentT
 /** Combined member refs are small; oversized combined rows fall back to listing their member rows. */
 const COMBINED_MEMBERS_MAX_BYTES = 128;
 const COMBINED_METADATA_MAX_BYTES = 512;
-const LISTING_ROW_MAX_BYTES = 80 * 1024; // Worst-case JSON-escaped projected fields, including the 4 KiB summaries.
-const LIST_PAGE_BYTE_BUDGET = Math.floor(TRANSCRIPT_RESPONSE_BYTE_LIMIT * 0.98);
+const LISTING_ROW_MAX_BYTES = 256 * 1024; // Field caps bound JSON-escaped rows below this, including 12 bytes per Unicode scalar.
+const LIST_PAGE_BYTE_BUDGET = Math.floor(TRANSCRIPT_RESPONSE_BYTE_LIMIT * 0.75);
 const LISTING_PAGE_ROWS = Math.floor(LIST_PAGE_BYTE_BUDGET / LISTING_ROW_MAX_BYTES);
 const COMBINED_ROW_MAX_BYTES = 8 * 1024;
 const COMBINED_PAGE_ROWS = Math.floor(LIST_PAGE_BYTE_BUDGET / COMBINED_ROW_MAX_BYTES);
@@ -401,8 +401,8 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       let cursor = 0;
       while (true) {
         const page = await queryPage(
-          `source, source_id, metadata, CASE WHEN length(CAST(id AS BLOB)) <= ${MEETING_REF_MAX_LENGTH} THEN id END`,
-          `source = ? AND length(CAST(id AS BLOB)) <= ${MEETING_REF_MAX_LENGTH} AND length(CAST(source_id AS BLOB)) <= 512 AND length(CAST(metadata AS BLOB)) <= ${COMBINED_METADATA_MAX_BYTES} AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} ELSE 0 END`,
+          "source, source_id, metadata",
+          `source = ? AND length(CAST(source_id AS BLOB)) <= 512 AND length(CAST(metadata AS BLOB)) <= ${COMBINED_METADATA_MAX_BYTES} AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} ELSE 0 END`,
           [COMBINED_SOURCE], "id ASC", cursor, COMBINED_PAGE_ROWS, context);
         for (const key of combinedMemberKeys(page.rows, combinedColumns)) keys.add(key);
         if (page.cursor === null) return keys;
@@ -473,17 +473,24 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       if (args.from) { clauses.push("julianday(started_at) >= julianday(?)"); params.push(new Date(Date.parse(args.from) - 86_400_000).toISOString()); }
       if (args.to) { clauses.push("julianday(started_at) < julianday(?)"); params.push(new Date(Date.parse(args.to) + 2 * 86_400_000).toISOString()); }
       clauses.push(readableClause());
-      const page = await queryPage(
-        LISTING_COLUMNS, clauses.join(" AND "), params,
-        `julianday(started_at) IS NULL ASC, julianday(started_at) ${args.sort === "oldest" ? "ASC" : "DESC"}, id ASC`,
-        0, LISTING_PAGE_ROWS, context);
-      logSkippedOversizedIds(page.rows.filter(row => row[11] === 1).length);
-      const usableRows = page.rows.filter(row => row[11] !== 1);
+      const order = `julianday(started_at) IS NULL ASC, julianday(started_at) ${args.sort === "oldest" ? "ASC" : "DESC"}, id ASC`;
+      const scanStart = args.cursor ?? 0;
+      const scannedRows: unknown[][] = [];
+      let cursor: number | null = scanStart;
+      while (scannedRows.length < 12 && cursor !== null) {
+        const page = await queryPage(
+          LISTING_COLUMNS, clauses.join(" AND "), params, order, cursor,
+          Math.min(LISTING_PAGE_ROWS, 12 - scannedRows.length), context);
+        scannedRows.push(...page.rows);
+        cursor = page.cursor;
+      }
+      logSkippedOversizedIds(scannedRows.filter(row => row[11] === 1).length);
+      const usableRows = scannedRows.filter(row => row[11] !== 1);
       const hidden = await combinedKeys(context);
-      // Discovery deliberately returns the newest byte-bounded page; callers may continue with nextCursor.
-      const decoded = visibleRows(await commitReadable(usableRows.slice(0, 500), context), hidden).flatMap(row => { const value = decodeMetadata(row); return value ? [value] : []; });
-      const result = discoveryResult(decoded, page.cursor === null ? usableRows.length : METADATA_ROW_LIMIT, args, context);
-      return { ...result, discovery: { ...result.discovery, ...(page.cursor === null ? {} : { nextCursor: page.cursor }) } };
+      // Discovery returns up to twelve scanned rows across byte-bounded SQL pages; callers may continue.
+      const decoded = visibleRows(await commitReadable(usableRows, context), hidden).flatMap(row => { const value = decodeMetadata(row); return value ? [value] : []; });
+      const result = discoveryResult(decoded, cursor !== null || scanStart > 0 ? METADATA_ROW_LIMIT : usableRows.length, args, context);
+      return { ...result, discovery: { ...result.discovery, ...(cursor === null ? {} : { nextCursor: cursor }) } };
     },
     readBody,
     async getTranscript(source, sourceId) {

@@ -21,7 +21,7 @@ export interface MeetingFilters {
   source?: TranscriptSource;
 }
 
-export interface FindMeetingsArgs extends MeetingFilters { sort?: SortOrder; selectFirst?: boolean; limit?: number; meetingRef?: string }
+export interface FindMeetingsArgs extends MeetingFilters { sort?: SortOrder; selectFirst?: boolean; limit?: number; meetingRef?: string; cursor?: number }
 export interface ReadMeetingArgs {
   meetingRef?: string;
   focus: "summary" | "actions" | "decisions" | "speaker" | "transcript";
@@ -58,18 +58,20 @@ function parseFilters(args: Record<string, unknown>): MeetingFilters | null {
 }
 
 export function parseFindMeetingsArgs(args: Record<string, unknown>): FindMeetingsArgs | null {
-  const allowed = new Set(["title", "participant", "from", "to", "source", "sort", "selectFirst", "limit", "meetingRef"]);
+  const allowed = new Set(["title", "participant", "from", "to", "source", "sort", "selectFirst", "limit", "meetingRef", "cursor"]);
   if (Object.keys(args).some((key) => !allowed.has(key))) return null;
   const filters = parseFilters(args);
   const meetingRef = parseBoundedString(args.meetingRef, 128);
   if (!filters || meetingRef === null || (meetingRef && !safeMeetingRef(meetingRef))) return null;
   if (args.limit !== undefined && (!Number.isInteger(args.limit) || Number(args.limit) < 1 || Number(args.limit) > 12)) return null;
+  if (args.cursor !== undefined && (!Number.isSafeInteger(args.cursor) || Number(args.cursor) < 0)) return null;
   if (args.sort !== undefined && args.sort !== "newest" && args.sort !== "oldest") return null;
   if (args.selectFirst !== undefined && typeof args.selectFirst !== "boolean") return null;
   return {
     ...filters,
     ...(meetingRef ? { meetingRef } : {}),
     ...(args.limit !== undefined ? { limit: Number(args.limit) } : {}),
+    ...(args.cursor !== undefined ? { cursor: Number(args.cursor) } : {}),
     ...(args.sort ? { sort: args.sort as SortOrder } : {}),
     ...(typeof args.selectFirst === "boolean" ? { selectFirst: args.selectFirst } : {}),
   };

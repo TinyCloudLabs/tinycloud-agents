@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createReader } from "./transcript-registry.js";
-import { findMeetings } from "./actions/tinycloud-search-transcripts.js";
+import { findMeetings, parseFindMeetingsArgs } from "./actions/tinycloud-search-transcripts.js";
 import { TRANSCRIPT_RESPONSE_BYTE_LIMIT } from "./transcript-transport.js";
 import { metadataOutcome } from "./meeting-evidence.js";
 
@@ -117,6 +117,32 @@ describe("meeting listing keeps transcripts stored in metadata out of the respon
     expect(listed).toHaveLength(250);
     expect(listed.some(row => row.source === "fireflies")).toBe(false);
     expect(Math.max(...sizes)).toBeLessThan(TRANSCRIPT_RESPONSE_BYTE_LIMIT);
+    db.close();
+  });
+  test("combined rows with oversized IDs still hide their members", async () => {
+    const db = fixture([
+      ["c".repeat(129), "exo-merged", "merge-1", day(0), JSON.stringify({ merge: { v: 1, members: [{ source: "fireflies", source_id: "capture-1" }] } })],
+      ["capture-1", "fireflies", "capture-1", day(1), null],
+    ]);
+    const { instance } = reader(db);
+    expect((await instance.listMetadata()).map(row => row.meetingRef)).not.toContain("capture-1");
+    db.close();
+  });
+
+  test("discovery resumes at the supplied cursor after filtering unusable rows", async () => {
+    const rows: Row[] = Array.from({ length: 36 }, (_, i) => [`m-${i}`, "fireflies", `f-${i}`, day(i), null]);
+    rows[0] = ["x".repeat(129), "fireflies", "oversized", day(0), null];
+    const db = fixture(rows);
+    const { instance } = reader(db);
+    const first = await instance.discoverMetadata!({ limit: 12 } as never, {});
+    const cursor = first.discovery.nextCursor!;
+    expect(cursor).toBe(12);
+    const parsed = parseFindMeetingsArgs({ limit: 12, cursor });
+    expect(parsed?.cursor).toBe(cursor);
+    const second = await findMeetings(instance, parsed!);
+    expect(second.data.meetings.map(row => row.meetingRef)).toContain(`m-${cursor}`);
+    expect(second.data.meetings.map(row => row.meetingRef)).not.toContain("m-0");
+    expect(second.data.discovery?.nextCursor).toBe(24);
     db.close();
   });
   test("byte-budgets max-sized list rows, marks clipped display fields, and skips oversized IDs", async () => {
