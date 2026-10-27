@@ -68,7 +68,7 @@ function fixture(parentMs = 7 * 24 * HOUR) {
           return {
             sql: { db(name: string) {
               expect(name).toBe(PATH);
-              return { query: async (sql: string) => result("sql", { rows: [["meeting", "fireflies", "source", delegation.cid, "2030-01-01T00:00:00Z", null, "[]", null, null]] }, !sql.startsWith("SELECT source, source_id, metadata")) };
+              return { query: async (sql: string) => result("sql", { rows: [["meeting", "fireflies", "source", delegation.cid, "2030-01-01T00:00:00Z", null, "[]", null, null]] }, !sql.startsWith("WITH candidates") && !sql.startsWith("SELECT 1 FROM connector_meeting")) };
             } },
             kv: { get: async (key: string, options?: { prefix?: string }) => {
               expect(key).toBe(`${PATH}/fireflies/transcript/source`);
