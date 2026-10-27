@@ -241,11 +241,13 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
 }
 
 const MARKER_KEYS = ["artifactType", "artifact_type", "type", "kind", "documentType", "document_type", "notes_kind", "notes_association"] as const;
-/** Keep whole transcripts stored in `metadata` out of meeting-list responses. */
+/** Combined member refs are small; oversized combined rows fall back to listing their member rows. */
+const COMBINED_MEMBERS_MAX_BYTES = 128;
+const COMBINED_METADATA_MAX_BYTES = 512;
 const METADATA_PROJECTION = `CASE WHEN json_valid(metadata) THEN json_object(${[
   ...MARKER_KEYS.map(key => `'${key}', CASE WHEN json_type(metadata, '$.${key}') = 'text' AND length(json_extract(metadata, '$.${key}')) < 100 THEN json_extract(metadata, '$.${key}') END`),
   "'transcript_count', CASE WHEN json_type(metadata, '$.transcript_count') IN ('integer', 'real') THEN json_extract(metadata, '$.transcript_count') END",
-  "'merge', json_object('members', CASE json_type(metadata, '$.merge.members') WHEN 'array' THEN json(json_extract(metadata, '$.merge.members')) END)",
+  `'merge', CASE WHEN source = '${COMBINED_SOURCE}' AND json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} THEN json_object('members', json(json_extract(metadata, '$.merge.members'))) END`,
 ].join(", ")}) END`;
 const COLUMNS = `id, source, source_id, title, started_at, organizer_email, participants, summary_overview, summary_action_items, ${METADATA_PROJECTION}`;
 function decodeMetadata(row: unknown): TranscriptMetadata | null {
@@ -346,7 +348,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
   const listedColumns = (row: unknown[]) => ({ source: row[1], sourceId: row[2], metadata: row[9] });
   const combinedKeys = async (context: RetrievalContext = {}): Promise<Set<string>> => {
     try {
-      return combinedMemberKeys(await query("SELECT source, source_id, metadata FROM connector_meeting WHERE source = ?", [COMBINED_SOURCE], context), combinedColumns);
+      return combinedMemberKeys(await query(`SELECT source, source_id, metadata FROM connector_meeting WHERE source = ? AND length(CAST(metadata AS BLOB)) <= ${COMBINED_METADATA_MAX_BYTES} AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} ELSE 0 END`, [COMBINED_SOURCE], context), combinedColumns);
     } catch (error) {
       // Only the generic unavailable failure fails open; access, timeout and cancellation errors propagate.
       if (error instanceof MeetingRetrievalError && error.code === "transcript_unavailable") return new Set();

@@ -82,4 +82,22 @@ describe("meeting listing keeps transcripts stored in metadata out of the respon
     expect(Math.max(...sizes)).toBeLessThan(TRANSCRIPT_RESPONSE_BYTE_LIMIT);
     db.close();
   });
+  test("unbounded merge-member arrays cannot overflow listing or exclusion responses", async () => {
+    const members = Array.from({ length: 20_000 }, (_, i) => ({
+      source: "fireflies", source_id: `f-${i}-${"x".repeat(32)}`,
+    }));
+    const metadata = JSON.stringify({ merge: { v: 1, members } });
+    const db = fixture([
+      ["combined", "exo-merged", "merged-1", day(0), metadata],
+      ["member", "fireflies", members[0].source_id, day(1), null],
+      ["ordinary", "fireflies", "ordinary-1", day(2), metadata],
+    ]);
+    const { instance, sizes } = reader(db);
+    const listed = await instance.listMetadata();
+    expect(listed.map(row => row.meetingRef)).toContain("member");
+    expect(listed.map(row => row.meetingRef)).toContain("ordinary");
+    expect(listed.map(row => row.meetingRef)).not.toContain("combined");
+    expect(Math.max(...sizes)).toBeLessThan(TRANSCRIPT_RESPONSE_BYTE_LIMIT);
+    db.close();
+  });
 });
