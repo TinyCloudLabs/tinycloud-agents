@@ -244,6 +244,8 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
 const MARKER_KEYS = ["artifactType", "artifact_type", "type", "kind", "documentType", "document_type", "notes_kind", "notes_association"] as const;
 /** Combined member refs are small; oversized combined rows fall back to listing their member rows. */
 const COMBINED_MEMBERS_MAX_BYTES = 128;
+/** Upper bound on combined-row pages read for exclusion; a missed exclusion is a recoverable duplicate. */
+const COMBINED_KEYS_MAX_PAGES = 20;
 const SQL_PAGE_MAX_ROWS = 500;
 const SQL_PAGE_BYTE_BUDGET = Math.floor(TRANSCRIPT_RESPONSE_BYTE_LIMIT * 0.75);
 const SQL_PAGE_ROW_OVERHEAD_BYTES = 32;
@@ -370,7 +372,8 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
        ), budgeted AS (
          SELECT *, SUM(__page_row_bytes + ${SQL_PAGE_ROW_OVERHEAD_BYTES}) OVER (
            ORDER BY __page_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-         ) AS __page_total_bytes
+         ) AS __page_total_bytes,
+         COUNT(*) OVER () AS __page_candidates
          FROM candidates
        )
        SELECT * FROM budgeted
@@ -378,6 +381,10 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
        ORDER BY __page_order`,
       [...params, pageRows, cursor, SQL_PAGE_BYTE_BUDGET], context);
     const page = measured.map(row => row.slice(0, columnCount));
+    // A short page the byte budget did not trim is the last one; only full or trimmed pages need a continuation probe.
+    const candidates = Number(measured[0]?.[columnCount + 3]);
+    const trimmed = Number.isFinite(candidates) && candidates > page.length;
+    if (!trimmed && page.length < pageRows) return { rows: page, cursor: null };
     const hasMore = (await query(
       `SELECT 1 FROM connector_meeting WHERE ${where} LIMIT 1 OFFSET ?`,
       [...params, cursor + page.length], context)).length > 0;
@@ -417,7 +424,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     try {
       const keys = new Set<string>();
       let cursor = 0;
-      while (true) {
+      for (let pages = 0; pages < COMBINED_KEYS_MAX_PAGES; pages += 1) {
         const page = await queryPage(
           `source, NULL, ${COMBINED_KEYS_METADATA_PROJECTION}`,
           3,
@@ -428,6 +435,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
         if (page.cursor <= cursor) return keys;
         cursor = page.cursor;
       }
+      return keys;
     } catch (error) {
       // Only the generic unavailable failure fails open; access, timeout and cancellation errors propagate.
       if (error instanceof MeetingRetrievalError && error.code === "transcript_unavailable") return new Set();
