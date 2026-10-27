@@ -240,7 +240,14 @@ export class TranscriptAccessRegistry implements TranscriptRegistry {
   }
 }
 
-const COLUMNS = "id, source, source_id, title, started_at, organizer_email, participants, summary_overview, summary_action_items, metadata";
+const MARKER_KEYS = ["artifactType", "artifact_type", "type", "kind", "documentType", "document_type", "notes_kind", "notes_association"] as const;
+/** Keep whole transcripts stored in `metadata` out of meeting-list responses. */
+const METADATA_PROJECTION = `CASE WHEN json_valid(metadata) THEN json_object(${[
+  ...MARKER_KEYS.map(key => `'${key}', CASE json_type(metadata, '$.${key}') WHEN 'text' THEN json_extract(metadata, '$.${key}') END`),
+  "'transcript_count', CASE WHEN json_type(metadata, '$.transcript_count') IN ('integer', 'real') THEN json_extract(metadata, '$.transcript_count') END",
+  "'merge', json_object('members', CASE json_type(metadata, '$.merge.members') WHEN 'array' THEN json(json_extract(metadata, '$.merge.members')) END)",
+].join(", ")}) END`;
+const COLUMNS = `id, source, source_id, title, started_at, organizer_email, participants, summary_overview, summary_action_items, ${METADATA_PROJECTION}`;
 function decodeMetadata(row: unknown): TranscriptMetadata | null {
   if (!Array.isArray(row)) return null;
   const [meetingRef, source, sourceId, title, startedAt, organizerEmail, participants, summaryOverview, summaryActionItems, metadata] = row;
@@ -250,7 +257,7 @@ function decodeMetadata(row: unknown): TranscriptMetadata | null {
   if (typeof provenance === "string") { try { provenance = JSON.parse(provenance); } catch { provenance = undefined; } }
   // Only keep existing artifact type markers, never opaque provider metadata.
   const known: Record<string, unknown> = {};
-  if (provenance && typeof provenance === "object") for (const key of ["artifactType", "artifact_type", "type", "kind", "documentType", "document_type", "notes_kind", "notes_association"]) {
+  if (provenance && typeof provenance === "object") for (const key of MARKER_KEYS) {
     const value = (provenance as Record<string, unknown>)[key]; if (typeof value === "string" && value.length < 100) known[key] = value;
   }
   const transcriptCount = provenance && typeof provenance === "object" ? (provenance as Record<string, unknown>).transcript_count : undefined;
