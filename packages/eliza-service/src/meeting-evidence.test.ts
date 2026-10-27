@@ -214,7 +214,12 @@ describe("meeting evidence v2", () => {
 describe("storage classification and scoped discovery", () => {
   function storage(body: unknown, rows: unknown[][] = [["old", "fireflies", "old-source", "Design", "2025-01-01T10:00:00Z", null, [], null, null]]) {
     const calls: Array<{ sql: string; params: unknown }> = [];
-    const source = createReader({ sql: { db: () => ({ query: async (sql, params) => { if (!sql.startsWith("SELECT source, source_id, metadata")) calls.push({ sql, params }); return { ok: true, data: { rows } }; } }) }, kv: { get: async () => body } });
+    const source = createReader({ sql: { db: () => ({ query: async (sql, params) => {
+      if (!sql.startsWith("SELECT source, source_id, metadata")) calls.push({ sql, params });
+      const limit = Number(sql.match(/\bLIMIT\s+(\d+)/i)?.[1] ?? rows.length);
+      const offset = sql.includes("OFFSET ?") ? Number(params?.at(-1) ?? 0) : 0;
+      return { ok: true, data: { rows: rows.slice(offset, offset + limit) } };
+    } }) }, kv: { get: async () => body } });
     return { source, calls };
   }
   test.each([

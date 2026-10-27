@@ -26,6 +26,8 @@ export interface Discovery {
   matchedCount: number; countKind: "exact" | "lower_bound"; returnedCount: number; scanLimited: boolean;
   excludedUndatedCount: number; orderProven: boolean; interval: { from?: string; to?: string; timeZone?: string };
   observedAt: string; omittedMeetingRefs: string[];
+  /** Offset for a continuation page; find answers intentionally return this page without following it. */
+  nextCursor?: number;
 }
 export interface DiscoveryResult { rows: TranscriptMetadata[]; discovery: Discovery }
 export class MeetingRetrievalError extends Error {
@@ -117,7 +119,7 @@ export function storedRecap(value: string | null | undefined): string | null {
   return text.length <= 600 && PLACEHOLDER_RECAPS.some(pattern => pattern.test(lead)) ? null : text;
 }
 function baseOutcome(row: TranscriptMetadata, request: EvidenceRequest): MeetingOutcome {
-  const metadataLimited = row.participantNames.length > 20 || row.participantNames.some(name => name.length > 120) || (row.title?.length ?? 0) > 160 || (row.organizerEmail?.length ?? 0) > 254 || row.metadataLimited;
+  const metadataLimited = row.participantNames.length > 20 || row.participantNames.some(name => name.length > 120) || (row.title?.length ?? 0) > 160 || (row.organizerEmail?.length ?? 0) > 254 || row.metadataLimited || row.listingTruncated;
   return { meetingRef: row.meetingRef, source: row.source, meeting: meetingMetadata(row), state: request.focus === "metadata" ? "metadata" : "read", body: { state: "not_requested" },
     search: { state: "not_requested", storedFieldsExamined: false, bodyExamined: false, examinedMatches: 0, retainedMatches: 0 }, evidence: [],
     coverage: { purpose: request.focus, overviewPresent: storedRecap(row.summaryOverview) !== null, actionsPresent: Boolean(row.summaryActionItems?.trim()), bodyAttempted: false, bodyRequired: Boolean(request.includeBody) || ["topic", "speaker", "decisions", "transcript"].includes(request.focus), evidenceRetained: 0, omittedEvidenceCount: metadataLimited ? 1 : 0, omissionReasons: metadataLimited ? ["metadata_limit"] : [], support: "none" } };

@@ -9,7 +9,7 @@ import { TRANSCRIPT_SOURCES } from "./actions/tinycloud-search-transcripts.js";
 import type { TranscriptMetadata, TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
 import { checkContext, decodeBody, discoveryResult, MeetingRetrievalError, withinContext } from "./meeting-evidence.js";
 import type { BodyResult, MeetingSelection, RetrievalContext } from "./meeting-evidence.js";
-import { createTranscriptNode, TranscriptResponseLimitError } from "./transcript-transport.js";
+import { createTranscriptNode, TranscriptResponseLimitError, TRANSCRIPT_RESPONSE_BYTE_LIMIT } from "./transcript-transport.js";
 import { COMBINED_SOURCE, combinedMemberKeys, isCombinedMember, readCombinedMembers } from "./combined-meetings.js";
 
 const SQL_PATH = "xyz.tinycloud.tinychat/connectors";
@@ -244,16 +244,43 @@ const MARKER_KEYS = ["artifactType", "artifact_type", "type", "kind", "documentT
 /** Combined member refs are small; oversized combined rows fall back to listing their member rows. */
 const COMBINED_MEMBERS_MAX_BYTES = 128;
 const COMBINED_METADATA_MAX_BYTES = 512;
-const COMBINED_ROWS_PER_QUERY = 100;
+const LISTING_ROW_MAX_BYTES = 80 * 1024; // Worst-case JSON-escaped projected fields, including the 4 KiB summaries.
+const LIST_PAGE_BYTE_BUDGET = Math.floor(TRANSCRIPT_RESPONSE_BYTE_LIMIT * 0.98);
+const LISTING_PAGE_ROWS = Math.floor(LIST_PAGE_BYTE_BUDGET / LISTING_ROW_MAX_BYTES);
+const COMBINED_ROW_MAX_BYTES = 8 * 1024;
+const COMBINED_PAGE_ROWS = Math.floor(LIST_PAGE_BYTE_BUDGET / COMBINED_ROW_MAX_BYTES);
+const MEETING_REF_MAX_LENGTH = 128;
+const SOURCE_ID_MAX_LENGTH = 512;
+const LIST_TITLE_MAX_LENGTH = 512;
+const LIST_STARTED_AT_MAX_LENGTH = 64;
+const LIST_ORGANIZER_MAX_LENGTH = 254;
+const LIST_PARTICIPANTS_MAX_BYTES = 4_096;
+const LIST_SUMMARY_MAX_LENGTH = 4_096;
 const METADATA_PROJECTION = `CASE WHEN json_valid(metadata) THEN json_object(${[
   ...MARKER_KEYS.map(key => `'${key}', CASE WHEN json_type(metadata, '$.${key}') = 'text' AND length(json_extract(metadata, '$.${key}')) < 100 THEN json_extract(metadata, '$.${key}') END`),
   "'transcript_count', CASE WHEN json_type(metadata, '$.transcript_count') IN ('integer', 'real') THEN json_extract(metadata, '$.transcript_count') END",
   `'merge', CASE WHEN source = '${COMBINED_SOURCE}' AND json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} THEN json_object('members', json(json_extract(metadata, '$.merge.members'))) END`,
 ].join(", ")}) END`;
+const LISTING_METADATA_PROJECTION = `CASE WHEN json_valid(metadata) THEN json_object(${[
+  ...MARKER_KEYS.map(key => `'${key}', CASE WHEN json_type(metadata, '$.${key}') = 'text' THEN substr(json_extract(metadata, '$.${key}'), 1, 99) END`),
+  "'transcript_count', CASE WHEN json_type(metadata, '$.transcript_count') IN ('integer', 'real') THEN json_extract(metadata, '$.transcript_count') END",
+  `'merge', CASE WHEN source = '${COMBINED_SOURCE}' AND json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} THEN json_object('members', json(json_extract(metadata, '$.merge.members')) ) END`,
+].join(", ")}) END`;
 const COLUMNS = `id, source, source_id, title, started_at, organizer_email, participants, summary_overview, summary_action_items, ${METADATA_PROJECTION}`;
+const LISTING_ID = `CASE WHEN length(CAST(id AS BLOB)) <= ${MEETING_REF_MAX_LENGTH} THEN id END`;
+const LISTING_SOURCE_ID = `CASE WHEN length(source_id) <= ${SOURCE_ID_MAX_LENGTH} THEN source_id END`;
+const LISTING_TITLE = `substr(title, 1, ${LIST_TITLE_MAX_LENGTH})`;
+const LISTING_STARTED_AT = `substr(started_at, 1, ${LIST_STARTED_AT_MAX_LENGTH})`;
+const LISTING_ORGANIZER = `substr(organizer_email, 1, ${LIST_ORGANIZER_MAX_LENGTH})`;
+const LISTING_PARTICIPANTS = `CASE WHEN participants IS NULL THEN NULL WHEN json_valid(participants) AND length(CAST(participants AS BLOB)) <= ${LIST_PARTICIPANTS_MAX_BYTES} THEN participants ELSE '[]' END`;
+const LISTING_OVERVIEW = `substr(summary_overview, 1, ${LIST_SUMMARY_MAX_LENGTH})`;
+const LISTING_ACTIONS = `substr(summary_action_items, 1, ${LIST_SUMMARY_MAX_LENGTH})`;
+const LISTING_TRUNCATED = `CASE WHEN length(id) > ${MEETING_REF_MAX_LENGTH} OR length(source_id) > ${SOURCE_ID_MAX_LENGTH} OR length(title) > ${LIST_TITLE_MAX_LENGTH} OR length(started_at) > ${LIST_STARTED_AT_MAX_LENGTH} OR length(organizer_email) > ${LIST_ORGANIZER_MAX_LENGTH} OR (participants IS NOT NULL AND (NOT json_valid(participants) OR length(CAST(participants AS BLOB)) > ${LIST_PARTICIPANTS_MAX_BYTES})) OR length(summary_overview) > ${LIST_SUMMARY_MAX_LENGTH} OR length(summary_action_items) > ${LIST_SUMMARY_MAX_LENGTH}${MARKER_KEYS.map(key => ` OR (json_valid(metadata) AND json_type(metadata, '$.${key}') = 'text' AND length(json_extract(metadata, '$.${key}')) >= 100)`).join("")} OR (source = '${COMBINED_SOURCE}' AND json_valid(metadata) AND json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) > ${COMBINED_MEMBERS_MAX_BYTES}) THEN 1 ELSE 0 END`;
+const LISTING_ID_OVERSIZED = `CASE WHEN length(CAST(id AS BLOB)) > ${MEETING_REF_MAX_LENGTH} THEN 1 ELSE 0 END`;
+const LISTING_COLUMNS = `${LISTING_ID}, source, ${LISTING_SOURCE_ID}, ${LISTING_TITLE}, ${LISTING_STARTED_AT}, ${LISTING_ORGANIZER}, ${LISTING_PARTICIPANTS}, ${LISTING_OVERVIEW}, ${LISTING_ACTIONS}, ${LISTING_METADATA_PROJECTION}, ${LISTING_TRUNCATED}, ${LISTING_ID_OVERSIZED}`;
 function decodeMetadata(row: unknown): TranscriptMetadata | null {
   if (!Array.isArray(row)) return null;
-  const [meetingRef, source, sourceId, title, startedAt, organizerEmail, participants, summaryOverview, summaryActionItems, metadata] = row;
+  const [meetingRef, source, sourceId, title, startedAt, organizerEmail, participants, summaryOverview, summaryActionItems, metadata, listingTruncated] = row;
   if (typeof meetingRef !== "string" || !safeMeetingRef(meetingRef) || !isSource(source) || typeof sourceId !== "string" || !safeSegment(sourceId)) return null;
   const parsed = parseParticipants(participants);
   let provenance: unknown = metadata;
@@ -269,8 +296,12 @@ function decodeMetadata(row: unknown): TranscriptMetadata | null {
     startedAt: typeof startedAt === "string" && Number.isFinite(Date.parse(startedAt)) ? startedAt : null,
     participantNames: parsed.names, participantEmails: parsed.emails, metadataLimited: parsed.limited, organizerEmail: typeof organizerEmail === "string" ? organizerEmail : null,
     summaryOverview: typeof summaryOverview === "string" ? summaryOverview : null, summaryActionItems: typeof summaryActionItems === "string" ? summaryActionItems : null,
+    listingTruncated: listingTruncated === 1,
     ...(Object.keys(known).length ? { metadata: known } : {}),
   };
+}
+function logSkippedOversizedIds(count: number): void {
+  if (count > 0) console.warn("transcript_listing_oversized_ids_skipped", { count });
 }
 /** Pinned SDK (2.11.0; wrapError unchanged since 2.6.0) preserves HTTP error details, but KV_NOT_FOUND alone is ambiguous. */
 export function classifyBodyFailure(error: unknown): BodyResult {
@@ -317,6 +348,23 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     }
     return response.data.rows;
   };
+  const queryPage = async (
+    columns: string,
+    where: string,
+    params: Array<string | number | null>,
+    order: string,
+    cursor: number,
+    pageRows: number,
+    context: RetrievalContext = {},
+  ): Promise<{ rows: unknown[][]; cursor: number | null }> => {
+    const rows = await query(
+      `SELECT ${columns} FROM connector_meeting WHERE ${where} ORDER BY ${order} LIMIT ${pageRows} OFFSET ?`,
+      [...params, cursor], context);
+    const page = rows.slice(0, pageRows);
+    const hasMore = rows.length > pageRows || (page.length === pageRows
+      && (await query(`SELECT 1 FROM connector_meeting WHERE ${where} LIMIT 1 OFFSET ?`, [...params, cursor + pageRows], context)).length > 0);
+    return { rows: page, cursor: hasMore ? cursor + page.length : null };
+  };
   const readKey = async (key: string, context: RetrievalContext): Promise<BodyResult> => {
     // Transcript-only transport caps decoded bytes before SDK buffering. Retain
     // the decoded-value check for injected readers and UTF-8 replacement growth.
@@ -350,14 +398,16 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
   const combinedKeys = async (context: RetrievalContext = {}): Promise<Set<string>> => {
     try {
       const keys = new Set<string>();
-      let cursor = "";
+      let cursor = 0;
       while (true) {
-        const rows = await query(`SELECT source, source_id, metadata, id FROM connector_meeting WHERE source = ? AND id > ? AND length(CAST(source_id AS BLOB)) <= 512 AND length(CAST(metadata AS BLOB)) <= ${COMBINED_METADATA_MAX_BYTES} AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} ELSE 0 END ORDER BY id LIMIT ${COMBINED_ROWS_PER_QUERY}`, [COMBINED_SOURCE, cursor], context);
-        for (const key of combinedMemberKeys(rows, combinedColumns)) keys.add(key);
-        if (rows.length < COMBINED_ROWS_PER_QUERY) return keys;
-        const nextCursor = rows[rows.length - 1]?.[3];
-        if (typeof nextCursor !== "string" || nextCursor <= cursor) return keys;
-        cursor = nextCursor;
+        const page = await queryPage(
+          `source, source_id, metadata, CASE WHEN length(CAST(id AS BLOB)) <= ${MEETING_REF_MAX_LENGTH} THEN id END`,
+          `source = ? AND length(CAST(id AS BLOB)) <= ${MEETING_REF_MAX_LENGTH} AND length(CAST(source_id AS BLOB)) <= 512 AND length(CAST(metadata AS BLOB)) <= ${COMBINED_METADATA_MAX_BYTES} AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} ELSE 0 END`,
+          [COMBINED_SOURCE], "id ASC", cursor, COMBINED_PAGE_ROWS, context);
+        for (const key of combinedMemberKeys(page.rows, combinedColumns)) keys.add(key);
+        if (page.cursor === null) return keys;
+        if (page.cursor <= cursor) return keys;
+        cursor = page.cursor;
       }
     } catch (error) {
       // Only the generic unavailable failure fails open; access, timeout and cancellation errors propagate.
@@ -393,9 +443,20 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     assertAccess,
     async listMetadata() {
       const readable = readableClause();
-      const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting WHERE ${readable} ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) DESC, id ASC LIMIT ${METADATA_ROW_LIMIT}`);
+      const order = "julianday(started_at) IS NULL ASC, julianday(started_at) DESC, id ASC";
+      const rows: unknown[][] = [];
+      let cursor = 0;
+      while (rows.length < METADATA_ROW_LIMIT) {
+        const pageRows = Math.min(LISTING_PAGE_ROWS, METADATA_ROW_LIMIT - rows.length);
+        const page = await queryPage(LISTING_COLUMNS, readable, [], order, cursor, pageRows);
+        rows.push(...page.rows);
+        if (page.cursor === null) break;
+        cursor = page.cursor;
+      }
+      logSkippedOversizedIds(rows.filter(row => row[11] === 1).length);
+      const usableRows = rows.filter(row => row[11] !== 1);
       const hidden = await combinedKeys();
-      return visibleRows(await commitReadable(rows), hidden).flatMap(row => { const decoded = decodeMetadata(row); return decoded ? [decoded] : []; });
+      return visibleRows(await commitReadable(usableRows), hidden).flatMap(row => { const decoded = decodeMetadata(row); return decoded ? [decoded] : []; });
     },
     async getMetadata(reference, context = {}) {
       if (!safeMeetingRef(reference)) throw new MeetingRetrievalError("invalid_args", 400);
@@ -412,11 +473,17 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       if (args.from) { clauses.push("julianday(started_at) >= julianday(?)"); params.push(new Date(Date.parse(args.from) - 86_400_000).toISOString()); }
       if (args.to) { clauses.push("julianday(started_at) < julianday(?)"); params.push(new Date(Date.parse(args.to) + 2 * 86_400_000).toISOString()); }
       clauses.push(readableClause());
-      const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting${clauses.length ? ` WHERE ${clauses.join(" AND ")}` : ""} ORDER BY julianday(started_at) IS NULL ASC, julianday(started_at) ${args.sort === "oldest" ? "ASC" : "DESC"}, id ASC LIMIT ${METADATA_ROW_LIMIT}`, params, context);
+      const page = await queryPage(
+        LISTING_COLUMNS, clauses.join(" AND "), params,
+        `julianday(started_at) IS NULL ASC, julianday(started_at) ${args.sort === "oldest" ? "ASC" : "DESC"}, id ASC`,
+        0, LISTING_PAGE_ROWS, context);
+      logSkippedOversizedIds(page.rows.filter(row => row[11] === 1).length);
+      const usableRows = page.rows.filter(row => row[11] !== 1);
       const hidden = await combinedKeys(context);
-      // The raw row count (before exclusion) decides scanLimited, so rows past the read window stay counted as unseen.
-      const decoded = visibleRows(await commitReadable(rows.slice(0, 500), context), hidden).flatMap(row => { const value = decodeMetadata(row); return value ? [value] : []; });
-      return discoveryResult(decoded, rows.length, args, context);
+      // Discovery deliberately returns the newest byte-bounded page; callers may continue with nextCursor.
+      const decoded = visibleRows(await commitReadable(usableRows.slice(0, 500), context), hidden).flatMap(row => { const value = decodeMetadata(row); return value ? [value] : []; });
+      const result = discoveryResult(decoded, page.cursor === null ? usableRows.length : METADATA_ROW_LIMIT, args, context);
+      return { ...result, discovery: { ...result.discovery, ...(page.cursor === null ? {} : { nextCursor: page.cursor }) } };
     },
     readBody,
     async getTranscript(source, sourceId) {

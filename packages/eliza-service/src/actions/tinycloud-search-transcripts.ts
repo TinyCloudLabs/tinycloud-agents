@@ -133,6 +133,8 @@ export interface TranscriptMetadata {
   summaryActionItems: string | null;
   metadata?: Record<string, unknown>;
   metadataLimited?: boolean;
+  /** True when the list view caps a display field; `getMetadata` returns uncapped titles and summaries. */
+  listingTruncated?: boolean;
 }
 
 export interface TranscriptReader {
