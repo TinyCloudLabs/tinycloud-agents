@@ -47,12 +47,12 @@ test("Eliza owns find, read and clean cited synthesis with aggregate usage and n
 const discovery = { matchedCount: 1, countKind: "exact", returnedCount: 1, scanLimited: false, excludedUndatedCount: 0, orderProven: true, interval: {}, observedAt: "2026-09-15", omittedMeetingRefs: [] };
 
 type Step = { text?: string; calls?: Array<{ name: string; args: Record<string, unknown> }>; status?: number };
-function scenario(steps: Step[], options: { question?: string; calendar?: TaskRequest["calendar"]; tool?: (name: string, args: any, index: number) => unknown; signal?: AbortSignal } = {}) {
+function scenario(steps: Step[], options: { question?: string; calendar?: TaskRequest["calendar"]; deadlineMs?: number; tool?: (name: string, args: any, index: number) => unknown; signal?: AbortSignal } = {}) {
   const requests: any[] = [];
   const dispatched: string[] = [];
   const emitted: string[] = [];
   const delegation: string[] = [];
-  const request: TaskRequest = { version: 1, executionId: crypto.randomUUID(), entityId: crypto.randomUUID(), roomId: "fixture-room", model: { id: "fixture-model", contextWindowTokens: 40000 }, messages: [{ role: "system", content: "PRIVATE_ACCOUNT_MEMORY" }, { role: "user", content: options.question ?? "Summarize my latest meeting." }], calendar: options.calendar, allowedTools: ["tinycloud_find_meetings", "tinycloud_read_meeting", "web_search"], deadlineAt: Date.now() + 60000 };
+  const request: TaskRequest = { version: 1, executionId: crypto.randomUUID(), entityId: crypto.randomUUID(), roomId: "fixture-room", model: { id: "fixture-model", contextWindowTokens: 40000 }, messages: [{ role: "system", content: "PRIVATE_ACCOUNT_MEMORY" }, { role: "user", content: options.question ?? "Summarize my latest meeting." }], calendar: options.calendar, allowedTools: ["tinycloud_find_meetings", "tinycloud_read_meeting", "web_search"], deadlineAt: Date.now() + (options.deadlineMs ?? 60000) };
   const signal = options.signal ?? new AbortController().signal;
   const tools = new TaskTools({ app: { appId: TINYCHAT_APP_ID, agentId: TINYCHAT_AGENT_ID }, entityId: request.entityId, roomId: request.roomId!, allowedTools: request.allowedTools, deadlineAt: request.deadlineAt, signal,
     host: { runtimeFor: async () => ({ actions: request.allowedTools.map(name => ({ name: name.toUpperCase(), handler: async (_runtime: unknown, _message: unknown, _state: unknown, operation: any) => {
@@ -73,6 +73,48 @@ function scenario(steps: Step[], options: { question?: string; calendar?: TaskRe
 }
 const find: Step = { calls: [{ name: "tinycloud_find_meetings", args: { sort: "newest", selectFirst: true } }] };
 const read: Step = { calls: [{ name: "tinycloud_read_meeting", args: { meetingRef: metadata.meetingRef, focus: "summary" } }] };
+
+test("empty bounded discovery continues internally and retains the next page meeting identity", async () => {
+  const calls: Array<{ name: string; args: any }> = [];
+  const run = scenario([find, read, { text: "The release was delayed [M1:E2]." }], { tool(name, args, index) {
+    calls.push({ name, args });
+    if (name === "tinycloud_find_meetings" && index === 1) return { contractVersion: 2, outcomes: [], discovery: { ...discovery, matchedCount: 0, returnedCount: 0, scanLimited: true, countKind: "lower_bound", nextCursor: 500 } };
+    return { contractVersion: 2, outcomes: [outcome(name === "tinycloud_read_meeting")], ...(name === "tinycloud_find_meetings" ? { discovery } : {}) };
+  } });
+  const result = await run.pending;
+  expect(calls.slice(0, 2)).toEqual([
+    { name: "tinycloud_find_meetings", args: { sort: "newest", selectFirst: true } },
+    { name: "tinycloud_find_meetings", args: { sort: "newest", selectFirst: true, cursor: 500 } },
+  ]);
+  expect(calls[2]).toMatchObject({ name: "tinycloud_read_meeting", args: { meetingRef: metadata.meetingRef } });
+  expect(result.outcome).toBe("partial");
+  expect(JSON.stringify(run.requests[2])).toContain("Planning");
+  expect(result.answer.text).toContain("release was delayed");
+  expect(run.requests).toHaveLength(3);
+});
+
+test("empty discovery stops without a forward cursor and respects the existing tool-attempt limit", async () => {
+  const noCursor = scenario([find], { tool() { return { contractVersion: 2, outcomes: [], discovery: { ...discovery, matchedCount: 0, returnedCount: 0, scanLimited: true, countKind: "lower_bound" } }; } });
+  await noCursor.pending;
+  expect(noCursor.dispatched).toEqual(["tinycloud_find_meetings"]);
+
+  const bounded = scenario([find], { tool(name, args) {
+    return { contractVersion: 2, outcomes: [], discovery: { ...discovery, matchedCount: 0, returnedCount: 0, scanLimited: true, countKind: "lower_bound", nextCursor: Number(args.cursor ?? 0) + 500 } };
+  } });
+  await bounded.pending;
+  expect(bounded.dispatched).toHaveLength(16);
+  expect(bounded.requests).toHaveLength(1);
+});
+
+test("empty discovery does not continue beyond the existing task deadline", async () => {
+  const run = scenario([find], { deadlineMs: 25, async tool() {
+    await new Promise(resolve => setTimeout(resolve, 40));
+    return { contractVersion: 2, outcomes: [], discovery: { ...discovery, matchedCount: 0, returnedCount: 0, scanLimited: true, countKind: "lower_bound", nextCursor: 500 } };
+  } });
+  await expect(run.pending).rejects.toThrow("turn_timeout");
+  expect(run.dispatched).toHaveLength(1);
+  expect(run.requests).toHaveLength(1);
+});
 
 test("transient discovery retries once locally, then still reads and synthesizes inside a short task budget", async () => {
   const run = scenario([find, read, { text: "The release was delayed [M1:E2]." }], { tool(name, _args, attempt) {
