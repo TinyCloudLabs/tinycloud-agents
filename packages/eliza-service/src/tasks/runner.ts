@@ -305,30 +305,33 @@ export async function runTask(request: TaskRequest, config: TaskConfig, signal: 
       const scoped = ["from", "to", "title", "participant", "source"].some(field => argumentsForTool[field] !== undefined);
       const mode = name === "web_search" ? undefined : scope || argumentsForTool.from !== undefined || argumentsForTool.to !== undefined ? "range"
         : name === "tinycloud_find_meetings" && (scoped || argumentsForTool.selectFirst === true || /\b(?:latest|last|newest|first) meeting\b/i.test(question)) ? argumentsForTool.selectFirst === true || !/\bmeetings\b/i.test(question) ? "single" : "range" : undefined;
-      const result = await execute(name, argumentsForTool, call.id, mode);
-      const error = toolError(result);
-      if (error && ACCESS_ERRORS.has(error)) { options.onDelegationError?.(error); throw new TaskError(error); }
-      if (error === "meeting_selection_required" || error === "ambiguous_selection") return finish(clarifyMeetingSelection(cleanPack()));
-      if (error === "tool_not_allowed") throw new TaskError("routing_mismatch");
-      if (result.status === 413 || /(?:result|context)_size_limit/.test(error ?? "")) throw new TaskError("result_size_limit");
-      operations.push({ tool: name, arguments: argumentsForTool, status: result.status, ...(error ? { error } : {}) });
-      if (operations.length > 16) throw new TaskError("tool_attempt_limit");
-      if (error) {
-        if (name === "tinycloud_read_meeting" && typeof argumentsForTool.meetingRef === "string" && (TRANSIENT_ERRORS.has(error) || error === "meeting_not_found")) {
-          const prior = evidence.ledger.meetings.find(meeting => meeting.meetingRef === argumentsForTool.meetingRef);
-          if (prior) {
-            const failed: MeetingOutcome = { ...prior, state: error === "meeting_not_found" ? "meeting_not_found" : "unavailable", body: { state: "unavailable", reasonCode: error }, evidence: [],
-              coverage: { ...prior.coverage, bodyAttempted: false, evidenceRetained: 0, support: "none", omissionReasons: [...prior.coverage.omissionReasons, error] } };
-            evidence = admitMeetingToolData(evidence, { toolName: name, arguments: argumentsForTool, data: { contractVersion: 2, outcomes: [failed] } });
+      let result: ToolResult;
+      for (;;) {
+        result = await execute(name, argumentsForTool, call.id, mode);
+        const error = toolError(result);
+        if (error && ACCESS_ERRORS.has(error)) { options.onDelegationError?.(error); throw new TaskError(error); }
+        if (error === "meeting_selection_required" || error === "ambiguous_selection") return finish(clarifyMeetingSelection(cleanPack()));
+        if (error === "tool_not_allowed") throw new TaskError("routing_mismatch");
+        if (result.status === 413 || /(?:result|context)_size_limit/.test(error ?? "")) throw new TaskError("result_size_limit");
+        operations.push({ tool: name, arguments: argumentsForTool, status: result.status, ...(error ? { error } : {}) });
+        if (operations.length > 16) throw new TaskError("tool_attempt_limit");
+        if (error) {
+          if (name === "tinycloud_read_meeting" && typeof argumentsForTool.meetingRef === "string" && (TRANSIENT_ERRORS.has(error) || error === "meeting_not_found")) {
+            const prior = evidence.ledger.meetings.find(meeting => meeting.meetingRef === argumentsForTool.meetingRef);
+            if (prior) {
+              const failed: MeetingOutcome = { ...prior, state: error === "meeting_not_found" ? "meeting_not_found" : "unavailable", body: { state: "unavailable", reasonCode: error }, evidence: [],
+                coverage: { ...prior.coverage, bodyAttempted: false, evidenceRetained: 0, support: "none", omissionReasons: [...prior.coverage.omissionReasons, error] } };
+              evidence = admitMeetingToolData(evidence, { toolName: name, arguments: argumentsForTool, data: { contractVersion: 2, outcomes: [failed] } });
+            }
           }
+          break;
         }
-        continue;
-      }
-      const data = object(result.body.result) ? result.body.result.data : undefined;
-      if (name === "web_search") {
-        for (const source of readPublicSources(data)) publicSources.set(source.url, source);
-        if (JSON.stringify([...publicSources.values()]).length > 16000) throw new TaskError("result_size_limit");
-      } else {
+        const data = object(result.body.result) ? result.body.result.data : undefined;
+        if (name === "web_search") {
+          for (const source of readPublicSources(data)) publicSources.set(source.url, source);
+          if (JSON.stringify([...publicSources.values()]).length > 16000) throw new TaskError("result_size_limit");
+          break;
+        }
         evidence = admitMeetingToolData(evidence, { toolName: name, arguments: argumentsForTool, data });
         if (evidence.ledger.meetings.some(meeting => meeting.state === "access_denied")) {
           options.onDelegationError?.("access_denied");
@@ -343,6 +346,17 @@ export async function runTask(request: TaskRequest, config: TaskConfig, signal: 
           if (!selected) return finish(clarifyMeetingSelection(cleanPack()));
           selectedMeetingRef = object(received[0]) && typeof received[0].meetingRef === "string" ? received[0].meetingRef : undefined;
         }
+        const cursor = discovery?.nextCursor;
+        const currentCursor = argumentsForTool.cursor ?? 0;
+        if (name === "tinycloud_find_meetings" && received.length === 0 && typeof cursor === "number" && Number.isSafeInteger(cursor)
+          && typeof currentCursor === "number" && cursor > currentCursor && options.tools.attempts < 16 && operations.length < 16) {
+          argumentsForTool = { ...argumentsForTool, cursor };
+          check();
+          continue;
+        }
+        break;
+      }
+      if (name !== "web_search" && !toolError(result)) {
         // Empty, successful retrieval supplies no facts for a generated private summary.
         if (!evidence.ledger.meetings.length && !round.calls.some(other => other !== call && other.name.toLowerCase().startsWith("tinycloud_"))) {
           const noEvidence = cleanPack();
