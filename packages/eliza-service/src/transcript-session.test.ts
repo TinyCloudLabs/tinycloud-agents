@@ -524,7 +524,9 @@ describe("per-entity isolation, expiry, and revocation", () => {
         meetingRef: "meeting-a",
         excerpts: [{ text: expect.stringContaining("ember compass") }],
       }] } });
-      expect(trace.sql).toHaveLength(2);
+      // Metadata discovery and lookup, plus the one bounded speaker_names read for the body that was fetched.
+      expect(trace.sql.filter(sql => !sql.includes("$.speaker_names"))).toHaveLength(2);
+      expect(trace.sql.filter(sql => sql.includes("$.speaker_names"))).toHaveLength(1);
       expect(trace.kvKeys).toEqual([`${KV_PATH}fireflies/transcript/canary-1`]);
       expect(trace.signIns).toBe(2);
       expect(memoryCalls).toHaveLength(1);

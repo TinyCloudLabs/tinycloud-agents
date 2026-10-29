@@ -326,6 +326,25 @@ export function classifyBodyFailure(error: unknown): BodyResult {
   if (code === "KV_NOT_FOUND") return /(?:key|entry) not found/i.test(text) ? { state: "missing", reasonCode: code } : { state: "unavailable", reasonCode: "ambiguous_not_found" };
   return { state: "unavailable", reasonCode: code };
 }
+const SPEAKER_NAMES_MAX_BYTES = 16_384;
+const SPEAKER_FIELDS = ["speaker_name", "speaker", "speakerName"] as const;
+function parseSpeakerNames(value: unknown): Map<string, string> | null {
+  let parsed = value;
+  if (typeof value === "string") { try { parsed = JSON.parse(value); } catch { return null; } }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const names = new Map<string, string>();
+  for (const [label, name] of Object.entries(parsed)) if (typeof name === "string" && name.trim()) names.set(label, name);
+  return names.size ? names : null;
+}
+function renameSpeakers(item: unknown, names: ReadonlyMap<string, string>): unknown {
+  if (!item || typeof item !== "object") return item;
+  const renamed: Record<string, unknown> = { ...item };
+  for (const field of SPEAKER_FIELDS) {
+    const label = renamed[field];
+    if (typeof label === "string" && names.has(label)) renamed[field] = names.get(label);
+  }
+  return renamed;
+}
 export function createReader(access: Access | (() => Promise<Access>), assertAccess: () => void = () => {}, invalidateAccess: () => void = () => {}): TranscriptReader {
   const withAccess = async <T>(signal: AbortSignal | undefined, operation: (active: Access) => Promise<T>) => {
     const active = typeof access === "function" ? await access() : access;
@@ -398,6 +417,17 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     const body = response?.ok === true ? decodeBody(response.data?.data) : classifyBodyFailure(response?.error);
     enforceAccess(body); return body;
   };
+  // TC-2189 stores renames on the note row as metadata.speaker_names (original label -> shown name); the stored sentences keep their original labels.
+  // Read only that key, bounded in SQL, so the opaque metadata blob and the listing projection stay untouched.
+  const withSpeakerNames = async (body: BodyResult, source: string, sourceId: string, context: RetrievalContext): Promise<BodyResult> => {
+    if (body.state !== "present" || !Array.isArray(body.value)) return body;
+    const [row] = await query(
+      `SELECT CASE WHEN json_valid(metadata) THEN CASE WHEN json_type(metadata, '$.speaker_names') = 'object' AND length(CAST(json_extract(metadata, '$.speaker_names') AS BLOB)) <= ${SPEAKER_NAMES_MAX_BYTES} THEN json_extract(metadata, '$.speaker_names') END END FROM connector_meeting WHERE source = ? AND source_id = ? LIMIT 1`,
+      [source, sourceId], context);
+    const names = parseSpeakerNames(row?.[0]);
+    if (!names) return body;
+    return { ...body, value: body.value.map(item => renameSpeakers(item, names)) };
+  };
   const readBody = async (source: TranscriptMetadata["source"], sourceId: string, context: RetrievalContext = {}): Promise<BodyResult> => {
     if (!isSource(source) || !safeSegment(sourceId)) throw new MeetingRetrievalError("invalid_stored_metadata");
     assertAccess();
@@ -409,9 +439,9 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       // The body key must be exactly the writer's key for this source id and hash, so the index cannot reach any other KV key.
       if (outcome !== "transcribed" || typeof hash !== "string" || !VOICE_NOTE_REV_HASH.test(hash)
         || bodyKey !== `${VOICE_NOTE_REV_PREFIX}${sourceId}/${hash}`) return { state: "missing" };
-      return readKey(bodyKey, context);
+      return withSpeakerNames(await readKey(bodyKey, context), source, sourceId, context);
     }
-    return readKey(`${SQL_PATH}/${source}/transcript/${sourceId}`, context);
+    return withSpeakerNames(await readKey(`${SQL_PATH}/${source}/transcript/${sourceId}`, context), source, sourceId, context);
   };
   // Member keys come from every combined row, never from the page being listed: a source filter or
   // date window could otherwise return members whose combined row is outside the result.
