@@ -27,8 +27,9 @@ env:
 
 jobs:
   build:
-    # Only the default branch's copy of this workflow may push (fork copies and
-    # feature-branch dispatches are refused).
+    # Guards against accidental dispatch from a branch or fork. This is NOT a
+    # security boundary: a writer can dispatch a branch copy that drops this
+    # check. Restrict who can push branches with rulesets/branch protection.
     if: >-
       github.repository == 'TinyCloudLabs/tinycloud-agents' &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
@@ -94,13 +95,6 @@ jobs:
           push: true
           provenance: true
 
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
-
       - name: Report digest
         env:
           SHA: ${{ inputs.sha }}
@@ -112,6 +106,14 @@ jobs:
             echo "### eliza-service image"
             echo
             echo "- image: \`$IMAGE:$SHA\`"
-            echo "digest: $DIGEST"
             echo "- pin: \`$IMAGE@$DIGEST\`"
+            echo
+            echo "digest: $DIGEST"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
