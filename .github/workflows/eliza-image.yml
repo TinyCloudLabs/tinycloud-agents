@@ -1,0 +1,119 @@
+# Builds the eliza-service image on a GitHub-hosted runner and pushes it to GHCR
+# tagged with the full commit SHA. Build + push only: this workflow never touches
+# a CVM, Phala, or any deploy, and never pushes `latest` or any moving tag.
+# See packages/eliza-service/DEPLOY.md ("Build and push from GitHub Actions").
+name: eliza-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full 40-hex commit SHA (lowercase) to build and tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: eliza-image-${{ inputs.sha }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/tinycloudlabs/eliza-service
+
+jobs:
+  build:
+    # Guards against accidental dispatch from a branch or fork. This is NOT a
+    # security boundary: a writer can dispatch a branch copy that drops this
+    # check. Restrict who can push branches with rulesets/branch protection.
+    if: >-
+      github.repository == 'TinyCloudLabs/tinycloud-agents' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Validate sha input
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::sha must be a full 40-character lowercase hex commit SHA"
+            exit 1
+          fi
+
+      # Full clone of branches and tags so the commit can be proven to belong to
+      # this repository (a bare SHA fetch would also resolve fork-network objects).
+      - name: Check out the requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify commit belongs to this repository
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SHA" ]] || { echo "::error::checked out HEAD does not equal sha"; exit 1; }
+          [[ "$(git cat-file -t "$SHA")" == "commit" ]] || { echo "::error::$SHA is not a commit"; exit 1; }
+          if [[ -z "$(git branch -r --contains "$SHA")$(git tag --contains "$SHA")" ]]; then
+            echo "::error::$SHA is not reachable from any branch or tag of this repository"
+            exit 1
+          fi
+          test -f packages/eliza-service/Dockerfile
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Mirrors DEPLOY.md section 1:
+      #   docker build --platform linux/amd64 --build-arg BUILD_REVISION="$SHA" \
+      #     -f packages/eliza-service/Dockerfile -t "$IMAGE:$SHA" .
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: packages/eliza-service/Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            BUILD_REVISION=${{ inputs.sha }}
+          tags: ${{ env.IMAGE }}:${{ inputs.sha }}
+          push: true
+          provenance: true
+
+      - name: Report digest
+        env:
+          SHA: ${{ inputs.sha }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::unexpected digest: $DIGEST"; exit 1; }
+          {
+            echo "### eliza-service image"
+            echo
+            echo "- image: \`$IMAGE:$SHA\`"
+            echo "- pin: \`$IMAGE@$DIGEST\`"
+            echo
+            echo "digest: $DIGEST"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

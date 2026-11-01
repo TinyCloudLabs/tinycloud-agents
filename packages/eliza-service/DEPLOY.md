@@ -126,6 +126,33 @@ You also need an ingress image at `ghcr.io/tinycloudlabs/eliza-service:ingress-l
 Tag/push the org's dstack-ingress image under that name, or override
 `ELIZA_INGRESS_IMAGE` in the env file to point at an existing ingress image.
 
+### Build and push from GitHub Actions (instead of sections 1-2)
+
+`.github/workflows/eliza-image.yml` builds the same image on a GitHub-hosted
+runner and pushes it, so no host needs Docker. It runs only by manual dispatch
+(GitHub dispatches only workflows that exist on the default branch; the job
+refuses to run from any other ref), takes one required input, `sha` (a full 40-character lowercase commit SHA that is
+reachable from a branch or tag of this repo), checks out exactly that commit and
+runs the `docker build` from section 1 (`linux/amd64`,
+`BUILD_REVISION=<sha>`, `packages/eliza-service/Dockerfile`). It pushes only
+`ghcr.io/tinycloudlabs/eliza-service:<sha>` (never `latest`), with provenance
+attached, and prints `digest: sha256:…` in the run's step summary and as the
+`digest` job output. It never deploys; use that digest as
+`ELIZA_SERVICE_IMAGE=ghcr.io/tinycloudlabs/eliza-service@<digest>` in
+section 3 (the digest already starts with `sha256:`).
+
+```bash
+gh workflow run eliza-image.yml --repo TinyCloudLabs/tinycloud-agents --ref main -f sha=<full-commit-sha>
+```
+
+The workflow authenticates with the run's `GITHUB_TOKEN`. The `eliza-service`
+GHCR package must grant this repo write access (package settings, "Manage
+Actions access", role Write), or the push is denied. A package first pushed with
+a PAT is not linked to any repository. Anyone who can push a branch can dispatch a
+branch copy of the workflow with the same package write access, so restrict branch
+creation with rulesets/branch protection (the package also holds the moving
+`ingress-latest` tag).
+
 ## 3. Prepare the env file (`.env.phala`)
 
 ```dotenv
