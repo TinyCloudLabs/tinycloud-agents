@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/tinycloudlabs/eliza-service
+  IMAGE: ghcr.io/tinycloudlabs/eliza-service-ci
 
 jobs:
   build:
