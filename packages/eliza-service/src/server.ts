@@ -319,6 +319,7 @@ function streamMessageResponse(host: ElizaServiceHost, body: PostMessagesBody, a
     status: 200,
     headers: {
       "content-type": "text/event-stream",
+      "x-accel-buffering": "no",
       "cache-control": "no-cache",
       connection: "keep-alive",
     },
