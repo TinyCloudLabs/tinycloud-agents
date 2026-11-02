@@ -66,6 +66,8 @@ export interface OkResult {
   type: "ok";
 }
 
+const MESSAGE_KEEPALIVE_MS = 30_000;
+
 /**
  * Handle POST /messages.
  *
@@ -104,9 +106,59 @@ export async function handlePostMessages(
   }
 
   if (!allowed()) return denied();
-  const runtime = await host.runtimeFor(agentId);
-  if (!allowed()) return denied();
+  let cancelKeepalive: (() => void) | undefined;
+  let keepaliveFinished = false;
+  const stopKeepalive = () => {
+    const cancel = cancelKeepalive;
+    cancelKeepalive = undefined;
+    cancel?.();
+  };
+  const scheduleKeepalive = () => {
+    if (keepaliveFinished || !allowed()) return;
+    const timer = setTimeout(() => {
+      cancelKeepalive = undefined;
+      if (keepaliveFinished || !allowed()) return;
+      writer.write(": ping\n\n");
+      scheduleKeepalive();
+    }, MESSAGE_KEEPALIVE_MS);
+    cancelKeepalive = () => clearTimeout(timer);
+  };
+  const writeEvent = (frame: string) => {
+    if (keepaliveFinished || !allowed()) return;
+    stopKeepalive();
+    writer.write(frame);
+    scheduleKeepalive();
+  };
+
+
+  // Runtime boot can take long enough to outlast the idle window.
+  transport.signal?.addEventListener("abort", stopKeepalive, { once: true });
+  scheduleKeepalive();
+
+  // Callback: each content chunk from the pipeline writes one SSE data frame.
+  const callback: HandlerCallback = async (content: Content): Promise<Memory[]> => {
+    writeEvent(`data: ${JSON.stringify(content)}\n\n`);
+    return [];
+  };
+  let runtime: IAgentRuntime;
+  try {
+    runtime = await host.runtimeFor(agentId);
+  } catch (error) {
+    keepaliveFinished = true;
+    stopKeepalive();
+    transport.signal?.removeEventListener("abort", stopKeepalive);
+    throw error;
+  }
+  if (!allowed()) {
+    keepaliveFinished = true;
+    stopKeepalive();
+    transport.signal?.removeEventListener("abort", stopKeepalive);
+    return denied();
+  }
   if (!runtime.messageService) {
+    keepaliveFinished = true;
+    stopKeepalive();
+    transport.signal?.removeEventListener("abort", stopKeepalive);
     throw new Error(
       `handlePostMessages: no messageService on runtime for agentId ${agentId}`,
     );
@@ -123,19 +175,15 @@ export async function handlePostMessages(
     createdAt: Date.now(),
   };
 
-  // Callback: each content chunk from the pipeline writes one SSE data frame.
-  const callback: HandlerCallback = async (content: Content): Promise<Memory[]> => {
-    if (allowed()) writer.write(`data: ${JSON.stringify(content)}\n\n`);
-    return [];
-  };
-
   // Eliza caches compose/action state by message ID. Never clear shared runtime
   // state, persisted history, or another account's message state.
   const stateCache = (runtime as IAgentRuntime & { stateCache?: Map<string, unknown> }).stateCache;
-  const cleanup = () => {
-    if (message.id) { stateCache?.delete(message.id); stateCache?.delete(`${message.id}_action_results`); }
+  const cleanup = () => { if (message.id) { stateCache?.delete(message.id); stateCache?.delete(`${message.id}_action_results`); } };
+  const onAbort = () => {
+    stopKeepalive();
+    cleanup();
   };
-  transport.signal?.addEventListener("abort", cleanup, { once: true });
+  transport.signal?.addEventListener("abort", onAbort, { once: true });
   try {
     if (!allowed()) return denied();
     const pipeline = withPrivateAccess(allowed, () => runtime.messageService!.handleMessage(runtime, message, callback, { abortSignal: transport.signal }));
@@ -143,12 +191,18 @@ export async function handlePostMessages(
     // Retain this cleanup until its own completion so late cache writes vanish.
     const work = pipeline.finally(cleanup);
     if (transport.signal) await withAbort(work, transport.signal); else await work;
-    if (allowed()) writer.write("data: [DONE]\n\n");
+    if (allowed()) {
+      stopKeepalive();
+      writer.write("data: [DONE]\n\n");
+    }
   } catch (error) {
     if (allowed()) throw error;
   } finally {
+    keepaliveFinished = true;
+    stopKeepalive();
     cleanup();
-    transport.signal?.removeEventListener("abort", cleanup);
+    transport.signal?.removeEventListener("abort", stopKeepalive);
+    transport.signal?.removeEventListener("abort", onAbort);
     writer.close();
   }
   return { type: "ok" };
