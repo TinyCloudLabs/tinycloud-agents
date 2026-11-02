@@ -2,6 +2,7 @@ import type { Plugin } from "@elizaos/core";
 import { RuntimeHost } from "./runtime-host.js";
 import { SessionStore } from "./session-store.js";
 import { startElizaService } from "./server.js";
+import { serverIdleTimeoutFromEnv } from "./server-config.js";
 import { createLocalValidationHost, localValidationFromEnv } from "./local-validation-host.js";
 import { taskConfigFromEnv } from "./tasks/contract.js";
 import { agentIdentityFromFile } from "@tinycloud/agent-client";
@@ -63,6 +64,7 @@ export async function main(): Promise<void> {
     tasks,
     hostname: process.env.HOST ?? process.env.TINYCLOUD_ELIZA_SERVICE_HOST ?? "0.0.0.0",
     port: readPort(process.env.PORT ?? process.env.TINYCLOUD_ELIZA_SERVICE_PORT),
+    idleTimeout: serverIdleTimeoutFromEnv(process.env.ELIZA_SERVICE_IDLE_TIMEOUT),
   });
 
   console.log(

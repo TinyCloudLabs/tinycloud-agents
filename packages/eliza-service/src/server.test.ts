@@ -10,6 +10,7 @@ import { createElizaServiceFetch, startElizaService, type ElizaServiceHost } fro
 import { runArtifactSkillAction } from "./actions/run-artifact-skill.js";
 import { MeetingRetrievalError } from "./meeting-evidence.js";
 import { ARTIFACTORY_AGENT_ID, TINYCHAT_AGENT_ID } from "./auth/app-registry.js";
+import { serverIdleTimeoutFromEnv } from "./server-config.js";
 
 const TEST_SERVICE_SECRET = "server-test-service-secret";
 const TEST_ARTIFACTORY_SERVICE_SECRET = "server-test-artifactory-secret";
@@ -39,6 +40,12 @@ function activeSessions(entityId = TEST_ENTITY_ID): SessionStore {
   const lease = store.reserve(scope, entityId)!;
   store.commit(scope, entityId, lease, { agentId: scope.agentId, serializedDelegation: makeValidSerialized(), serializedTranscriptDelegation: "synthetic-transcript" });
   return store;
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 class FakeStorage {
@@ -237,6 +244,7 @@ describe("eliza-service HTTP server", () => {
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/event-stream");
+    expect(res.headers.get("x-accel-buffering")).toBe("no");
     expect(await res.text()).toBe(
       `data: ${JSON.stringify({ text: "one" })}\n\n`
         + `data: ${JSON.stringify({ text: "two" })}\n\n`
@@ -244,6 +252,75 @@ describe("eliza-service HTTP server", () => {
     );
     expect(seen.message?.entityId).toBe(TEST_ENTITY_ID);
   });
+
+  it("POST /messages stays open past Bun's default idle timeout and receives a ping", async () => {
+    const started = deferred();
+    const release = deferred();
+    const runtime = {
+      agentId: TEST_AGENT_ID as UUID,
+      messageService: {
+        async handleMessage(
+          _runtime: IAgentRuntime,
+          _message: Memory,
+          callback?: (content: Content) => Promise<Memory[]>,
+        ) {
+          started.resolve();
+          await release.promise;
+          if (callback) await callback({ text: "answer after idle" });
+          return { didRespond: true, responseMessages: [], mode: "simple" as const };
+        },
+      },
+    } as unknown as IAgentRuntime;
+    const host: ElizaServiceHost = {
+      agentDid: TEST_AGENT_DID,
+      storageFor: async () => new FakeStorage(),
+      runtimeFor: async () => runtime,
+      preflight: async () => {},
+      privateAccessAvailable: () => true,
+    };
+    server = startElizaService({
+      host,
+      sessions: activeSessions(),
+      port: 0,
+      idleTimeout: serverIdleTimeoutFromEnv(undefined),
+    });
+
+    const response = await fetch(url("/messages"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "Authorization": `Bearer ${TEST_SERVICE_SECRET}`,
+      },
+      body: JSON.stringify({
+        agentId: TEST_AGENT_ID,
+        entityId: TEST_ENTITY_ID,
+        roomId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        text: "wait quietly",
+      }),
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+
+    try {
+      await started.promise;
+      const ping = await reader.read();
+      expect(ping.done).toBe(false);
+      expect(decoder.decode(ping.value)).toBe(": ping\n\n");
+      release.resolve();
+      let stream = "";
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        stream += decoder.decode(chunk.value);
+      }
+      expect(stream).toContain(`data: ${JSON.stringify({ text: "answer after idle" })}\n\n`);
+      expect(stream).toContain("data: [DONE]\n\n");
+    } finally {
+      release.resolve();
+      await reader.cancel().catch(() => {});
+    }
+  }, 45_000);
 
   it("POST /messages maps missing delegation to pre-stream HTTP 409", async () => {
     const { host } = makeMessageHost({
