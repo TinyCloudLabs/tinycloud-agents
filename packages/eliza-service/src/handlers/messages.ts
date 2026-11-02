@@ -66,6 +66,8 @@ export interface OkResult {
   type: "ok";
 }
 
+const MESSAGE_KEEPALIVE_MS = 30_000;
+
 /**
  * Handle POST /messages.
  *
@@ -80,8 +82,6 @@ export interface OkResult {
  * C never constructs an AgentClient or calls storage write methods directly —
  * memory writes happen inside the pipeline through B's already-laned storage seam.
  */
-const MESSAGE_KEEPALIVE_MS = 30_000;
-
 export async function handlePostMessages(
   body: PostMessagesBody,
   host: MessageHandlerHost,
@@ -107,27 +107,29 @@ export async function handlePostMessages(
 
   if (!allowed()) return denied();
   let cancelKeepalive: (() => void) | undefined;
+  let keepaliveFinished = false;
   const stopKeepalive = () => {
     const cancel = cancelKeepalive;
     cancelKeepalive = undefined;
     cancel?.();
   };
   const scheduleKeepalive = () => {
-    if (!allowed()) return;
+    if (keepaliveFinished || !allowed()) return;
     const timer = setTimeout(() => {
       cancelKeepalive = undefined;
-      if (!allowed()) return;
+      if (keepaliveFinished || !allowed()) return;
       writer.write(": ping\n\n");
       scheduleKeepalive();
     }, MESSAGE_KEEPALIVE_MS);
     cancelKeepalive = () => clearTimeout(timer);
   };
   const writeEvent = (frame: string) => {
-    if (!allowed()) return;
+    if (keepaliveFinished || !allowed()) return;
     stopKeepalive();
     writer.write(frame);
     scheduleKeepalive();
   };
+
 
   // Runtime boot can take long enough to outlast the idle window.
   transport.signal?.addEventListener("abort", stopKeepalive, { once: true });
@@ -142,16 +144,19 @@ export async function handlePostMessages(
   try {
     runtime = await host.runtimeFor(agentId);
   } catch (error) {
+    keepaliveFinished = true;
     stopKeepalive();
     transport.signal?.removeEventListener("abort", stopKeepalive);
     throw error;
   }
   if (!allowed()) {
+    keepaliveFinished = true;
     stopKeepalive();
     transport.signal?.removeEventListener("abort", stopKeepalive);
     return denied();
   }
   if (!runtime.messageService) {
+    keepaliveFinished = true;
     stopKeepalive();
     transport.signal?.removeEventListener("abort", stopKeepalive);
     throw new Error(
@@ -193,6 +198,7 @@ export async function handlePostMessages(
   } catch (error) {
     if (allowed()) throw error;
   } finally {
+    keepaliveFinished = true;
     stopKeepalive();
     cleanup();
     transport.signal?.removeEventListener("abort", stopKeepalive);

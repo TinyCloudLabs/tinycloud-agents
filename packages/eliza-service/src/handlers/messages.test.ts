@@ -292,6 +292,126 @@ describe("handlePostMessages — SSE keepalive", () => {
     }
   });
 
+  it("restarts the idle interval after each data event", async () => {
+    const clock = installFakeTimers();
+    const started = deferred();
+    const sendProgress = deferred();
+    const progressWritten = deferred();
+    const release = deferred();
+    const runtime = {
+      agentId: AGENT_ID as UUID,
+      messageService: {
+        async handleMessage(
+          _runtime: IAgentRuntime,
+          _message: Memory,
+          callback?: (content: Content) => Promise<Memory[]>,
+        ) {
+          started.resolve();
+          await sendProgress.promise;
+          if (callback) await callback({ text: "progress" });
+          progressWritten.resolve();
+          await release.promise;
+          if (callback) await callback({ text: "final answer" });
+          return { didRespond: true, responseMessages: [], mode: "simple" as const };
+        },
+      },
+    } as unknown as IAgentRuntime;
+    const host: MessageHandlerHost = {
+      async preflight() {},
+      async runtimeFor() { return runtime; },
+    };
+    const writer = new CapturingWriter();
+    const handling = handlePostMessages(DEFAULT_BODY, host, writer);
+
+    try {
+      await started.promise;
+      clock.advance(25_000);
+      sendProgress.resolve();
+      await progressWritten.promise;
+      clock.advance(29_999);
+      expect(writer.frames.filter((frame) => frame === ": ping\n\n")).toHaveLength(0);
+      clock.advance(1);
+      expect(writer.frames.filter((frame) => frame === ": ping\n\n")).toHaveLength(1);
+    } finally {
+      release.resolve();
+      try {
+        await handling;
+      } finally {
+        clock.restore();
+      }
+    }
+  });
+
+  it("stops keepalives when disconnected during runtime startup", async () => {
+    const clock = installFakeTimers();
+    const bootStarted = deferred();
+    const bootRelease = deferred();
+    const controller = new AbortController();
+    const { runtime } = makeFakeRuntime(AGENT_ID, [{ text: "never sent" }]);
+    const host: MessageHandlerHost = {
+      async preflight() {},
+      async runtimeFor() {
+        bootStarted.resolve();
+        await bootRelease.promise;
+        return runtime;
+      },
+    };
+    const writer = new CapturingWriter();
+    const handling = handlePostMessages(DEFAULT_BODY, host, writer, { signal: controller.signal });
+
+    try {
+      await bootStarted.promise;
+      expect(clock.pendingCount).toBe(1);
+      controller.abort();
+      expect(clock.pendingCount).toBe(0);
+      clock.advance(60_000);
+      expect(writer.frames).not.toContain(": ping\n\n");
+      bootRelease.resolve();
+      await handling;
+    } finally {
+      bootRelease.resolve();
+      try {
+        await handling;
+      } finally {
+        clock.restore();
+      }
+    }
+  });
+
+  it("does not restart the timer from a callback after the stream ends", async () => {
+    const clock = installFakeTimers();
+    let lateCallback: ((content: Content) => Promise<Memory[]>) | undefined;
+    const runtime = {
+      agentId: AGENT_ID as UUID,
+      messageService: {
+        async handleMessage(
+          _runtime: IAgentRuntime,
+          _message: Memory,
+          callback?: (content: Content) => Promise<Memory[]>,
+        ) {
+          lateCallback = callback;
+          return { didRespond: true, responseMessages: [], mode: "simple" as const };
+        },
+      },
+    } as unknown as IAgentRuntime;
+    const host: MessageHandlerHost = {
+      async preflight() {},
+      async runtimeFor() { return runtime; },
+    };
+    const writer = new CapturingWriter();
+
+    try {
+      await handlePostMessages(DEFAULT_BODY, host, writer);
+      await lateCallback?.({ text: "late event" });
+      clock.advance(60_000);
+      expect(writer.frames).not.toContain(": ping\n\n");
+      expect(writer.frames).not.toContain(`data: ${JSON.stringify({ text: "late event" })}\n\n`);
+      expect(clock.pendingCount).toBe(0);
+    } finally {
+      clock.restore();
+    }
+  });
+
   it("clears the idle keepalive timer after a fast answer without sending a ping", async () => {
     const clock = installFakeTimers();
     const { host } = makeHost({ chunks: [{ text: "fast answer" }] });
