@@ -33,6 +33,13 @@ export interface DiscoveryResult { rows: TranscriptMetadata[]; discovery: Discov
 export class MeetingRetrievalError extends Error {
   constructor(readonly code: string, readonly status = 503) { super(code); this.name = "MeetingRetrievalError"; }
 }
+/**
+ * A body read that met the start reserve or the deadline before its body request reached the node. It carries the deadline's
+ * code so callers see an ordinary timeout, but an evidence read reports the meeting as not started rather than as a body attempt.
+ */
+export class BodyNotStartedError extends MeetingRetrievalError {
+  constructor() { super("retrieval_timeout", 504); this.name = "BodyNotStartedError"; }
+}
 export function checkContext(context: RetrievalContext = {}): void {
   if (context.signal?.aborted) throw new MeetingRetrievalError("retrieval_cancelled", 499);
   if (context.deadlineAt !== undefined && Date.now() >= context.deadlineAt) throw new MeetingRetrievalError("retrieval_timeout", 504);
@@ -282,12 +289,16 @@ export async function collectMeetingEvidence(reader: TranscriptReader, row: Tran
     let body: BodyResult;
     try {
       // The read is bounded here too, so a reader that ignores its signal still cannot add a result after the deadline.
-      body = reader.readBody ? await withinContext(signal => reader.readBody!(row.source, row.sourceId, { ...context, signal }, row.speakerNames), context)
+      // The bound is a millisecond wider than the reader's own, so a reader that reaches the deadline first can say its body request was never dispatched.
+      const bound = context.deadlineAt === undefined ? context : { ...context, deadlineAt: context.deadlineAt + 1 };
+      body = reader.readBody ? await withinContext(signal => reader.readBody!(row.source, row.sourceId, { ...context, signal }, row.speakerNames), bound)
         : await withinContext(async () => { const value = await reader.getTranscript(row.source, row.sourceId); return value === null ? { state: "missing" as const } : normalizedBody(value); }, context);
     } catch (error) {
       if (isAccessError(error)) throw error;
       const code = (error as { code?: string }).code;
-      body = { state: code === "retrieval_timeout" ? "timeout" : code === "retrieval_cancelled" ? "cancelled" : "unavailable", ...(code === "retrieval_timeout" ? { reasonCode: code } : {}) };
+      // No body request reached the node, so this meeting was never read: it is a budget omission, not an attempted or interrupted body.
+      if (error instanceof BodyNotStartedError) { outcome.coverage.bodyAttempted = false; outcome.state = "not_read"; outcome.coverage.omissionReasons.push("budget"); }
+      body = error instanceof BodyNotStartedError ? { state: "not_requested" } : { state: code === "retrieval_timeout" ? "timeout" : code === "retrieval_cancelled" ? "cancelled" : "unavailable", ...(code === "retrieval_timeout" ? { reasonCode: code } : {}) };
     }
     const { value, ...status } = body; outcome.body = status;
     if (body.state === "access_denied") throw new MeetingRetrievalError("access_denied", 409);

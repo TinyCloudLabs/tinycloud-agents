@@ -251,6 +251,77 @@ describe("start cutoff after access acquisition", () => {
   });
 });
 
+describe("a body that never reached the node is not a body attempt", () => {
+  beforeEach(() => { jest.useFakeTimers(); });
+  afterEach(() => { jest.useRealTimers(); });
+  const VOICE_KEY = `${REV_PREFIX}${VOICE_ID}/${HASH}`;
+  const SQL_QUERY = (db: Database) => async (sql: string, params: unknown[]) => ({ ok: true, data: { rows: db.query(sql).values(...(params as never[])) } });
+  function voiceNoteRow(): TranscriptMetadata {
+    return { meetingRef: `vn-${VOICE_ID}`, source: "exo-voice-note", sourceId: VOICE_ID, title: "Note", startedAt: "2026-03-03T10:00:00Z",
+      participantNames: [], participantEmails: [], organizerEmail: null, summaryOverview: null, summaryActionItems: null, speakerNames: null };
+  }
+  function voiceNoteDb() {
+    const db = fixture();
+    insert(db, `vn-${VOICE_ID}`, "exo-voice-note", VOICE_ID, "2026-03-03T10:00:00Z", { transcription_outcome: "transcribed" });
+    db.run("INSERT INTO voice_note_transcript VALUES (?, 1, ?, ?, 'transcribed', '2026-03-03T10:00:00Z')", [VOICE_ID, HASH, VOICE_KEY]);
+    return db;
+  }
+  /** The concrete reader's body path behind an already-revalidated row, so the test starts at the body read. */
+  function atBodyRead(concrete: TranscriptReader, row: TranscriptMetadata): TranscriptReader {
+    return { ...concrete, discoverMetadata: async (args, context) => discoveryResult([row], 1, args, context ?? {}), getMetadataBatch: async refs => new Map(refs.map(ref => [ref, row])) };
+  }
+  const notStarted = (result: Awaited<ReturnType<typeof searchTranscripts>>) => {
+    expect(result.data.outcomes[0]).toMatchObject({ state: "not_read", body: { state: "not_requested" }, coverage: { bodyAttempted: false, omissionReasons: expect.arrayContaining(["budget"]) } });
+    expect(result.data.corpus).toMatchObject({ examinedCount: 0, unreadCount: 1, budgetOmittedCount: 1, bodyReadCount: 0, bodyDeadlineCount: 0, bodyTransportTimeoutCount: 0, transcriptFallbackCount: 0, transcriptRead: false, matchedCount: 0, partial: true });
+    expect(result.text).toContain("Meetings not started: 1. Body reads interrupted: 0.");
+  };
+
+  test("a voice note whose SQL lookups leave less than the KV reserve is not started, and no KV read is dispatched", async () => {
+    const db = voiceNoteDb();
+    // Index and commit lookups take 600ms each: the commit starts with 1400 left (>= 1219), the KV body read would start with 800 (< 990).
+    const { reader, trace } = recorded(db, new Map([[VOICE_KEY, SENTENCES]]), { sql: async (sql, params) => { await sleep(600); return SQL_QUERY(db)(sql, params); } });
+    const result = await settle(searchTranscripts(atBodyRead(reader, voiceNoteRow()), { query: "cobalt" }, undefined, { retrievalMode: "range", deadlineAt: Date.now() + 2_000 }));
+    expect(trace.sql).toHaveLength(2);
+    expect(trace.kv).toEqual([]);
+    notStarted(result);
+    db.close();
+  });
+
+  test("a voice note whose SQL lookup is still running at the deadline is not started either", async () => {
+    const db = voiceNoteDb();
+    const { reader, trace } = recorded(db, new Map([[VOICE_KEY, SENTENCES]]), { sql: async (sql, params) => {
+      if (sql.includes("FROM voice_note_transcript WHERE source_id")) await sleep(10_000); // ignores the abort
+      return SQL_QUERY(db)(sql, params);
+    } });
+    const result = await settle(searchTranscripts(atBodyRead(reader, voiceNoteRow()), { query: "cobalt" }, undefined, { retrievalMode: "range", deadlineAt: Date.now() + 2_000 }));
+    expect(trace.kv).toEqual([]);
+    notStarted(result);
+    db.close();
+  });
+
+  test("a voice note whose KV body read was dispatched and then cut off by the deadline is an attempted, interrupted body", async () => {
+    const db = voiceNoteDb();
+    const { reader, trace } = recorded(db, new Map(), { kv: async () => { await sleep(10_000); return { ok: true, data: { data: SENTENCES } }; } });
+    const result = await settle(searchTranscripts(atBodyRead(reader, voiceNoteRow()), { query: "cobalt" }, undefined, { retrievalMode: "range", deadlineAt: Date.now() + 2_000 }));
+    expect(trace.kv).toEqual([VOICE_KEY]);
+    expect(result.data.outcomes[0]).toMatchObject({ state: "read", body: { state: "timeout", reasonCode: "retrieval_timeout" }, coverage: { bodyAttempted: true } });
+    expect(result.data.corpus).toMatchObject({ budgetOmittedCount: 0, bodyDeadlineCount: 1, bodyReadCount: 0, transcriptFallbackCount: 1, matchedCount: 0, partial: true });
+    expect(result.text).toContain("Meetings not started: 0. Body reads interrupted: 1.");
+    db.close();
+  });
+
+  test("a body read whose access wait leaves less than the KV reserve is not started, and no KV read is dispatched", async () => {
+    const db = fixture();
+    const row = { ...voiceNoteRow(), meetingRef: "ff-a", source: "fireflies" as const, sourceId: "a" };
+    const { reader, trace } = recorded(db, new Map([[`${PREFIX}/fireflies/transcript/a`, SENTENCES]]), {}, 300);
+    // 1100 left passes the cutoff on entry (>= 990); the 300ms access wait leaves 800.
+    const result = await settle(searchTranscripts(atBodyRead(reader, row), { query: "cobalt" }, undefined, { retrievalMode: "range", deadlineAt: Date.now() + 1_100 }));
+    expect(trace.kv).toEqual([]);
+    notStarted(result);
+    db.close();
+  });
+});
+
 describe("deadline abort and late results", () => {
   beforeEach(() => { jest.useFakeTimers(); });
   afterEach(() => { jest.useRealTimers(); });

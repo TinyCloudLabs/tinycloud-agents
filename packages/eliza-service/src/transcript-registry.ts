@@ -7,7 +7,7 @@ import type { PortableDelegation } from "@tinycloud/agent-client";
 import { currentPrivateAccess, DelegationExpiredError, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
 import { TRANSCRIPT_SOURCES } from "./actions/tinycloud-search-transcripts.js";
 import type { TranscriptMetadata, TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
-import { checkContext, decodeBody, discoveryResult, MeetingRetrievalError, requireStartBudget, scopedRows, withinContext } from "./meeting-evidence.js";
+import { BodyNotStartedError, checkContext, decodeBody, discoveryResult, MeetingRetrievalError, requireStartBudget, scopedRows, withinContext } from "./meeting-evidence.js";
 import type { BodyResult, MeetingSelection, RetrievalContext } from "./meeting-evidence.js";
 import { createTranscriptNode, TranscriptResponseLimitError, TRANSCRIPT_RESPONSE_BYTE_LIMIT } from "./transcript-transport.js";
 import { COMBINED_SOURCE, combinedMemberKeys, isCombinedMember, readCombinedMembers } from "./combined-meetings.js";
@@ -435,11 +435,23 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     const hasMore = measured.length > rows.length;
     return { rows, cursor: hasMore ? cursor + rows.length : null };
   };
+  // A deadline or start reserve met before the body request is dispatched leaves no body attempt behind (see BodyNotStartedError).
+  const beforeBodyRequest = async <T>(step: () => Promise<T>): Promise<T> => {
+    try { return await step(); }
+    catch (error) { throw (error as { code?: string }).code === "retrieval_timeout" ? new BodyNotStartedError() : error; }
+  };
   const readKey = async (key: string, context: RetrievalContext): Promise<BodyResult> => {
-    requireStartBudget("kv", context);
-    // Transcript-only transport caps decoded bytes before SDK buffering. Retain
-    // the decoded-value check for injected readers and UTF-8 replacement growth.
-    const response = await withinContext(signal => withAccess("kv", context, signal, active => active.kv.get(key, { prefix: "", raw: true, signal })), context) as { ok?: boolean; error?: unknown; data?: { data?: unknown } };
+    let dispatched = false;
+    let response: { ok?: boolean; error?: unknown; data?: { data?: unknown } };
+    try {
+      requireStartBudget("kv", context);
+      // Transcript-only transport caps decoded bytes before SDK buffering. Retain
+      // the decoded-value check for injected readers and UTF-8 replacement growth.
+      response = await withinContext(signal => withAccess("kv", context, signal, active => { dispatched = true; return active.kv.get(key, { prefix: "", raw: true, signal }); }), context) as typeof response;
+    } catch (error) {
+      if (!dispatched && (error as { code?: string }).code === "retrieval_timeout") throw new BodyNotStartedError();
+      throw error;
+    }
     assertAccess();
     const body = response?.ok === true ? decodeBody(response.data?.data) : classifyBodyFailure(response?.error);
     enforceAccess(body); return body;
@@ -460,8 +472,8 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
   const readBody = async (source: TranscriptMetadata["source"], sourceId: string, context: RetrievalContext = {}, speakerNames?: ReadonlyMap<string, string> | null): Promise<BodyResult> => {
     if (!isSource(source) || !safeSegment(sourceId)) throw new MeetingRetrievalError("invalid_stored_metadata");
     assertAccess();
-    if (source === VOICE_NOTE_SOURCE && await hasVoiceNoteIndex(context)) {
-      const [commit] = await query(`SELECT outcome, hash, body_key FROM ${VOICE_NOTE_INDEX} WHERE source_id = ? LIMIT 1`, [sourceId], context);
+    if (source === VOICE_NOTE_SOURCE && await beforeBodyRequest(() => hasVoiceNoteIndex(context))) {
+      const [commit] = await beforeBodyRequest(() => query(`SELECT outcome, hash, body_key FROM ${VOICE_NOTE_INDEX} WHERE source_id = ? LIMIT 1`, [sourceId], context));
       // The index names the one committed revision. No commit row, or any outcome other than transcribed, has no readable body.
       if (!commit) return { state: "missing" };
       const [outcome, hash, bodyKey] = commit;
