@@ -273,7 +273,7 @@ export async function collectMeetingEvidence(reader: TranscriptReader, row: Tran
     } catch (error) {
       if (isAccessError(error)) throw error;
       const code = (error as { code?: string }).code;
-      body = { state: code === "retrieval_timeout" ? "timeout" : code === "retrieval_cancelled" ? "cancelled" : "unavailable" };
+      body = { state: code === "retrieval_timeout" ? "timeout" : code === "retrieval_cancelled" ? "cancelled" : "unavailable", ...(code === "retrieval_timeout" ? { reasonCode: code } : {}) };
     }
     const { value, ...status } = body; outcome.body = status;
     if (body.state === "access_denied") throw new MeetingRetrievalError("access_denied", 409);
@@ -352,7 +352,11 @@ function projectResult(operation: MeetingOperation, outcomes: MeetingOutcome[], 
   const truncated = Boolean(discovery?.scanLimited || (discovery && discovery.matchedCount > discovery.returnedCount)) || outcomes.some(outcome => outcome.coverage.omissionReasons.length > 0 || outcome.evidence.some(item => item.truncated));
   const unreadCount = outcomes.filter(outcome => outcome.state !== "read").length;
   const budgetOmittedCount = outcomes.filter(outcome => outcome.state === "not_read" && outcome.coverage.omissionReasons.includes("budget")).length;
-  const bodyTimeoutCount = outcomes.filter(outcome => outcome.body.state === "timeout").length;
+  const bodiesAttempted = outcomes.filter(outcome => outcome.coverage.bodyAttempted).length;
+  const bodyReadCount = outcomes.filter(outcome => outcome.coverage.bodyAttempted && outcome.body.state === "present").length;
+  // The tool deadline marks its own interruptions retrieval_timeout; a TIMEOUT from storage keeps its transport code.
+  const bodyDeadlineCount = outcomes.filter(outcome => outcome.body.state === "timeout" && outcome.body.reasonCode === "retrieval_timeout").length;
+  const bodyTransportTimeoutCount = outcomes.filter(outcome => outcome.body.state === "timeout").length - bodyDeadlineCount;
   const first = projected[0];
   const data = {
     contractVersion: 2 as const, outcomes, ...(discovery ? { discovery } : {}),
@@ -362,15 +366,17 @@ function projectResult(operation: MeetingOperation, outcomes: MeetingOutcome[], 
     actionItems: operation === "read" ? first?.actionItems ?? [] : [], excerpts: operation === "read" ? first?.excerpts ?? [] : [], matches,
     focus: outcomes[0]?.coverage.purpose,
     corpus: { candidateCount: discovery?.matchedCount ?? outcomes.length, returnedCount: outcomes.length, examinedCount: outcomes.filter(outcome => outcome.state === "read").length,
-      ...(operation === "find" ? {} : { unreadCount, budgetOmittedCount, bodyTimeoutCount }),
-      matchedCount: matches.length, transcriptRead: outcomes.some(outcome => outcome.coverage.bodyAttempted), transcriptFallbackCount: outcomes.filter(outcome => outcome.coverage.bodyAttempted).length, truncated, partial },
+      ...(operation === "find" ? {} : { unreadCount, budgetOmittedCount, bodyReadCount, bodyDeadlineCount, bodyTransportTimeoutCount }),
+      matchedCount: matches.length, transcriptRead: bodiesAttempted > 0, transcriptFallbackCount: bodiesAttempted, truncated, partial },
   };
   const text = operation === "find" ? `Found ${discovery?.countKind === "lower_bound" ? "at least " : ""}${discovery?.matchedCount ?? outcomes.length} matching meetings; returned ${outcomes.length} metadata records. Discovery does not inspect bodies.`
     : `Retrieved ${retained.length} purpose-supported meeting outcomes from ${outcomes.length} included records. Use retained evidence citations; body and coverage outcomes describe retrieval limitations.`;
-  // Aggregate answers must not read as complete when the time budget left meetings unread.
-  const examined = `Examined ${outcomes.length - unreadCount} of ${outcomes.length} discovered meetings; ${unreadCount} unread.`
-    + (budgetOmittedCount || bodyTimeoutCount ? ` The tool time budget ran out: ${budgetOmittedCount} not started, ${bodyTimeoutCount} body reads timed out.` : "");
-  return { text: text + (operation === "search" || operation === "actions" ? ` ${examined}` : "") + (truncated || partial ? " Coverage is bounded; narrow the requested scope for more evidence." : ""), data };
+  // Answers must not read as complete when metadata was not revalidated, bodies were not read, or the deadline cut work.
+  const coverage = ` Revalidated metadata for ${outcomes.length - unreadCount} of ${outcomes.length} ${discovery ? "discovered" : "requested"} meeting${outcomes.length === 1 ? "" : "s"}; ${unreadCount} not read.`
+    + (bodiesAttempted ? ` Transcript bodies read: ${bodyReadCount} of ${bodiesAttempted} attempted.` : " No transcript bodies were attempted.")
+    + (budgetOmittedCount || bodyDeadlineCount ? ` The tool time budget ran out. Meetings not started: ${budgetOmittedCount}. Body reads interrupted: ${bodyDeadlineCount}.` : "")
+    + (bodyTransportTimeoutCount ? ` Body reads that timed out in storage: ${bodyTransportTimeoutCount}.` : "");
+  return { text: text + (operation === "find" ? "" : coverage) + (truncated || partial ? " Coverage is bounded; narrow the requested scope for more evidence." : ""), data };
 }
 export type MeetingToolResult = ReturnType<typeof projectResult>;
 /** Fit legacy and v2 together, measuring the real dispatcher wrapper and callback frame. */

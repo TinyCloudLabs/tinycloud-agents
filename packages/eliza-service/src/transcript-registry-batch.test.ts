@@ -124,3 +124,20 @@ describe("batched metadata revalidation", () => {
     db.close();
   });
 });
+
+describe("storage TIMEOUT versus the tool deadline through the concrete reader", () => {
+  test("an SDK transport TIMEOUT on a body is reported as a storage timeout, never as a spent budget", async () => {
+    const db = fixture();
+    insert(db, "r-a", "fireflies", "a", "2026-03-02T09:00:00Z");
+    const reader = createReader({
+      sql: { db: () => ({ query: async (sql: string, params?: unknown[]) => ({ ok: true, data: { rows: db.query(sql).values(...((params ?? []) as never[])) } }) }) },
+      kv: { get: async () => ({ ok: false, error: { code: "TIMEOUT", message: "request timed out" } }) },
+    } as never);
+    const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, { retrievalMode: "range", deadlineAt: Date.now() + 5_000 });
+    expect(result.data.outcomes[0]!.body).toMatchObject({ state: "timeout", reasonCode: "TIMEOUT" });
+    expect(result.data.corpus).toMatchObject({ budgetOmittedCount: 0, bodyDeadlineCount: 0, bodyTransportTimeoutCount: 1, bodyReadCount: 0 });
+    expect(result.text).toContain("Body reads that timed out in storage: 1.");
+    expect(result.text).not.toContain("time budget");
+    db.close();
+  });
+});
