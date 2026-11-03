@@ -168,10 +168,14 @@ function fakeNodeFactory(corpusFor: (privateKey: string) => Corpus, trace: NodeT
                 }
                 trace.dbs.push(name);
                 trace.sql.push(sql);
-                if (sql.includes("WITH candidates AS (")) {
-                  const limit = Number(params?.at(-3) ?? corpus.rows.length);
-                  const offset = Number(params?.at(-2) ?? 0);
-                  const rows = corpus.rows.slice(offset, offset + limit).map(row => [...row.slice(0, 9), null, 0, 0]);
+                if (sql.includes("length(CAST(json_array(")) {
+                  const limit = Number(params?.at(-2) ?? corpus.rows.length);
+                  const offset = Number(params?.at(-1) ?? 0);
+                  const rows = corpus.rows.slice(offset, offset + limit).map(row => {
+                    const projected = [...row.slice(0, 9), null, 0, 0];
+                    while (projected.length < 12) projected.push(null);
+                    return [...projected, new TextEncoder().encode(JSON.stringify(projected)).byteLength];
+                  });
                   return { ok: true, data: { rows } };
                 }
                 return { ok: true, data: { rows: sql.includes("WHERE id = ?") ? corpus.rows.filter(row => row[0] === params?.[0]) : corpus.rows } };

@@ -29,6 +29,13 @@ const VOICE_NOTE_REV_HASH = /^[0-9a-f]{32}$/;
 // Metadata mirror for listing and lookup. Prefilters to a transcribed outcome; with the commit index present, commitReadable then requires the commit row too.
 const VOICE_NOTE_MIRROR_READABLE = "(CASE WHEN json_valid(metadata) THEN (json_extract(metadata, '$.transcription_outcome') = 'transcribed') ELSE 0 END)";
 
+function logNodeFailure(operation: string, error: unknown): void {
+  const fields = error && typeof error === "object" ? error as Record<string, unknown> : undefined;
+  const rawMessage = typeof error === "string" ? error : fields && typeof fields.message === "string" ? fields.message : "";
+  const message = rawMessage.replace(/\s+in\s+(?:WITH|SELECT)\b[\s\S]*$/i, "").slice(0, 240);
+  const code = fields && typeof fields.code === "string" ? fields.code.slice(0, 80) : undefined;
+  console.warn("transcript_node_request_failed", { operation, ...(code ? { code } : {}), ...(message ? { message } : {}) });
+}
 type Access = {
   sql: { db(name: string): { query(sql: string, params?: Array<string | number | null>, options?: { signal?: AbortSignal }): Promise<unknown> } };
   kv: { get(key: string, options?: { prefix?: string; raw?: boolean; signal?: AbortSignal }): Promise<unknown> };
@@ -247,6 +254,8 @@ const COMBINED_MEMBERS_MAX_BYTES = 128;
 /** Upper bound on combined-row pages read for exclusion; a missed exclusion is a recoverable duplicate. */
 const COMBINED_KEYS_MAX_PAGES = 20;
 const SQL_PAGE_MAX_ROWS = 500;
+/** Keep every raw SQL response below the node transport cap, even for worst-case escaped text. */
+const SQL_PAGE_RESPONSE_BATCH_ROWS = 8;
 const SQL_PAGE_BYTE_BUDGET = Math.floor(TRANSCRIPT_RESPONSE_BYTE_LIMIT * 0.75);
 const SQL_PAGE_ROW_OVERHEAD_BYTES = 32;
 const MEETING_REF_MAX_LENGTH = 128;
@@ -365,12 +374,13 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     const response = await withinContext(signal => withAccess(signal, active => active.sql.db(SQL_PATH).query(sql, params, { signal })), context) as { ok?: boolean; data?: { rows?: unknown[][] }; error?: unknown };
     assertAccess();
     if (response?.ok !== true || !Array.isArray(response.data?.rows)) {
+      logNodeFailure("sql.read", response?.error);
       enforceAccess(classifyBodyFailure(response?.error));
       throw new MeetingRetrievalError("transcript_unavailable");
     }
     return response.data.rows;
   };
-  // Measure serialized projection bytes in SQL; the cursor advances only over emitted rows so callers can continue partial pages.
+  // Measure each projected row in SQL; accumulate the byte budget in the caller without window functions.
   const queryPage = async (
     columns: string,
     columnCount: number,
@@ -380,34 +390,33 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     cursor: number,
     pageRows: number,
     context: RetrievalContext = {},
+    responseBatchRows = SQL_PAGE_RESPONSE_BATCH_ROWS,
   ): Promise<{ rows: unknown[][]; cursor: number | null }> => {
+    const batchLimit = Math.min(pageRows, responseBatchRows);
     const measured = await query(
-      `WITH candidates AS (
-         SELECT ${columns},
-           length(CAST(json_array(${columns}) AS BLOB)) AS __page_row_bytes,
-           ROW_NUMBER() OVER (ORDER BY ${order}) AS __page_order
-         FROM connector_meeting WHERE ${where}
-         ORDER BY ${order} LIMIT ? OFFSET ?
-       ), budgeted AS (
-         SELECT *, SUM(__page_row_bytes + ${SQL_PAGE_ROW_OVERHEAD_BYTES}) OVER (
-           ORDER BY __page_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-         ) AS __page_total_bytes,
-         COUNT(*) OVER () AS __page_candidates
-         FROM candidates
-       )
-       SELECT * FROM budgeted
-       WHERE __page_total_bytes <= ?
-       ORDER BY __page_order`,
-      [...params, pageRows, cursor, SQL_PAGE_BYTE_BUDGET], context);
-    const page = measured.map(row => row.slice(0, columnCount));
-    // A short page the byte budget did not trim is the last one; only full or trimmed pages need a continuation probe.
-    const candidates = Number(measured[0]?.[columnCount + 3]);
-    const trimmed = Number.isFinite(candidates) && candidates > page.length;
-    if (!trimmed && page.length < pageRows) return { rows: page, cursor: null };
+      `SELECT ${columns},
+         length(CAST(json_array(${columns}) AS BLOB)) AS __page_row_bytes
+       FROM connector_meeting WHERE ${where}
+       ORDER BY ${order} LIMIT ? OFFSET ?`,
+      [...params, batchLimit, cursor], context);
+    const rows: unknown[][] = [];
+    let pageBytes = 0;
+    for (const row of measured) {
+      const rowBytes = Number(row[columnCount]);
+      if (!Number.isFinite(rowBytes)) throw new MeetingRetrievalError("transcript_unavailable");
+      const nextBytes = pageBytes + rowBytes + SQL_PAGE_ROW_OVERHEAD_BYTES;
+      if (nextBytes > SQL_PAGE_BYTE_BUDGET) {
+        if (rows.length === 0) throw new MeetingRetrievalError("meeting_result_size_limit", 413);
+        break;
+      }
+      rows.push(row.slice(0, columnCount));
+      pageBytes = nextBytes;
+    }
+    if (measured.length < batchLimit && rows.length === measured.length) return { rows, cursor: null };
     const hasMore = (await query(
       `SELECT 1 FROM connector_meeting WHERE ${where} LIMIT 1 OFFSET ?`,
-      [...params, cursor + page.length], context)).length > 0;
-    return { rows: page, cursor: hasMore ? cursor + page.length : null };
+      [...params, cursor + rows.length], context)).length > 0;
+    return { rows, cursor: hasMore ? cursor + rows.length : null };
   };
   const readKey = async (key: string, context: RetrievalContext): Promise<BodyResult> => {
     // Transcript-only transport caps decoded bytes before SDK buffering. Retain
@@ -459,7 +468,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
           `source, NULL, ${COMBINED_KEYS_METADATA_PROJECTION}`,
           3,
           `source = ? AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} ELSE 0 END`,
-          [COMBINED_SOURCE], "id ASC", cursor, SQL_PAGE_MAX_ROWS, context);
+          [COMBINED_SOURCE], "id ASC", cursor, SQL_PAGE_MAX_ROWS, context, SQL_PAGE_MAX_ROWS);
         for (const key of combinedMemberKeys(page.rows, combinedColumns)) keys.add(key);
         if (page.cursor === null) return keys;
         if (page.cursor <= cursor) return keys;

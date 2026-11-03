@@ -219,10 +219,17 @@ describe("storage classification and scoped discovery", () => {
       const hasMoreProbe = sql.startsWith("SELECT 1 FROM connector_meeting");
       if (combinedQuery) return { ok: true, data: { rows: [] } };
       if (!hasMoreProbe) calls.push({ sql, params });
-      const pageQuery = sql.includes("WITH candidates AS (");
-      const limit = Number(pageQuery ? params?.at(-3) ?? rows.length : sql.match(/\bLIMIT\s+(\d+)/i)?.[1] ?? rows.length);
-      const offset = pageQuery ? Number(params?.at(-2) ?? 0) : sql.includes("OFFSET ?") ? Number(params?.at(-1) ?? 0) : 0;
-      return { ok: true, data: { rows: hasMoreProbe ? (offset < rows.length ? [[1]] : []) : rows.slice(offset, offset + limit) } };
+      const pageQuery = sql.includes("length(CAST(json_array(");
+      const limit = Number(pageQuery ? params?.at(-2) ?? rows.length : sql.match(/\bLIMIT\s+(\d+)/i)?.[1] ?? rows.length);
+      const offset = pageQuery ? Number(params?.at(-1) ?? 0) : sql.includes("OFFSET ?") ? Number(params?.at(-1) ?? 0) : 0;
+      if (hasMoreProbe) return { ok: true, data: { rows: offset < rows.length ? [[1]] : [] } };
+      const selected = rows.slice(offset, offset + limit);
+      const resultRows = pageQuery ? selected.map(row => {
+        const projected = [...row.slice(0, 9), null, 0, 0];
+        while (projected.length < 12) projected.push(null);
+        return [...projected, new TextEncoder().encode(JSON.stringify(projected)).byteLength];
+      }) : selected;
+      return { ok: true, data: { rows: resultRows } };
     } }) }, kv: { get: async () => body } });
     return { source, calls };
   }
@@ -335,7 +342,14 @@ describe("Exo Local meetings", () => {
       if (properties.source) expect([...properties.source.enum]).toEqual([...TRANSCRIPT_SOURCES]);
     }
     // Unknown stored sources still never form a KV key.
-    const reader = createReader({ sql: { db: () => ({ query: async () => ({ ok: true, data: { rows: [["x", "exo-remote", "local:sess-1"]] } }) }) }, kv: { get: async () => { throw new Error("must not read"); } } });
+    const reader = createReader({ sql: { db: () => ({ query: async (sql: string) => {
+      if (sql.startsWith("SELECT 1 FROM connector_meeting") || sql.includes("FROM connector_meeting WHERE source = ? AND CASE WHEN json_valid(metadata)")) return { ok: true, data: { rows: [] } };
+      if (sql.includes("length(CAST(json_array(")) {
+        const projected = ["x", "exo-remote", "local:sess-1", null, null, null, null, null, null, null, 0, 0];
+        return { ok: true, data: { rows: [[...projected, new TextEncoder().encode(JSON.stringify(projected)).byteLength]] } };
+      }
+      return { ok: true, data: { rows: [["x", "exo-remote", "local:sess-1"]] } };
+    } }) }, kv: { get: async () => { throw new Error("must not read"); } } });
     expect(await reader.listMetadata()).toEqual([]);
     await expect(reader.readBody!("exo-remote" as never, "local:sess-1")).rejects.toMatchObject({ code: "invalid_stored_metadata" });
   });
