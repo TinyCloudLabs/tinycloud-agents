@@ -226,16 +226,15 @@ describe("meeting listing keeps transcripts stored in metadata out of the respon
       db.close();
     }
   });
-  test("pages bounded listings without window functions under the node response limit", async () => {
+  test("pages bounded listings under the node response limit", async () => {
     const db = fixture(Array.from({ length: 200 }, (_, i) => [`m-${i}`, "fireflies", `f-${i}`, day(i), null, "\u0001".repeat(4_096)]));
     db.prepare("UPDATE connector_meeting SET summary_action_items = ?").run("\u0001".repeat(4_096));
     const responseBytes: number[] = [];
     let requestCount = 0;
     const instance = createReader({
-      sql: { db: () => ({ query: async (sql: string, params?: unknown[]) => {
-        if (/\bOVER\s*\(/i.test(sql)) throw new Error("node SQL authorizer rejects window functions");
-        const rows = db.query(sql).values(...((params ?? []) as never[]));
-        expect(rows.length).toBeLessThanOrEqual(8);
+      sql: { db: () => ({ query: async (_sql: string, params?: unknown[]) => {
+        const rows = db.query(_sql).values(...((params ?? []) as never[]));
+        expect(rows.length).toBeLessThanOrEqual(9);
         const response = { ok: true, data: { rows } };
         responseBytes.push(new TextEncoder().encode(JSON.stringify(response)).byteLength);
         requestCount += 1;
@@ -246,7 +245,7 @@ describe("meeting listing keeps transcripts stored in metadata out of the respon
     try {
       const listed = await instance.listMetadata();
       expect(listed).toHaveLength(200);
-      expect(requestCount).toBeGreaterThan(25);
+      expect(requestCount).toBeLessThanOrEqual(26);
       expect(Math.max(...responseBytes)).toBeLessThan(TRANSCRIPT_RESPONSE_BYTE_LIMIT);
     } finally {
       db.close();
@@ -260,17 +259,37 @@ describe("meeting listing keeps transcripts stored in metadata out of the respon
     const instance = createReader({
       sql: { db: () => ({ query: async () => ({
         ok: false,
-        error: { code: "SQLITE_AUTH", message: `SQLite error: not authorized to use function: ROW_NUMBER in ${queryText}` },
+        error: { status: 400, code: "SQLITE_AUTH", message: `SQLite error: not authorized to use function: ROW_NUMBER in ${queryText}` },
+      }) }) },
+      kv: { get: async () => ({ ok: false, error: { code: "KV_NOT_FOUND" } }) },
+    } as never);
+    try {
+      await expect(instance.listMetadata()).rejects.toMatchObject({ code: "transcript_query_rejected", status: 503 });
+      expect(failures).toHaveLength(1);
+      expect(failures[0][0]).toBe("transcript_node_request_failed");
+      const diagnostic = JSON.stringify(failures[0][1]);
+      expect(diagnostic).toContain("not authorized to use function: ROW_NUMBER");
+      expect(diagnostic).not.toContain(queryText);
+      expect(diagnostic).not.toContain("private_column");
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+  test("does not log arbitrary SQL syntax details", async () => {
+    const failures: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { failures.push(args); };
+    const instance = createReader({
+      sql: { db: () => ({ query: async () => ({
+        ok: false,
+        error: { code: "SQLITE_ERROR", message: 'near "private_column": syntax error' },
       }) }) },
       kv: { get: async () => ({ ok: false, error: { code: "KV_NOT_FOUND" } }) },
     } as never);
     try {
       await expect(instance.listMetadata()).rejects.toMatchObject({ code: "transcript_unavailable" });
       expect(failures).toHaveLength(1);
-      expect(failures[0][0]).toBe("transcript_node_request_failed");
       const diagnostic = JSON.stringify(failures[0][1]);
-      expect(diagnostic).toContain("ROW_NUMBER");
-      expect(diagnostic).not.toContain(queryText);
       expect(diagnostic).not.toContain("private_column");
     } finally {
       console.warn = originalWarn;

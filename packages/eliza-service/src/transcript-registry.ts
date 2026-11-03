@@ -29,11 +29,17 @@ const VOICE_NOTE_REV_HASH = /^[0-9a-f]{32}$/;
 // Metadata mirror for listing and lookup. Prefilters to a transcribed outcome; with the commit index present, commitReadable then requires the commit row too.
 const VOICE_NOTE_MIRROR_READABLE = "(CASE WHEN json_valid(metadata) THEN (json_extract(metadata, '$.transcription_outcome') = 'transcribed') ELSE 0 END)";
 
-function logNodeFailure(operation: string, error: unknown): void {
+function safeNodeErrorMessage(error: unknown): string | undefined {
   const fields = error && typeof error === "object" ? error as Record<string, unknown> : undefined;
   const rawMessage = typeof error === "string" ? error : fields && typeof fields.message === "string" ? fields.message : "";
-  const message = rawMessage.replace(/\s+in\s+(?:WITH|SELECT)\b[\s\S]*$/i, "").slice(0, 240);
-  const code = fields && typeof fields.code === "string" ? fields.code.slice(0, 80) : undefined;
+  const authorizerRefusal = rawMessage.match(/not authorized to use function:\s*([A-Z_][A-Z0-9_]{0,39})/i);
+  return authorizerRefusal ? `not authorized to use function: ${authorizerRefusal[1].toUpperCase()}` : undefined;
+}
+
+function logNodeFailure(operation: string, error: unknown): void {
+  const fields = error && typeof error === "object" ? error as Record<string, unknown> : undefined;
+  const message = safeNodeErrorMessage(error);
+  const code = fields && typeof fields.code === "string" && /^[A-Z0-9_]{1,80}$/.test(fields.code) ? fields.code : undefined;
   console.warn("transcript_node_request_failed", { operation, ...(code ? { code } : {}), ...(message ? { message } : {}) });
 }
 type Access = {
@@ -376,6 +382,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     if (response?.ok !== true || !Array.isArray(response.data?.rows)) {
       logNodeFailure("sql.read", response?.error);
       enforceAccess(classifyBodyFailure(response?.error));
+      if (safeNodeErrorMessage(response?.error)) throw new MeetingRetrievalError("transcript_query_rejected");
       throw new MeetingRetrievalError("transcript_unavailable");
     }
     return response.data.rows;
@@ -398,10 +405,10 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
          length(CAST(json_array(${columns}) AS BLOB)) AS __page_row_bytes
        FROM connector_meeting WHERE ${where}
        ORDER BY ${order} LIMIT ? OFFSET ?`,
-      [...params, batchLimit, cursor], context);
+      [...params, batchLimit + 1, cursor], context);
     const rows: unknown[][] = [];
     let pageBytes = 0;
-    for (const row of measured) {
+    for (const row of measured.slice(0, batchLimit)) {
       const rowBytes = Number(row[columnCount]);
       if (!Number.isFinite(rowBytes)) throw new MeetingRetrievalError("transcript_unavailable");
       const nextBytes = pageBytes + rowBytes + SQL_PAGE_ROW_OVERHEAD_BYTES;
@@ -412,10 +419,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       rows.push(row.slice(0, columnCount));
       pageBytes = nextBytes;
     }
-    if (measured.length < batchLimit && rows.length === measured.length) return { rows, cursor: null };
-    const hasMore = (await query(
-      `SELECT 1 FROM connector_meeting WHERE ${where} LIMIT 1 OFFSET ?`,
-      [...params, cursor + rows.length], context)).length > 0;
+    const hasMore = measured.length > rows.length;
     return { rows, cursor: hasMore ? cursor + rows.length : null };
   };
   const readKey = async (key: string, context: RetrievalContext): Promise<BodyResult> => {
