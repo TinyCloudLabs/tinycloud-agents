@@ -14,6 +14,8 @@ import {
   tinycloudSearchTranscriptsAction,
   tinycloudSearchTranscriptsPlugin,
 } from "./tinycloud-search-transcripts.js";
+import { withinContext } from "../meeting-evidence.js";
+import type { BodyResult, RetrievalContext } from "../meeting-evidence.js";
 import type { TranscriptMetadata } from "./tinycloud-search-transcripts.js";
 
 // Session-driven activation, per-entity isolation, expiry, and the concrete
@@ -291,5 +293,180 @@ describe("tinycloud_search_transcripts retrieval bounds", () => {
     expect(JSON.stringify(result.data).length).toBeLessThanOrEqual(16_000);
     expect(result.data.corpus.truncated).toBe(true);
     expect(result.data.corpus.matchedCount).toBe(result.data.matches.length);
+  });
+});
+
+describe("tinycloud_search_transcripts batched revalidation and budget reporting (TC-2421)", () => {
+  const range = { retrievalMode: "range" as const };
+  const refs = (count: number) => Array.from({ length: count }, (_, i) => meta({ sourceId: `m-${String(i).padStart(2, "0")}`, title: "Decision" }));
+  function counting(rows: TranscriptMetadata[], body: (sourceId: string) => Promise<unknown> | unknown = () => "the decision was cobalt") {
+    const calls = { batch: [] as string[][], exact: [] as string[], bodies: [] as string[] };
+    const reader = {
+      listMetadata: async () => rows,
+      getMetadata: async (ref: string) => { calls.exact.push(ref); return rows.find(row => row.meetingRef === ref) ?? null; },
+      getMetadataBatch: async (batch: string[]) => { calls.batch.push(batch); return new Map(rows.filter(row => batch.includes(row.meetingRef)).map(row => [row.meetingRef, row])); },
+      getTranscript: async (_source: TranscriptMetadata["source"], sourceId: string) => { calls.bodies.push(sourceId); return body(sourceId); },
+    };
+    return { reader, calls };
+  }
+
+  test("revalidates every discovered meeting in one batch instead of one exact lookup each", async () => {
+    const rows = refs(12);
+    const { reader, calls } = counting(rows);
+    const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, range);
+    expect(calls.batch).toEqual([rows.map(row => row.meetingRef)]);
+    expect(calls.exact).toEqual([]);
+    expect(calls.bodies).toHaveLength(12);
+    expect(result.data.corpus).toMatchObject({ candidateCount: 12, examinedCount: 12, unreadCount: 0, matchedCount: 12, partial: false });
+  });
+
+  test("an exact reference still revalidates through its own lookup", async () => {
+    const rows = refs(3);
+    const { reader, calls } = counting(rows);
+    await searchTranscripts(reader, { query: "cobalt", meetingRef: rows[1]!.meetingRef }, undefined, range);
+    expect(calls.exact).toEqual([rows[1]!.meetingRef]);
+    expect(calls.batch).toEqual([]);
+  });
+
+  test("evidence comes from the fresh batch row, not the discovery snapshot", async () => {
+    const stale = meta({ sourceId: "m-0", title: "Decision", summaryOverview: "stale cobalt recap" });
+    const { reader } = counting([stale], () => null);
+    reader.getMetadataBatch = async () => new Map([[stale.meetingRef, { ...stale, summaryOverview: "fresh cobalt recap" }]]);
+    const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, range);
+    expect(JSON.stringify(result.data.outcomes[0]!.evidence)).toContain("fresh cobalt recap");
+    expect(JSON.stringify(result.data.outcomes[0]!.evidence)).not.toContain("stale cobalt recap");
+  });
+
+  test("a meeting missing from the batch is reported not found and its body is never read", async () => {
+    const rows = refs(3);
+    const { reader, calls } = counting(rows);
+    reader.getMetadataBatch = async () => new Map([[rows[0]!.meetingRef, rows[0]!], [rows[2]!.meetingRef, rows[2]!]]);
+    const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, range);
+    expect(result.data.outcomes.map(outcome => outcome.state)).toEqual(["read", "meeting_not_found", "read"]);
+    expect(calls.bodies).toEqual(["m-00", "m-02"]);
+    expect(result.data.corpus).toMatchObject({ examinedCount: 2, unreadCount: 1, budgetOmittedCount: 0, partial: true });
+    expect(result.text).toContain("Revalidated metadata for 2 of 3 discovered meetings; 1 not read.");
+    expect(result.text).not.toContain("time budget");
+  });
+
+  test("a failed batch falls back to exact revalidation per meeting", async () => {
+    const rows = refs(2);
+    const { reader, calls } = counting(rows);
+    reader.getMetadataBatch = async () => { throw Object.assign(new Error("meeting_result_size_limit"), { code: "meeting_result_size_limit", status: 413 }); };
+    const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, range);
+    expect(calls.exact).toEqual(rows.map(row => row.meetingRef));
+    expect(result.data.corpus).toMatchObject({ examinedCount: 2, unreadCount: 0 });
+  });
+  test("a budget timeout stays budget-unread when metadata was already limited", async () => {
+    const row = meta({ sourceId: "m-0", metadataLimited: true });
+    const { reader, calls } = counting([row]);
+    reader.getMetadataBatch = async () => { throw Object.assign(new Error("meeting_result_size_limit"), { code: "meeting_result_size_limit" }); };
+    reader.getMetadata = async (reference: string) => {
+      calls.exact.push(reference);
+      throw Object.assign(new Error("deadline"), { code: "retrieval_timeout" });
+    };
+    const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, range);
+    expect(result.data.outcomes[0]).toMatchObject({ state: "not_read", coverage: { omissionReasons: ["metadata_limit", "budget"] } });
+    expect(result.data.corpus).toMatchObject({ unreadCount: 1, budgetOmittedCount: 1, bodyReadCount: 0 });
+    expect(result.text).toContain("Revalidated metadata for 0 of 1 discovered meeting; 1 not read.");
+    expect(result.text).toContain("The tool time budget ran out. Meetings not started: 1. Body reads interrupted: 0.");
+    expect(calls.exact).toEqual([row.meetingRef]);
+  });
+
+  test("a delegation failure during the batch rejects the whole search", async () => {
+    const { reader, calls } = counting(refs(2));
+    reader.getMetadataBatch = async () => { throw Object.assign(new Error("expired"), { name: "DelegationExpiredError" }); };
+    await expect(searchTranscripts(reader, { query: "cobalt" }, undefined, range)).rejects.toMatchObject({ name: "DelegationExpiredError" });
+    expect(calls.bodies).toEqual([]);
+  });
+
+  test("a batch that outlives the deadline leaves every meeting unread and says the budget ran out", async () => {
+    const { reader, calls } = counting(refs(4));
+    reader.getMetadataBatch = () => new Promise(() => {});
+    const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, { ...range, deadlineAt: Date.now() + 30 });
+    expect(calls.bodies).toEqual([]);
+    expect(result.data.outcomes.map(outcome => [outcome.state, outcome.coverage.omissionReasons])).toEqual(Array(4).fill(["not_read", ["budget"]]));
+    expect(result.data.corpus).toMatchObject({ candidateCount: 4, examinedCount: 0, unreadCount: 4, budgetOmittedCount: 4, bodyReadCount: 0, partial: true, truncated: true });
+    expect(result.text).toContain("Revalidated metadata for 0 of 4 discovered meetings; 4 not read. No transcript bodies were attempted.");
+    expect(result.text).toContain("The tool time budget ran out. Meetings not started: 4. Body reads interrupted: 0.");
+  });
+
+  test("a spent budget reports examined and unread counts and keeps citations for what was read", async () => {
+    const rows = refs(12);
+    let started = 0;
+    const { reader } = counting(rows, () => (++started <= 6 ? "the decision was cobalt" : new Promise(() => {})));
+    const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, { ...range, deadlineAt: Date.now() + 150 });
+    // Six bodies finished; three more were in flight at the deadline (body timeout); three were never started.
+    expect(result.data.corpus).toMatchObject({ candidateCount: 12, returnedCount: 12, examinedCount: 9, unreadCount: 3, budgetOmittedCount: 3, bodyReadCount: 6, bodyDeadlineCount: 3, bodyTransportTimeoutCount: 0, matchedCount: 6, partial: true, truncated: true });
+    expect(result.text).toContain("Revalidated metadata for 9 of 12 discovered meetings; 3 not read. Transcript bodies read: 6 of 9 attempted.");
+    expect(result.text).toContain("The tool time budget ran out. Meetings not started: 3. Body reads interrupted: 3.");
+    expect(result.text).not.toContain("storage");
+    const unread = result.data.outcomes.filter(outcome => outcome.state === "not_read");
+    expect(unread).toHaveLength(3);
+    for (const outcome of unread) expect(outcome.coverage.omissionReasons).toContain("budget");
+    expect(result.data.matches).toHaveLength(6);
+    for (const match of result.data.matches) {
+      const index = result.data.outcomes.findIndex(outcome => outcome.meetingRef === match.meetingRef);
+      expect(match.citation).toBe(`[M${index + 1}]`);
+      expect(match.excerpts[0]!.citation).toStartWith(`[M${index + 1}:`);
+    }
+  });
+
+  test("a complete read says nothing was left unread", async () => {
+    const { reader } = counting(refs(2));
+    const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, range);
+    expect(result.text).toContain("Revalidated metadata for 2 of 2 discovered meetings; 0 not read. Transcript bodies read: 2 of 2 attempted.");
+    expect(result.text).not.toContain("time budget");
+    expect(result.text).not.toContain("timed out");
+  });
+
+  describe("body outcomes", () => {
+    const transport: BodyResult = { state: "timeout", reasonCode: "TIMEOUT" };
+    const present = (sourceId: string): BodyResult => ({ state: "present", value: `the decision was cobalt ${sourceId}` });
+    function bodies(rows: TranscriptMetadata[], bodyFor: (sourceId: string) => Promise<BodyResult> | BodyResult) {
+      return { listMetadata: async () => rows, getMetadata: async (ref: string) => rows.find(row => row.meetingRef === ref) ?? null,
+        readBody: async (_source: TranscriptMetadata["source"], sourceId: string, context?: RetrievalContext) => withinContext(async () => bodyFor(sourceId), context), getTranscript: async () => null };
+    }
+
+    test("a storage timeout is counted as an unread body, not as a read meeting or a spent budget", async () => {
+      const rows = refs(3);
+      const result = await searchTranscripts(bodies(rows, sourceId => (sourceId === "m-01" ? transport : present(sourceId))), { query: "cobalt" }, undefined, range);
+      expect(result.data.corpus).toMatchObject({ unreadCount: 0, budgetOmittedCount: 0, transcriptFallbackCount: 3, bodyReadCount: 2, bodyDeadlineCount: 0, bodyTransportTimeoutCount: 1, partial: true });
+      expect(result.text).toContain("Revalidated metadata for 3 of 3 discovered meetings; 0 not read. Transcript bodies read: 2 of 3 attempted.");
+      expect(result.text).toContain("Body reads that timed out in storage: 1.");
+      expect(result.text).not.toContain("ran out");
+      expect(result.text).not.toContain("time budget");
+    });
+
+    test("deadline interruptions and storage timeouts are reported separately", async () => {
+      const rows = refs(4);
+      const reader = bodies(rows, sourceId => (sourceId === "m-01" ? transport : sourceId === "m-02" ? new Promise<BodyResult>(() => {}) : present(sourceId)));
+      const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, { ...range, deadlineAt: Date.now() + 100 });
+      expect(result.data.corpus).toMatchObject({ unreadCount: 0, budgetOmittedCount: 0, transcriptFallbackCount: 4, bodyReadCount: 2, bodyDeadlineCount: 1, bodyTransportTimeoutCount: 1 });
+      expect(result.data.outcomes[2]!.body).toMatchObject({ state: "timeout", reasonCode: "retrieval_timeout" });
+      expect(result.data.outcomes[1]!.body).toMatchObject({ state: "timeout", reasonCode: "TIMEOUT" });
+      expect(result.text).toContain("Transcript bodies read: 2 of 4 attempted.");
+      expect(result.text).toContain("The tool time budget ran out. Meetings not started: 0. Body reads interrupted: 1.");
+      expect(result.text).toContain("Body reads that timed out in storage: 1.");
+    });
+
+    test("an exact reference is a requested meeting, not a discovered one", async () => {
+      const rows = refs(2);
+      const reader = bodies(rows, () => transport);
+      const timedOut = await searchTranscripts(reader, { query: "cobalt", meetingRef: rows[0]!.meetingRef }, undefined, range);
+      expect(timedOut.text).toContain("Revalidated metadata for 1 of 1 requested meeting; 0 not read. Transcript bodies read: 0 of 1 attempted.");
+      expect(timedOut.text).toContain("Body reads that timed out in storage: 1.");
+      expect(timedOut.text).not.toContain("discovered");
+      const complete = await searchTranscripts(bodies(rows, present), { query: "cobalt", meetingRef: rows[0]!.meetingRef }, undefined, range);
+      expect(complete.text).toContain("Revalidated metadata for 1 of 1 requested meeting; 0 not read. Transcript bodies read: 1 of 1 attempted.");
+      expect(complete.text).not.toContain("discovered");
+    });
+
+    test("an answer that needed no body says so instead of reporting zero reads", async () => {
+      const stored = meta({ sourceId: "m-0", summaryActionItems: "- Sam will send the memo." });
+      const result = await listMeetingActions({ listMetadata: async () => [stored], getTranscript: async () => { throw new Error("must not read"); } }, {}, undefined, range);
+      expect(result.data.corpus).toMatchObject({ transcriptFallbackCount: 0, bodyReadCount: 0 });
+      expect(result.text).toContain("Revalidated metadata for 1 of 1 discovered meeting; 0 not read. No transcript bodies were attempted.");
+    });
   });
 });
