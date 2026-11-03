@@ -357,6 +357,21 @@ describe("tinycloud_search_transcripts batched revalidation and budget reporting
     expect(calls.exact).toEqual(rows.map(row => row.meetingRef));
     expect(result.data.corpus).toMatchObject({ examinedCount: 2, unreadCount: 0 });
   });
+  test("a budget timeout stays budget-unread when metadata was already limited", async () => {
+    const row = meta({ sourceId: "m-0", metadataLimited: true });
+    const { reader, calls } = counting([row]);
+    reader.getMetadataBatch = async () => { throw Object.assign(new Error("meeting_result_size_limit"), { code: "meeting_result_size_limit" }); };
+    reader.getMetadata = async (reference: string) => {
+      calls.exact.push(reference);
+      throw Object.assign(new Error("deadline"), { code: "retrieval_timeout" });
+    };
+    const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, range);
+    expect(result.data.outcomes[0]).toMatchObject({ state: "not_read", coverage: { omissionReasons: ["metadata_limit", "budget"] } });
+    expect(result.data.corpus).toMatchObject({ unreadCount: 1, budgetOmittedCount: 1, bodyReadCount: 0 });
+    expect(result.text).toContain("Revalidated metadata for 0 of 1 discovered meeting; 1 not read.");
+    expect(result.text).toContain("The tool time budget ran out. Meetings not started: 1. Body reads interrupted: 0.");
+    expect(calls.exact).toEqual([row.meetingRef]);
+  });
 
   test("a delegation failure during the batch rejects the whole search", async () => {
     const { reader, calls } = counting(refs(2));

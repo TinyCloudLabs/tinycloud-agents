@@ -208,7 +208,7 @@ async function aggregate(reader: TranscriptReader, args: MeetingFilters & { meet
         if (accessFailure) break;
         if ((error as { code?: string }).code === "retrieval_cancelled") throw error;
         outcomes[index] = unattemptedOutcome(row, request, (error as { code?: string }).code === "retrieval_timeout" ? "budget" : "metadata_unavailable");
-        if (outcomes[index]!.coverage.omissionReasons[0] !== "budget") outcomes[index]!.state = "unavailable";
+        if (!outcomes[index]!.coverage.omissionReasons.includes("budget")) outcomes[index]!.state = "unavailable";
       }
     }
   }));
