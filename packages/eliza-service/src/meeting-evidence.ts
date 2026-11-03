@@ -37,6 +37,19 @@ export function checkContext(context: RetrievalContext = {}): void {
   if (context.signal?.aborted) throw new MeetingRetrievalError("retrieval_cancelled", 499);
   if (context.deadlineAt !== undefined && Date.now() >= context.deadlineAt) throw new MeetingRetrievalError("retrieval_timeout", 504);
 }
+/**
+ * Observed p95 node read latency per operation kind (TC-2441 production QA: SQL 1219ms, KV 990ms). An operation is not
+ * started with less of the tool budget left than this: it would most likely be aborted mid-flight, still costing the serialized node a read.
+ */
+export const START_RESERVE_MS = { sql: 1_219, kv: 990 } as const;
+export function hasStartBudget(kind: keyof typeof START_RESERVE_MS, context: RetrievalContext = {}): boolean {
+  return context.deadlineAt === undefined || context.deadlineAt - Date.now() >= START_RESERVE_MS[kind];
+}
+/** Refuses to dispatch a node read the budget cannot cover; reported like the deadline itself because that is what it would have met. */
+export function requireStartBudget(kind: keyof typeof START_RESERVE_MS, context: RetrievalContext = {}): void {
+  checkContext(context);
+  if (!hasStartBudget(kind, context)) throw new MeetingRetrievalError("retrieval_timeout", 504);
+}
 /** Supplement SDK signals with deadline checks, late-reply discard, and listener cleanup. */
 export async function withinContext<T>(operation: (signal?: AbortSignal) => Promise<T>, context: RetrievalContext = {}): Promise<T> {
   checkContext(context);
@@ -268,7 +281,8 @@ export async function collectMeetingEvidence(reader: TranscriptReader, row: Tran
     outcome.coverage.bodyAttempted = true;
     let body: BodyResult;
     try {
-      body = reader.readBody ? await reader.readBody(row.source, row.sourceId, context)
+      // The read is bounded here too, so a reader that ignores its signal still cannot add a result after the deadline.
+      body = reader.readBody ? await withinContext(signal => reader.readBody!(row.source, row.sourceId, { ...context, signal }, row.speakerNames), context)
         : await withinContext(async () => { const value = await reader.getTranscript(row.source, row.sourceId); return value === null ? { state: "missing" as const } : normalizedBody(value); }, context);
     } catch (error) {
       if (isAccessError(error)) throw error;
