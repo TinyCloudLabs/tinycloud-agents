@@ -1,6 +1,6 @@
 import type { Action, Content, IAgentRuntime, Memory, Plugin, ProviderDataRecord } from "@elizaos/core";
 import { ToolError } from "../handlers/tools.js";
-import { checkContext, discoverMeetings, exactMeeting, formatMeetingResult, isAccessError, metadataOutcome, readMeetingEvidence, safeMeetingRef, unattemptedOutcome, validDate } from "../meeting-evidence.js";
+import { absentOutcome, checkContext, collectMeetingEvidence, discoverMeetings, exactMeeting, formatMeetingResult, isAccessError, MeetingRetrievalError, metadataOutcome, readMeetingEvidence, safeMeetingRef, unattemptedOutcome, validDate, withinContext } from "../meeting-evidence.js";
 import type { BodyResult, DiscoveryResult, EvidenceRequest, MeetingOutcome, MeetingSelection, RetrievalContext } from "../meeting-evidence.js";
 
 export const TINYCLOUD_FIND_MEETINGS = "tinycloud_find_meetings";
@@ -142,6 +142,8 @@ export interface TranscriptMetadata {
 export interface TranscriptReader {
   listMetadata(): Promise<TranscriptMetadata[]>;
   getMetadata?(meetingRef: string, context?: RetrievalContext): Promise<TranscriptMetadata | null>;
+  /** Fresh metadata for many references in one revalidation pass. References that are absent or no longer visible are omitted from the map. */
+  getMetadataBatch?(meetingRefs: string[], context?: RetrievalContext): Promise<Map<string, TranscriptMetadata>>;
   discoverMetadata?(args: FindMeetingsArgs, context?: RetrievalContext): Promise<DiscoveryResult>;
   readBody?(source: TranscriptSource, sourceId: string, context?: RetrievalContext): Promise<BodyResult>;
   assertAccess?(): void;
@@ -182,12 +184,25 @@ async function aggregate(reader: TranscriptReader, args: MeetingFilters & { meet
   const outcomes: MeetingOutcome[] = rows.map(row => unattemptedOutcome(row, request, "budget"));
   const siblings = new AbortController();
   const childContext = { ...context, signal: context.signal ? AbortSignal.any([context.signal, siblings.signal]) : siblings.signal };
+  // One fresh revalidation pass for the whole discovered set. When the reader has none, or it fails for a reason that does not
+  // end the request (such as an oversized row), each meeting revalidates on its own. A spent budget is handled by the loop below.
+  let fresh: Map<string, TranscriptMetadata> | undefined;
+  if (reader.getMetadataBatch && rows.length > 0) {
+    try { fresh = await withinContext(() => reader.getMetadataBatch!(rows.map(row => row.meetingRef), context), context); }
+    catch (error) {
+      if (isAccessError(error) || (error instanceof MeetingRetrievalError && error.code === "retrieval_cancelled")) throw error;
+    }
+  }
   let cursor = 0; let accessFailure: unknown;
   await Promise.all(Array.from({ length: Math.min(3, rows.length) }, async () => {
     while (cursor < rows.length && !accessFailure) {
       if (context.signal?.aborted || (context.deadlineAt !== undefined && Date.now() >= context.deadlineAt)) break;
       const index = cursor++; const row = rows[index]!;
-      try { outcomes[index] = await readMeetingEvidence(reader, row.meetingRef, request, childContext, row); }
+      try {
+        const revalidated = fresh?.get(row.meetingRef);
+        outcomes[index] = !fresh ? await readMeetingEvidence(reader, row.meetingRef, request, childContext, row)
+          : revalidated ? await collectMeetingEvidence(reader, revalidated, request, childContext) : absentOutcome(row, request);
+      }
       catch (error) {
         if (isAccessError(error)) { accessFailure = error; siblings.abort(); break; }
         if (accessFailure) break;

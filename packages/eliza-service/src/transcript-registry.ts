@@ -536,6 +536,29 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       // Check identity even when a faulty upstream ignores its predicate.
       return visibleRows(await commitReadable(rows, context), hidden).map(decodeMetadata).find(row => row?.meetingRef === reference) ?? null;
     },
+    // One revalidation pass for already-discovered references: the same row, combined-meeting and voice-note commit
+    // checks as getMetadata, with each of them run once for the whole set instead of once per meeting.
+    async getMetadataBatch(references, context = {}) {
+      if (!references.every(safeMeetingRef)) throw new MeetingRetrievalError("invalid_args", 400);
+      const requested = new Set(references);
+      if (requested.size === 0) return new Map();
+      const rows: unknown[][] = [];
+      let cursor = 0;
+      while (true) {
+        const page = await queryPage(COLUMNS, 10, `id IN (${[...requested].map(() => "?").join(", ")}) AND ${readableClause()}`, [...requested], "id ASC", cursor, requested.size, context);
+        rows.push(...page.rows);
+        if (page.cursor === null || page.cursor <= cursor) break;
+        cursor = page.cursor;
+      }
+      const hidden = await combinedKeys(context);
+      // Check identity even when a faulty upstream ignores its predicate.
+      const fresh = new Map<string, TranscriptMetadata>();
+      for (const row of visibleRows(await commitReadable(rows, context), hidden)) {
+        const decoded = decodeMetadata(row);
+        if (decoded && requested.has(decoded.meetingRef)) fresh.set(decoded.meetingRef, decoded);
+      }
+      return fresh;
+    },
     async discoverMetadata(args, context = {}) {
       const clauses: string[] = []; const params: Array<string | number | null> = [];
       if (args.source) { clauses.push("source = ?"); params.push(args.source); }

@@ -315,8 +315,8 @@ describe("session registration reaches the production transcript action", () => 
     const readableQueries = trace.sql.filter(sql => sql.includes("source != 'exo-voice-note' OR source IS NULL"));
     expect(readableQueries.length).toBeGreaterThan(0);
     for (const sql of readableQueries) expect(sql).toContain("json_extract(metadata, '$.transcription_outcome') = 'transcribed'");
-    const lookup = trace.sql.find(sql => /FROM connector_meeting WHERE id = \? AND .* LIMIT 1$/.test(sql));
-    expect(lookup).toBeDefined();
+    const revalidation = trace.sql.find(sql => sql.includes("FROM connector_meeting WHERE id IN (?) AND (source != 'exo-voice-note' OR source IS NULL"));
+    expect(revalidation).toBeDefined();
     expect(trace.kvKeys).toEqual([`${KV_PATH}fireflies/transcript/canary-1`]);
   });
 
