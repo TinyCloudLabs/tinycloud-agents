@@ -371,12 +371,14 @@ function renameSpeakers(item: unknown, names: ReadonlyMap<string, string>): unkn
   return renamed;
 }
 export function createReader(access: Access | (() => Promise<Access>), assertAccess: () => void = () => {}, invalidateAccess: () => void = () => {}): TranscriptReader {
-  const withAccess = async <T>(signal: AbortSignal | undefined, operation: (active: Access) => Promise<T>) => {
+  const withAccess = async <T>(kind: "sql" | "kv", context: RetrievalContext, signal: AbortSignal | undefined, operation: (active: Access) => Promise<T>) => {
     const active = typeof access === "function" ? await access() : access;
     // A caller can stop waiting while a shared renewal continues for others.
     // Check again before storage so cancelled callers never start a late read.
     checkContext({ signal });
     assertAccess();
+    // Waiting for access (renewal, activation) spends budget: the reserve is checked again at the point of dispatch.
+    requireStartBudget(kind, context);
     return operation(active);
   };
   const enforceAccess = (body: BodyResult) => {
@@ -388,7 +390,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
   const query = async (sql: string, params: Array<string | number | null> = [], context: RetrievalContext = {}): Promise<unknown[][]> => {
     assertAccess();
     requireStartBudget("sql", context);
-    const response = await withinContext(signal => withAccess(signal, active => active.sql.db(SQL_PATH).query(sql, params, { signal })), context) as { ok?: boolean; data?: { rows?: unknown[][] }; error?: unknown };
+    const response = await withinContext(signal => withAccess("sql", context, signal, active => active.sql.db(SQL_PATH).query(sql, params, { signal })), context) as { ok?: boolean; data?: { rows?: unknown[][] }; error?: unknown };
     assertAccess();
     if (response?.ok !== true || !Array.isArray(response.data?.rows)) {
       logNodeFailure("sql.read", response?.error);
@@ -437,7 +439,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     requireStartBudget("kv", context);
     // Transcript-only transport caps decoded bytes before SDK buffering. Retain
     // the decoded-value check for injected readers and UTF-8 replacement growth.
-    const response = await withinContext(signal => withAccess(signal, active => active.kv.get(key, { prefix: "", raw: true, signal })), context) as { ok?: boolean; error?: unknown; data?: { data?: unknown } };
+    const response = await withinContext(signal => withAccess("kv", context, signal, active => active.kv.get(key, { prefix: "", raw: true, signal })), context) as { ok?: boolean; error?: unknown; data?: { data?: unknown } };
     assertAccess();
     const body = response?.ok === true ? decodeBody(response.data?.data) : classifyBodyFailure(response?.error);
     enforceAccess(body); return body;

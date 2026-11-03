@@ -24,9 +24,9 @@ function insert(db: Database, id: string, source: string, sourceId: string, star
   db.run("INSERT INTO connector_meeting (id, source, source_id, title, started_at, metadata) VALUES (?, ?, ?, ?, ?, ?)", [id, source, sourceId, `Title ${id}`, startedAt, metadata === null ? null : JSON.stringify(metadata)]);
 }
 type Node = { sql?: (sql: string, params: unknown[], signal?: AbortSignal) => Promise<unknown>; kv?: (key: string, signal?: AbortSignal) => Promise<unknown> };
-function recorded(db: Database, kv: Map<string, unknown>, node: Node = {}) {
+function recorded(db: Database, kv: Map<string, unknown>, node: Node = {}, accessDelayMs?: number) {
   const trace = { sql: [] as string[], kv: [] as string[], sqlSignals: [] as Array<AbortSignal | undefined>, kvSignals: [] as Array<AbortSignal | undefined> };
-  const reader = createReader({
+  const access = {
     sql: { db: () => ({ query: async (sql: string, params: unknown[] = [], options?: { signal?: AbortSignal }) => {
       trace.sql.push(sql); trace.sqlSignals.push(options?.signal);
       if (node.sql) return node.sql(sql, params, options?.signal);
@@ -37,7 +37,9 @@ function recorded(db: Database, kv: Map<string, unknown>, node: Node = {}) {
       if (node.kv) return node.kv(key, options?.signal);
       return kv.has(key) ? { ok: true, data: { data: kv.get(key) } } : { ok: false, error: { code: "KV_NOT_FOUND" } };
     } },
-  } as never);
+  };
+  // A delayed provider models a session renewal or activation that the read must wait for before it can dispatch.
+  const reader = createReader((accessDelayMs === undefined ? access : async () => { await sleep(accessDelayMs); return access; }) as never);
   return { reader, trace };
 }
 /** The standalone per-meeting rename lookup that TC-2441 removes from the body read. */
@@ -194,6 +196,57 @@ describe("start cutoff by operation kind", () => {
     expect(trace.sql).toEqual([]);
     expect(trace.kv).toEqual([]);
     expect(result.data.corpus).toMatchObject({ examinedCount: 0, unreadCount: 3, budgetOmittedCount: 3, matchedCount: 0, partial: true });
+    db.close();
+  });
+});
+
+describe("start cutoff after access acquisition", () => {
+  beforeEach(() => { jest.useFakeTimers(); });
+  afterEach(() => { jest.useRealTimers(); });
+
+  test("a SQL read is not dispatched when waiting for access used up its reserve", async () => {
+    const db = fixture();
+    insert(db, "ff-a", "fireflies", "a", "2026-03-02T09:00:00Z");
+    // 1300ms left passes the entry check (>= 1219); the 500ms access wait leaves 800.
+    const { reader, trace } = recorded(db, new Map(), {}, 500);
+    await expect(settle(reader.getMetadata!("ff-a", { deadlineAt: Date.now() + 1_300 }))).rejects.toMatchObject({ code: "retrieval_timeout" });
+    expect(trace.sql).toEqual([]);
+    db.close();
+  });
+
+  test("a KV read is not dispatched when waiting for access used up its reserve", async () => {
+    const db = fixture();
+    const { reader, trace } = recorded(db, new Map([[`${PREFIX}/fireflies/transcript/a`, SENTENCES]]), {}, 200);
+    // 1100ms left passes the entry check (>= 990); the 200ms access wait leaves 900.
+    await expect(settle(reader.readBody!("fireflies", "a", { deadlineAt: Date.now() + 1_100 }, null))).rejects.toMatchObject({ code: "retrieval_timeout" });
+    expect(trace.kv).toEqual([]);
+    db.close();
+  });
+
+  test("reads still dispatch when the budget left after the access wait covers their kind", async () => {
+    const db = fixture();
+    insert(db, "ff-a", "fireflies", "a", "2026-03-02T09:00:00Z");
+    // getMetadata is two sequential SQL reads (row, combined scan), each waiting 100ms for access.
+    const { reader, trace } = recorded(db, new Map([[`${PREFIX}/fireflies/transcript/a`, SENTENCES]]), {}, 100);
+    expect((await settle(reader.getMetadata!("ff-a", { deadlineAt: Date.now() + 2_500 })))?.meetingRef).toBe("ff-a");
+    expect(trace.sql.length).toBeGreaterThan(0);
+    expect((await settle(reader.readBody!("fireflies", "a", { deadlineAt: Date.now() + 1_100 }, null))).state).toBe("present");
+    expect(trace.kv).toHaveLength(1);
+    db.close();
+  });
+
+  test("a search whose access wait consumes the budget dispatches nothing and reports every meeting as a budget omission", async () => {
+    const db = fixture();
+    const kv = new Map<string, unknown>();
+    for (let i = 0; i < 3; i++) { insert(db, `ff-${i}`, "fireflies", `s-${i}`, `2026-03-0${i + 1}T10:00:00Z`); kv.set(`${PREFIX}/fireflies/transcript/s-${i}`, SENTENCES); }
+    const { reader, trace } = recorded(db, kv);
+    const discovered = await reader.discoverMetadata!({ limit: 12 } as never);
+    const slow = recorded(db, kv, {}, 400);
+    trace.sql.length = 0;
+    const result = await settle(searchTranscripts({ ...slow.reader, discoverMetadata: async () => discovered }, { query: "cobalt" }, undefined, { retrievalMode: "range", deadlineAt: Date.now() + 1_400 }));
+    expect(slow.trace.sql).toEqual([]);
+    expect(slow.trace.kv).toEqual([]);
+    expect(result.data.corpus).toMatchObject({ examinedCount: 0, unreadCount: 3, budgetOmittedCount: 3, bodyReadCount: 0, matchedCount: 0, partial: true });
     db.close();
   });
 });
