@@ -1,10 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { classifyBodyFailure, createReader } from "./transcript-registry.js";
 import { findMeetings, listMeetingActions, parseFindMeetingsArgs, parseReadMeetingArgs, parseListMeetingActionsArgs, parseTranscriptSearchArgs, readMeeting, searchTranscripts, TRANSCRIPT_SOURCES } from "./actions/tinycloud-search-transcripts.js";
 import type { TranscriptMetadata, TranscriptReader } from "./actions/tinycloud-search-transcripts.js";
 import { readMeetingEvidence, storedRecap } from "./meeting-evidence.js";
 import { TINYCLOUD_MEETING_TOOLS } from "./tasks/tool-contract.js";
+import { settle } from "../../../test/virtual-time.js";
 
 const row: TranscriptMetadata = { meetingRef: "old", source: "fireflies", sourceId: "old-source", title: "Design", startedAt: "2025-01-01T10:00:00Z", organizerEmail: null, participantNames: [], participantEmails: [], summaryOverview: null, summaryActionItems: null };
 function reader(overrides: Partial<TranscriptMetadata> = {}, body: unknown = [{ text: "Beginning. Middle. Final decision: cobalt." }]): TranscriptReader {
@@ -162,7 +163,11 @@ describe("meeting evidence v2", () => {
   test("body timeout preserves already retrieved stored action evidence", async () => {
     const source = reader({ summaryActionItems: "- Sam will send the memo." });
     source.getTranscript = async () => new Promise(() => {});
-    const result = await listMeetingActions(source, { includeBody: true }, undefined, { retrievalMode: "range", deadlineAt: Date.now() + 25 });
+    jest.useFakeTimers();
+    let result: Awaited<ReturnType<typeof listMeetingActions>>;
+    // This reader has no batch lookup, so each meeting starts with a SQL revalidation: it needs the SQL p95 (1219ms) left, then the body read is interrupted at the deadline.
+    try { result = await settle(listMeetingActions(source, { includeBody: true }, undefined, { retrievalMode: "range", deadlineAt: Date.now() + 1_300 })); }
+    finally { jest.useRealTimers(); }
     expect(result.data.outcomes[0]).toMatchObject({ state: "read", body: { state: "timeout" }, coverage: { bodyAttempted: true, support: "limited" } });
     expect(result.data.outcomes[0].evidence.some(item => item.kind === "action")).toBe(true);
   });

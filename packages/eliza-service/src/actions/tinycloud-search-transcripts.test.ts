@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 import {
   findMeetings,
   listMeetingActions,
@@ -15,6 +15,7 @@ import {
   tinycloudSearchTranscriptsPlugin,
 } from "./tinycloud-search-transcripts.js";
 import { withinContext } from "../meeting-evidence.js";
+import { settle } from "../../../../test/virtual-time.js";
 import type { BodyResult, RetrievalContext } from "../meeting-evidence.js";
 import type { TranscriptMetadata } from "./tinycloud-search-transcripts.js";
 
@@ -395,7 +396,11 @@ describe("tinycloud_search_transcripts batched revalidation and budget reporting
     const rows = refs(12);
     let started = 0;
     const { reader } = counting(rows, () => (++started <= 6 ? "the decision was cobalt" : new Promise(() => {})));
-    const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, { ...range, deadlineAt: Date.now() + 150 });
+    jest.useFakeTimers();
+    let result: Awaited<ReturnType<typeof searchTranscripts>>;
+    // Every body starts with its KV p95 (990ms) left. The budget ends with six done, three in flight and three blocked behind them.
+    try { result = await settle(searchTranscripts(reader, { query: "cobalt" }, undefined, { ...range, deadlineAt: Date.now() + 1_000 })); }
+    finally { jest.useRealTimers(); }
     // Six bodies finished; three more were in flight at the deadline (body timeout); three were never started.
     expect(result.data.corpus).toMatchObject({ candidateCount: 12, returnedCount: 12, examinedCount: 9, unreadCount: 3, budgetOmittedCount: 3, bodyReadCount: 6, bodyDeadlineCount: 3, bodyTransportTimeoutCount: 0, matchedCount: 6, partial: true, truncated: true });
     expect(result.text).toContain("Revalidated metadata for 9 of 12 discovered meetings; 3 not read. Transcript bodies read: 6 of 9 attempted.");
@@ -441,7 +446,11 @@ describe("tinycloud_search_transcripts batched revalidation and budget reporting
     test("deadline interruptions and storage timeouts are reported separately", async () => {
       const rows = refs(4);
       const reader = bodies(rows, sourceId => (sourceId === "m-01" ? transport : sourceId === "m-02" ? new Promise<BodyResult>(() => {}) : present(sourceId)));
-      const result = await searchTranscripts(reader, { query: "cobalt" }, undefined, { ...range, deadlineAt: Date.now() + 100 });
+      jest.useFakeTimers();
+      let result: Awaited<ReturnType<typeof searchTranscripts>>;
+      // This reader has no batch lookup: each meeting starts with a SQL revalidation, which needs the SQL p95 (1219ms) left.
+      try { result = await settle(searchTranscripts(reader, { query: "cobalt" }, undefined, { ...range, deadlineAt: Date.now() + 1_300 })); }
+      finally { jest.useRealTimers(); }
       expect(result.data.corpus).toMatchObject({ unreadCount: 0, budgetOmittedCount: 0, transcriptFallbackCount: 4, bodyReadCount: 2, bodyDeadlineCount: 1, bodyTransportTimeoutCount: 1 });
       expect(result.data.outcomes[2]!.body).toMatchObject({ state: "timeout", reasonCode: "retrieval_timeout" });
       expect(result.data.outcomes[1]!.body).toMatchObject({ state: "timeout", reasonCode: "TIMEOUT" });
