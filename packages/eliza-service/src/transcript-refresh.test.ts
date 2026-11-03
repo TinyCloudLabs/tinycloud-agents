@@ -68,7 +68,17 @@ function fixture(parentMs = 7 * 24 * HOUR) {
           return {
             sql: { db(name: string) {
               expect(name).toBe(PATH);
-              return { query: async (sql: string) => result("sql", { rows: [["meeting", "fireflies", "source", delegation.cid, "2030-01-01T00:00:00Z", null, "[]", null, null]] }, !sql.startsWith("WITH candidates") && !sql.startsWith("SELECT 1 FROM connector_meeting")) };
+              return { query: async (sql: string) => {
+                const combinedQuery = sql.includes("FROM connector_meeting WHERE source = ? AND CASE WHEN json_valid(metadata) THEN json_type(metadata, '$.merge.members') = 'array'");
+                const hasMoreProbe = sql.startsWith("SELECT 1 FROM connector_meeting");
+                const pageQuery = sql.includes("length(CAST(json_array(");
+                const base = ["meeting", "fireflies", "source", delegation.cid, "2030-01-01T00:00:00Z", null, "[]", null, null];
+                const projected = [...base, null, 0, 0];
+                const rows = combinedQuery || hasMoreProbe ? [] : pageQuery
+                  ? [[...projected, new TextEncoder().encode(JSON.stringify(projected)).byteLength]]
+                  : [base];
+                return result("sql", { rows }, !pageQuery && !hasMoreProbe);
+              } };
             } },
             kv: { get: async (key: string, options?: { prefix?: string }) => {
               expect(key).toBe(`${PATH}/fireflies/transcript/source`);

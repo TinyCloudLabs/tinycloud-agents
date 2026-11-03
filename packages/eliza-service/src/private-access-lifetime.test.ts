@@ -69,6 +69,10 @@ const MEETING_ROW = [
   "avery@example.test", JSON.stringify([{ name: "Avery", email: "avery@example.test" }]),
   "The team approved ember compass.", "Avery will send the decision memo.",
 ];
+const MEASURED_MEETING_ROW = (() => {
+  const projected = [...MEETING_ROW, null, 0, 0];
+  return [...projected, new TextEncoder().encode(JSON.stringify(projected)).byteLength];
+})();
 const BODY = [{ text: "We rejected cobalt; the final choice is ember compass.", speaker_name: "Avery", start_time: 72 }];
 
 /** The TinyCloud node boundary, shared across simulated restarts. */
@@ -84,7 +88,10 @@ function makeService(opts: { node?: FakeNode; kv?: DelegationKv; memoryGrantMs?:
       async useDelegation() {
         if (node.activationRevoked) throw Object.assign(new Error("delegation has been revoked"), { code: "DELEGATION_REVOKED", status: 401 });
         return {
-          sql: { db: () => ({ query: async () => ({ ok: true, data: { rows: [MEETING_ROW] } }) }) },
+          sql: { db: () => ({ query: async (sql: string) => {
+            if (sql.startsWith("SELECT 1 FROM connector_meeting") || sql.includes("FROM connector_meeting WHERE source = ? AND CASE WHEN json_valid(metadata)")) return { ok: true, data: { rows: [] } };
+            return { ok: true, data: { rows: sql.includes("length(CAST(json_array(") ? [MEASURED_MEETING_ROW] : [MEETING_ROW] } };
+          } }) },
           kv: { get: async () => node.revoked
             ? { ok: false, error: { code: "DELEGATION_REVOKED", status: 403 } }
             : { ok: true, data: { data: JSON.stringify(BODY) } } },
