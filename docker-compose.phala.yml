@@ -41,7 +41,7 @@ services:
       TINYCLOUD_AGENT_KEY_FILE: ${TINYCLOUD_AGENT_KEY_FILE:-/run/secrets/agent.key}
       # ── TinyCloud node (REQUIRED) ──
       # Prod TEE node. Falls back to public node if unset.
-      TINYCLOUD_HOST: ${TINYCLOUD_HOST:-https://tee.node.tinycloud.xyz}
+      TINYCLOUD_HOST: ${TINYCLOUD_HOST:-https://node.tinycloud.xyz}
       # ── Tools (REQUIRED for web_search) ──
       TAVILY_API_KEY: ${TAVILY_API_KEY}
       # ── TinyChat tasks (disabled without both key and model map) ──
