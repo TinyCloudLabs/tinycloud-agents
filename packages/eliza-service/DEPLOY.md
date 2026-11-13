@@ -163,7 +163,7 @@ ELIZA_INGRESS_IMAGE=ghcr.io/tinycloudlabs/eliza-service:ingress-latest
 ELIZA_SERVICE_SECRET=<must match tinychat backend's ELIZA_SERVICE_SECRET>
 TINYCLOUD_AGENT_KEY=<existing production agent private key>
 TINYCLOUD_AGENT_KEY_FILE=/run/secrets/agent.key
-TINYCLOUD_HOST=https://node.tinycloud.xyz
+TINYCLOUD_HOST=https://tee.node.tinycloud.xyz
 TAVILY_API_KEY=<tavily key>
 
 # tasks remain disabled until both the key and model map are configured

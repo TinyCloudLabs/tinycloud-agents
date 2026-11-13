@@ -24,7 +24,7 @@
 //   D. eliza-service transcript transport (createTranscriptNode): a 30-day KV grant
 //      is activated and read through the hand-built delegated KV service.
 //
-// HOST: TINYCLOUD_HOST (default https://node.tinycloud.xyz — eliza-service prod).
+// HOST: TINYCLOUD_HOST (default https://tee.node.tinycloud.xyz — eliza-service prod).
 // PROBE_STEPS: subset of "ABCD" to run (default all).
 
 import { randomBytes } from "node:crypto";
@@ -42,7 +42,7 @@ import {
 } from "@tinycloud/agent-client";
 import { createTranscriptNode } from "../packages/eliza-service/src/transcript-transport.js";
 
-const DEFAULT_HOST = "https://node.tinycloud.xyz";
+const DEFAULT_HOST = "https://tee.node.tinycloud.xyz";
 // signIn on a FRESH account can take ~60s on node-sdk 2.11 (account-bootstrap repair
 // on the second signIn); later signIns are ~4-8s.
 const STEP_BUDGET_MS = 150_000;
