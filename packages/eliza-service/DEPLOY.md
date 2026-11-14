@@ -121,10 +121,11 @@ docker push "ghcr.io/tinycloudlabs/eliza-service:$ELIZA_REVISION"
 Make the GHCR **package** public (or grant the CVM pull access). Note: package
 visibility is set on the package, independent of repo visibility.
 
-You also need an ingress image at `ghcr.io/tinycloudlabs/eliza-service:ingress-latest`
-(the standard dstack-ingress image, same as listen's `listen-backend:ingress-latest`).
-Tag/push the org's dstack-ingress image under that name, or override
-`ELIZA_INGRESS_IMAGE` in the env file to point at an existing ingress image.
+You also need an ingress image, **pinned by digest** (never a tag such as
+`ingress-latest`: this CVM holds a Cloudflare DNS token, and a mutable tag lets
+whoever can push it take over the zone). The compose defaults to the
+`tinychat-backend` ingress wrapper digest that runs in production; override
+`ELIZA_INGRESS_IMAGE` in the env file only with another `@sha256:` reference.
 
 ### Build and push from GitHub Actions (instead of sections 1-2)
 
@@ -156,8 +157,8 @@ creation with rulesets/branch protection.
 
 ```dotenv
 # image
-ELIZA_SERVICE_IMAGE=ghcr.io/tinycloudlabs/eliza-service@sha256:<pushed digest>
-ELIZA_INGRESS_IMAGE=ghcr.io/tinycloudlabs/eliza-service:ingress-latest
+ELIZA_SERVICE_IMAGE=ghcr.io/tinycloudlabs/eliza-service-ci@sha256:<digest from the eliza-image.yml run>
+ELIZA_INGRESS_IMAGE=ghcr.io/tinycloudlabs/tinychat-backend@sha256:<ingress wrapper digest>
 
 # service
 ELIZA_SERVICE_SECRET=<must match tinychat backend's ELIZA_SERVICE_SECRET>
