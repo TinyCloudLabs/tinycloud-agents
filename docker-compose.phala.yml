@@ -24,8 +24,8 @@
 # TINYCLOUD_HOST, not in this container. See DEPLOY.md.
 services:
   eliza-service:
-    # Pinned by digest (TC-3049): a mutable tag on a CVM that holds a DNS token is the cheapest path to taking over
-    # the tinycloud.xyz zone. Override only with another `@sha256:` reference, never a tag. Value = what runs today.
+    # Pinned by digest so a deploy of this file never changes the image. Override only with another
+    # `@sha256:` reference, never a tag.
     image: ${ELIZA_SERVICE_IMAGE:-ghcr.io/tinycloudlabs/eliza-service-ci@sha256:d24ad8ae9006908f45c4dc1e5188043b1a88a7f0bdfb937df2dd1df3c3ce32dc}
     platform: linux/amd64
     ports:
@@ -65,7 +65,7 @@ services:
     restart: unless-stopped
 
   dstack-ingress:
-    # Pinned by digest (TC-3049); this is the tinychat-backend ingress wrapper that runs today.
+    # Pinned by digest; this is the ingress wrapper image that runs today.
     image: ${ELIZA_INGRESS_IMAGE:-ghcr.io/tinycloudlabs/tinychat-backend@sha256:edeb5866a2fd7d2b2aad3bd9031eba0e14d86f26679f1190aaf374ffb65fe311}
     ports:
       - "443:443"

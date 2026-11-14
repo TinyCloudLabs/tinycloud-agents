@@ -122,8 +122,7 @@ Make the GHCR **package** public (or grant the CVM pull access). Note: package
 visibility is set on the package, independent of repo visibility.
 
 You also need an ingress image, **pinned by digest** (never a tag such as
-`ingress-latest`: this CVM holds a Cloudflare DNS token, and a mutable tag lets
-whoever can push it take over the zone). The compose defaults to the
+`ingress-latest`, which can change under a deploy). The compose defaults to the
 `tinychat-backend` ingress wrapper digest that runs in production; override
 `ELIZA_INGRESS_IMAGE` in the env file only with another `@sha256:` reference.
 
