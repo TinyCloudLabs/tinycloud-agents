@@ -8,7 +8,7 @@ const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const PATH = "xyz.tinycloud.tinychat/connectors";
 const AGENT = "did:pkh:eip155:1:0x83cD9777d4128012F878376aCbd6a092DcdDE01c";
-const SPACE = "tinycloud:pkh:eip155:1:0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2:applications";
+const SPACE = "tinycloud:pkh:eip155:1:0x4db6e7Be716bA504Cd103BC16B9329FE6BBE41F2:applications";
 const HOST = "https://node.tinycloud.xyz";
 
 beforeEach(() => setSystemTime(new Date("2030-01-01T00:00:00Z")));
