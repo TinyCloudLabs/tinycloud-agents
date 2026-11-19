@@ -21,7 +21,7 @@
 //   verifies the signatures.
 
 import { TinyCloudNode } from "@tinycloud/node-sdk";
-import { AGENT_SESSION_EXPIRATION_MS } from "@tinycloud/agent-client";
+import { agentNodeOptions } from "@tinycloud/agent-client";
 
 /** Dedicated space name in the agent's account. */
 export const DELEGATION_STORE_SPACE = "eliza-delegations";
@@ -142,12 +142,15 @@ export class TinyCloudDelegationKv implements DelegationKv {
   private signedIn?: Promise<unknown>;
 
   constructor(opts: { privateKey: string; host: string; space?: string; node?: DelegationStoreNode }) {
+    const space = opts.space ?? DELEGATION_STORE_SPACE;
     this.node = opts.node ?? new TinyCloudNode({
       privateKey: opts.privateKey,
       host: opts.host,
-      prefix: opts.space ?? DELEGATION_STORE_SPACE,
+      prefix: space,
       autoCreateSpace: true,
-      sessionExpirationMs: AGENT_SESSION_EXPIRATION_MS,
+      ...agentNodeOptions(space, [
+        { service: "tinycloud.kv", path: `${KEY_PREFIX}/`, actions: ["get", "put", "del", "list"] },
+      ]),
     }) as unknown as DelegationStoreNode;
   }
 

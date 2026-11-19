@@ -1,6 +1,6 @@
 import { TinyCloudWeb, type Config } from "@tinycloud/web-sdk";
 import { connectWallet } from "./openkey";
-import { renderDelegationUI } from "./delegate";
+import { delegationManifest, renderDelegationUI } from "./delegate";
 
 const app = document.getElementById("app")!;
 
@@ -50,8 +50,13 @@ document.getElementById("signInBtn")!.addEventListener("click", async () => {
     const { provider, address } = await connectWallet();
     statusEl.textContent = "Signing in to TinyCloud...";
 
+    // The manifest is built from the DB handle at sign-in, so the session can
+    // delegate exactly that handle.
+    const dbHandle = (document.getElementById("dbHandle") as HTMLInputElement).value.trim();
     const config: Config = {
       providers: { web3: { driver: provider } },
+      manifest: delegationManifest(dbHandle),
+      includeAccountRegistryPermissions: false,
     };
     if (host) {
       config.tinycloudHosts = [host];
@@ -70,7 +75,6 @@ document.getElementById("signInBtn")!.addEventListener("click", async () => {
     ].join("");
 
     const delegateDID = (document.getElementById("delegateDID") as HTMLInputElement).value.trim();
-    const dbHandle = (document.getElementById("dbHandle") as HTMLInputElement).value.trim();
 
     renderDelegationUI(tcw, delegationContainer, delegateDID, dbHandle, host);
   } catch (err) {

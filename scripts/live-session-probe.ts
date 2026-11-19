@@ -36,6 +36,7 @@ import {
   NodeSdkTransport,
   TinyCloudNode,
   agentIdentityFromKey,
+  agentNodeOptions,
   resolveConfig,
   resolveDelegationConfig,
   serializeDelegation,
@@ -95,7 +96,8 @@ async function stepA(): Promise<void> {
     privateKey: throwawayKey(),
     host,
     autoCreateSpace: true,
-    sessionExpirationMs: AGENT_SESSION_EXPIRATION_MS,
+    // Same session options as the agent's own sessions.
+    ...agentNodeOptions("default", [{ service: "tinycloud.kv", path: "probe/", actions: ["get", "put"] }]),
   });
   let t = performance.now();
   await withDeadline(node.signIn(), "A signIn#1");
@@ -132,7 +134,10 @@ async function stepC(): Promise<void> {
     privateKey: throwawayKey(),
     host,
     autoCreateSpace: true,
-    sessionExpirationMs: AGENT_SESSION_EXPIRATION_MS,
+    // The throwaway "user" declares the db it delegates, with the agent's options.
+    ...agentNodeOptions("default", [
+      { service: "tinycloud.sql", path: DEFAULT_DB_HANDLE, actions: ["read", "write", "admin"] },
+    ]),
   });
   await withDeadline(user.signIn(), "C user signIn");
   // Wallet-signed SQL-only grant, the same shape tinychat/delegate-ui mint.
@@ -169,7 +174,12 @@ async function stepD(): Promise<void> {
   // DelegatedAccess internals — verify they still work on node-sdk 2.11.
   const agentKey = throwawayKey();
   const agent = await agentIdentityFromKey(agentKey);
-  const user = new TinyCloudNode({ privateKey: throwawayKey(), host, autoCreateSpace: true });
+  const user = new TinyCloudNode({
+    privateKey: throwawayKey(), host, autoCreateSpace: true,
+    ...agentNodeOptions("default", [
+      { service: "tinycloud.kv", path: "xyz.tinycloud.tinychat/connectors/", actions: ["get", "put", "list"] },
+    ]),
+  });
   await withDeadline(user.signIn(), "D user signIn");
   const key = `xyz.tinycloud.tinychat/connectors/probe/transcript/${randomBytes(4).toString("hex")}`;
   const body = `transcript-${randomBytes(6).toString("hex")}`;
