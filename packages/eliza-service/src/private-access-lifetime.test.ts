@@ -29,7 +29,7 @@ import { HeldSessions } from "./held-sessions.js";
 const SECRET = "private-access-lifetime-secret";
 const AGENT_DID = "did:pkh:eip155:1:0x83cD9777d4128012F878376aCbd6a092DcdDE01c";
 const AGENT_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-const OWNER = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
+const OWNER = "0x4db6e7Be716bA504Cd103BC16B9329FE6BBE41F2";
 const ENTITY = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const SQL_PATH = "xyz.tinycloud.tinychat/connectors";
 const KV_PATH = `${SQL_PATH}/`;

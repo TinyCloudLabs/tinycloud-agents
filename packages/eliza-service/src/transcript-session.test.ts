@@ -32,7 +32,7 @@ const OTHER_DID = "did:pkh:eip155:1:0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 const AGENT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const AGENT_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
-const OWNER_A = "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2";
+const OWNER_A = "0x4db6e7Be716bA504Cd103BC16B9329FE6BBE41F2";
 const OWNER_B = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 const SQL_PATH = "xyz.tinycloud.tinychat/connectors";
 const KV_PATH = `${SQL_PATH}/`;

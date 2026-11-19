@@ -162,8 +162,8 @@ Note the version nibble `0` in position 15 of the UUID (`08a2` — the `0` is th
 For `agentId = "92361e74-91ed-43a2-9656-5cc37ff3a07a"` and any address:
 
 ```
-addressToEntityId("0x7d0333579c19e8fa149c2dbf8405cb6f66c373f2", agentId)
-=== addressToEntityId("0x7D0333579C19E8Fa149C2dbF8405Cb6f66C373f2", agentId)
+addressToEntityId("0x4db6e7be716ba504cd103bc16b9329fe6bbe41f2", agentId)
+=== addressToEntityId("0x4db6e7Be716bA504Cd103BC16B9329FE6BBE41F2", agentId)
 ```
 
 Both produce the same UUID because `addressToEntityId` lowercases the address before seeding. This must hold; sha1 is case-sensitive and would produce different hashes for different casings.
