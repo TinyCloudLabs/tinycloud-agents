@@ -1,10 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 import { createServer } from "node:http";
 import { gzipSync } from "node:zlib";
 import { DelegatedAccess } from "@tinycloud/node-sdk";
 import type { InvokeFunction, PortableDelegation, TinyCloudSession } from "@tinycloud/node-sdk";
 import { createReader } from "./transcript-registry.js";
 import { readMeeting } from "./actions/tinycloud-search-transcripts.js";
+import { settle } from "../../../test/virtual-time.js";
 import { createTranscriptFetch, createTranscriptServices, TRANSCRIPT_RESPONSE_BYTE_LIMIT as LIMIT } from "./transcript-transport.js";
 
 function streamed(payload: string, init: ResponseInit = {}, chunkSize = 65_536) {
@@ -226,7 +227,11 @@ describe("pinned SDK transcript service integration", () => {
         pull() { return new Promise(() => {}); }, cancel() { cancelled = true; },
       }));
     }));
-    await expect(reader.readBody!("fireflies", "synthetic", { deadlineAt: Date.now() + 20 })).rejects.toMatchObject({ code: "retrieval_timeout" });
+    jest.useFakeTimers();
+    try {
+      // The read starts with its KV p95 (990ms) left and meets the deadline mid-flight.
+      await expect(settle(reader.readBody!("fireflies", "synthetic", { deadlineAt: Date.now() + 990 }))).rejects.toMatchObject({ code: "retrieval_timeout" });
+    } finally { jest.useRealTimers(); }
     expect(sdkSignal?.aborted).toBe(true);
     expect(cancelled).toBe(true);
   });

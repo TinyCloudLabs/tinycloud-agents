@@ -7,7 +7,7 @@ import type { PortableDelegation } from "@tinycloud/agent-client";
 import { currentPrivateAccess, DelegationExpiredError, NoDelegationError } from "@tinycloud/eliza-plugin-memory";
 import { TRANSCRIPT_SOURCES } from "./actions/tinycloud-search-transcripts.js";
 import type { TranscriptMetadata, TranscriptReader, TranscriptRegistry } from "./actions/tinycloud-search-transcripts.js";
-import { checkContext, decodeBody, discoveryResult, MeetingRetrievalError, scopedRows, withinContext } from "./meeting-evidence.js";
+import { BodyNotStartedError, checkContext, decodeBody, discoveryResult, MeetingRetrievalError, requireStartBudget, scopedRows, withinContext } from "./meeting-evidence.js";
 import type { BodyResult, MeetingSelection, RetrievalContext } from "./meeting-evidence.js";
 import { createTranscriptNode, TranscriptResponseLimitError, TRANSCRIPT_RESPONSE_BYTE_LIMIT } from "./transcript-transport.js";
 import { COMBINED_SOURCE, combinedMemberKeys, isCombinedMember, readCombinedMembers } from "./combined-meetings.js";
@@ -283,7 +283,12 @@ const LISTING_METADATA_PROJECTION = `CASE WHEN json_valid(metadata) THEN json_ob
   "'transcript_count', CASE WHEN json_type(metadata, '$.transcript_count') IN ('integer', 'real') THEN json_extract(metadata, '$.transcript_count') END",
   `'merge', CASE WHEN source = '${COMBINED_SOURCE}' AND json_type(metadata, '$.merge.members') = 'array' AND length(CAST(json(json_extract(metadata, '$.merge.members')) AS BLOB)) <= ${COMBINED_MEMBERS_MAX_BYTES} THEN json_object('members', json(json_extract(metadata, '$.merge.members')) ) END`,
 ].join(", ")}) END`;
-const COLUMNS = `id, source, source_id, title, started_at, organizer_email, participants, summary_overview, summary_action_items, ${METADATA_PROJECTION}`;
+const SPEAKER_NAMES_MAX_BYTES = 16_384;
+// Renames bounded in SQL: only an object of at most SPEAKER_NAMES_MAX_BYTES comes back; the opaque metadata blob stays untouched.
+const SPEAKER_NAMES_PROJECTION = `CASE WHEN json_valid(metadata) THEN CASE WHEN json_type(metadata, '$.speaker_names') = 'object' AND length(CAST(json_extract(metadata, '$.speaker_names') AS BLOB)) <= ${SPEAKER_NAMES_MAX_BYTES} THEN json_extract(metadata, '$.speaker_names') END END`;
+const COLUMNS = `id, source, source_id, title, started_at, organizer_email, participants, summary_overview, summary_action_items, ${METADATA_PROJECTION}, ${SPEAKER_NAMES_PROJECTION}`;
+/** COLUMNS is the listing columns plus the renames at this index. */
+const COLUMNS_COUNT = 11;
 const LISTING_ID = `CASE WHEN length(CAST(id AS BLOB)) <= ${MEETING_REF_MAX_LENGTH} THEN id END`;
 const LISTING_SOURCE = `CASE WHEN length(CAST(source AS BLOB)) <= ${LIST_SOURCE_MAX_BYTES} THEN source END`;
 const LISTING_SOURCE_ID = `CASE WHEN length(CAST(source_id AS BLOB)) <= ${SOURCE_ID_MAX_LENGTH} THEN source_id END`;
@@ -318,6 +323,12 @@ function decodeMetadata(row: unknown): TranscriptMetadata | null {
     ...(Object.keys(known).length ? { metadata: known } : {}),
   };
 }
+/** A COLUMNS row: the listing metadata plus the stored renames. A row that lacks the renames column leaves them unread (undefined), never known-empty. */
+function decodeFreshMetadata(row: unknown): TranscriptMetadata | null {
+  if (!Array.isArray(row)) return null;
+  const decoded = decodeMetadata(row.slice(0, COLUMNS_COUNT - 1));
+  return decoded && row.length >= COLUMNS_COUNT ? { ...decoded, speakerNames: parseSpeakerNames(row[COLUMNS_COUNT - 1]) } : decoded;
+}
 function logSkippedOversizedIds(count: number): void {
   if (count > 0) console.warn("transcript_listing_oversized_ids_skipped", { count });
 }
@@ -341,7 +352,6 @@ export function classifyBodyFailure(error: unknown): BodyResult {
   if (code === "KV_NOT_FOUND") return /(?:key|entry) not found/i.test(text) ? { state: "missing", reasonCode: code } : { state: "unavailable", reasonCode: "ambiguous_not_found" };
   return { state: "unavailable", reasonCode: code };
 }
-const SPEAKER_NAMES_MAX_BYTES = 16_384;
 const SPEAKER_FIELDS = ["speaker_name", "speaker", "speakerName"] as const;
 function parseSpeakerNames(value: unknown): Map<string, string> | null {
   let parsed = value;
@@ -361,12 +371,14 @@ function renameSpeakers(item: unknown, names: ReadonlyMap<string, string>): unkn
   return renamed;
 }
 export function createReader(access: Access | (() => Promise<Access>), assertAccess: () => void = () => {}, invalidateAccess: () => void = () => {}): TranscriptReader {
-  const withAccess = async <T>(signal: AbortSignal | undefined, operation: (active: Access) => Promise<T>) => {
+  const withAccess = async <T>(kind: "sql" | "kv", context: RetrievalContext, signal: AbortSignal | undefined, operation: (active: Access) => Promise<T>) => {
     const active = typeof access === "function" ? await access() : access;
     // A caller can stop waiting while a shared renewal continues for others.
     // Check again before storage so cancelled callers never start a late read.
     checkContext({ signal });
     assertAccess();
+    // Waiting for access (renewal, activation) spends budget: the reserve is checked again at the point of dispatch.
+    requireStartBudget(kind, context);
     return operation(active);
   };
   const enforceAccess = (body: BodyResult) => {
@@ -377,7 +389,8 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
   };
   const query = async (sql: string, params: Array<string | number | null> = [], context: RetrievalContext = {}): Promise<unknown[][]> => {
     assertAccess();
-    const response = await withinContext(signal => withAccess(signal, active => active.sql.db(SQL_PATH).query(sql, params, { signal })), context) as { ok?: boolean; data?: { rows?: unknown[][] }; error?: unknown };
+    requireStartBudget("sql", context);
+    const response = await withinContext(signal => withAccess("sql", context, signal, active => active.sql.db(SQL_PATH).query(sql, params, { signal })), context) as { ok?: boolean; data?: { rows?: unknown[][] }; error?: unknown };
     assertAccess();
     if (response?.ok !== true || !Array.isArray(response.data?.rows)) {
       logNodeFailure("sql.read", response?.error);
@@ -422,39 +435,54 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
     const hasMore = measured.length > rows.length;
     return { rows, cursor: hasMore ? cursor + rows.length : null };
   };
+  // A deadline or start reserve met before the body request is dispatched leaves no body attempt behind (see BodyNotStartedError).
+  const beforeBodyRequest = async <T>(step: () => Promise<T>): Promise<T> => {
+    try { return await step(); }
+    catch (error) { throw (error as { code?: string }).code === "retrieval_timeout" ? new BodyNotStartedError() : error; }
+  };
   const readKey = async (key: string, context: RetrievalContext): Promise<BodyResult> => {
-    // Transcript-only transport caps decoded bytes before SDK buffering. Retain
-    // the decoded-value check for injected readers and UTF-8 replacement growth.
-    const response = await withinContext(signal => withAccess(signal, active => active.kv.get(key, { prefix: "", raw: true, signal })), context) as { ok?: boolean; error?: unknown; data?: { data?: unknown } };
+    let dispatched = false;
+    let response: { ok?: boolean; error?: unknown; data?: { data?: unknown } };
+    try {
+      requireStartBudget("kv", context);
+      // Transcript-only transport caps decoded bytes before SDK buffering. Retain
+      // the decoded-value check for injected readers and UTF-8 replacement growth.
+      response = await withinContext(signal => withAccess("kv", context, signal, active => { dispatched = true; return active.kv.get(key, { prefix: "", raw: true, signal }); }), context) as typeof response;
+    } catch (error) {
+      if (!dispatched && (error as { code?: string }).code === "retrieval_timeout") throw new BodyNotStartedError();
+      throw error;
+    }
     assertAccess();
     const body = response?.ok === true ? decodeBody(response.data?.data) : classifyBodyFailure(response?.error);
     enforceAccess(body); return body;
   };
   // TC-2189 stores renames on the note row as metadata.speaker_names (original label -> shown name); the stored sentences keep their original labels.
-  // Read only that key, bounded in SQL, so the opaque metadata blob and the listing projection stay untouched.
-  const withSpeakerNames = async (body: BodyResult, source: string, sourceId: string, context: RetrievalContext): Promise<BodyResult> => {
+  // The names arrive with the fresh metadata row (SPEAKER_NAMES_PROJECTION, bounded in SQL), so a body read with them needs no query.
+  // `undefined` means the caller has no fresh row; only then is the key read on its own.
+  const withSpeakerNames = async (body: BodyResult, source: string, sourceId: string, known: ReadonlyMap<string, string> | null | undefined, context: RetrievalContext): Promise<BodyResult> => {
     if (body.state !== "present" || !Array.isArray(body.value)) return body;
-    const [row] = await query(
-      `SELECT CASE WHEN json_valid(metadata) THEN CASE WHEN json_type(metadata, '$.speaker_names') = 'object' AND length(CAST(json_extract(metadata, '$.speaker_names') AS BLOB)) <= ${SPEAKER_NAMES_MAX_BYTES} THEN json_extract(metadata, '$.speaker_names') END END FROM connector_meeting WHERE source = ? AND source_id = ? LIMIT 1`,
-      [source, sourceId], context);
-    const names = parseSpeakerNames(row?.[0]);
+    let names = known;
+    if (names === undefined) {
+      const [row] = await query(`SELECT ${SPEAKER_NAMES_PROJECTION} FROM connector_meeting WHERE source = ? AND source_id = ? LIMIT 1`, [source, sourceId], context);
+      names = parseSpeakerNames(row?.[0]);
+    }
     if (!names) return body;
     return { ...body, value: body.value.map(item => renameSpeakers(item, names)) };
   };
-  const readBody = async (source: TranscriptMetadata["source"], sourceId: string, context: RetrievalContext = {}): Promise<BodyResult> => {
+  const readBody = async (source: TranscriptMetadata["source"], sourceId: string, context: RetrievalContext = {}, speakerNames?: ReadonlyMap<string, string> | null): Promise<BodyResult> => {
     if (!isSource(source) || !safeSegment(sourceId)) throw new MeetingRetrievalError("invalid_stored_metadata");
     assertAccess();
-    if (source === VOICE_NOTE_SOURCE && await hasVoiceNoteIndex(context)) {
-      const [commit] = await query(`SELECT outcome, hash, body_key FROM ${VOICE_NOTE_INDEX} WHERE source_id = ? LIMIT 1`, [sourceId], context);
+    if (source === VOICE_NOTE_SOURCE && await beforeBodyRequest(() => hasVoiceNoteIndex(context))) {
+      const [commit] = await beforeBodyRequest(() => query(`SELECT outcome, hash, body_key FROM ${VOICE_NOTE_INDEX} WHERE source_id = ? LIMIT 1`, [sourceId], context));
       // The index names the one committed revision. No commit row, or any outcome other than transcribed, has no readable body.
       if (!commit) return { state: "missing" };
       const [outcome, hash, bodyKey] = commit;
       // The body key must be exactly the writer's key for this source id and hash, so the index cannot reach any other KV key.
       if (outcome !== "transcribed" || typeof hash !== "string" || !VOICE_NOTE_REV_HASH.test(hash)
         || bodyKey !== `${VOICE_NOTE_REV_PREFIX}${sourceId}/${hash}`) return { state: "missing" };
-      return withSpeakerNames(await readKey(bodyKey, context), source, sourceId, context);
+      return withSpeakerNames(await readKey(bodyKey, context), source, sourceId, speakerNames, context);
     }
-    return withSpeakerNames(await readKey(`${SQL_PATH}/${source}/transcript/${sourceId}`, context), source, sourceId, context);
+    return withSpeakerNames(await readKey(`${SQL_PATH}/${source}/transcript/${sourceId}`, context), source, sourceId, speakerNames, context);
   };
   // Member keys come from every combined row, never from the page being listed: a source filter or
   // date window could otherwise return members whose combined row is outside the result.
@@ -534,7 +562,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       const rows = await query(`SELECT ${COLUMNS} FROM connector_meeting WHERE id = ? AND ${readable} LIMIT 1`, [reference], context);
       const hidden = await combinedKeys(context);
       // Check identity even when a faulty upstream ignores its predicate.
-      return visibleRows(await commitReadable(rows, context), hidden).map(decodeMetadata).find(row => row?.meetingRef === reference) ?? null;
+      return visibleRows(await commitReadable(rows, context), hidden).map(row => decodeFreshMetadata(row)).find(row => row?.meetingRef === reference) ?? null;
     },
     // One revalidation pass for already-discovered references: the same row, combined-meeting and voice-note commit
     // checks as getMetadata, with each of them run once for the whole set instead of once per meeting.
@@ -545,7 +573,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       const rows: unknown[][] = [];
       let cursor = 0;
       while (true) {
-        const page = await queryPage(COLUMNS, 10, `id IN (${[...requested].map(() => "?").join(", ")}) AND ${readableClause()}`, [...requested], "id ASC", cursor, requested.size, context);
+        const page = await queryPage(COLUMNS, COLUMNS_COUNT, `id IN (${[...requested].map(() => "?").join(", ")}) AND ${readableClause()}`, [...requested], "id ASC", cursor, requested.size, context);
         rows.push(...page.rows);
         if (page.cursor === null || page.cursor <= cursor) break;
         cursor = page.cursor;
@@ -554,7 +582,7 @@ export function createReader(access: Access | (() => Promise<Access>), assertAcc
       // Check identity even when a faulty upstream ignores its predicate.
       const fresh = new Map<string, TranscriptMetadata>();
       for (const row of visibleRows(await commitReadable(rows, context), hidden)) {
-        const decoded = decodeMetadata(row);
+        const decoded = decodeFreshMetadata(row);
         if (decoded && requested.has(decoded.meetingRef)) fresh.set(decoded.meetingRef, decoded);
       }
       return fresh;

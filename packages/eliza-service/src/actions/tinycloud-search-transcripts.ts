@@ -1,6 +1,6 @@
 import type { Action, Content, IAgentRuntime, Memory, Plugin, ProviderDataRecord } from "@elizaos/core";
 import { ToolError } from "../handlers/tools.js";
-import { absentOutcome, checkContext, collectMeetingEvidence, discoverMeetings, exactMeeting, formatMeetingResult, isAccessError, MeetingRetrievalError, metadataOutcome, readMeetingEvidence, safeMeetingRef, unattemptedOutcome, validDate, withinContext } from "../meeting-evidence.js";
+import { absentOutcome, checkContext, collectMeetingEvidence, discoverMeetings, exactMeeting, formatMeetingResult, hasStartBudget, isAccessError, MeetingRetrievalError, metadataOutcome, readMeetingEvidence, safeMeetingRef, unattemptedOutcome, validDate, withinContext } from "../meeting-evidence.js";
 import type { BodyResult, DiscoveryResult, EvidenceRequest, MeetingOutcome, MeetingSelection, RetrievalContext } from "../meeting-evidence.js";
 
 export const TINYCLOUD_FIND_MEETINGS = "tinycloud_find_meetings";
@@ -137,6 +137,8 @@ export interface TranscriptMetadata {
   metadataLimited?: boolean;
   /** True when the list view caps a display field; `getMetadata` returns uncapped titles and summaries. */
   listingTruncated?: boolean;
+  /** Renames stored on the row (original label -> shown name), read with fresh metadata; null when none, undefined when not read. */
+  speakerNames?: ReadonlyMap<string, string> | null;
 }
 
 export interface TranscriptReader {
@@ -145,7 +147,8 @@ export interface TranscriptReader {
   /** Fresh metadata for many references in one revalidation pass. References that are absent or no longer visible are omitted from the map. */
   getMetadataBatch?(meetingRefs: string[], context?: RetrievalContext): Promise<Map<string, TranscriptMetadata>>;
   discoverMetadata?(args: FindMeetingsArgs, context?: RetrievalContext): Promise<DiscoveryResult>;
-  readBody?(source: TranscriptSource, sourceId: string, context?: RetrievalContext): Promise<BodyResult>;
+  /** `speakerNames` are the renames read with the fresh metadata row (null: none stored); `undefined` leaves the reader to look them up. */
+  readBody?(source: TranscriptSource, sourceId: string, context?: RetrievalContext, speakerNames?: ReadonlyMap<string, string> | null): Promise<BodyResult>;
   assertAccess?(): void;
   getTranscript(source: TranscriptSource, sourceId: string): Promise<unknown | null>;
 }
@@ -188,7 +191,7 @@ async function aggregate(reader: TranscriptReader, args: MeetingFilters & { meet
   // end the request (such as an oversized row), each meeting revalidates on its own. A spent budget is handled by the loop below.
   let fresh: Map<string, TranscriptMetadata> | undefined;
   if (reader.getMetadataBatch && rows.length > 0) {
-    try { fresh = await withinContext(() => reader.getMetadataBatch!(rows.map(row => row.meetingRef), context), context); }
+    try { fresh = await withinContext(signal => reader.getMetadataBatch!(rows.map(row => row.meetingRef), { ...context, signal }), context); }
     catch (error) {
       if (isAccessError(error) || (error instanceof MeetingRetrievalError && error.code === "retrieval_cancelled")) throw error;
     }
@@ -196,8 +199,10 @@ async function aggregate(reader: TranscriptReader, args: MeetingFilters & { meet
   let cursor = 0; let accessFailure: unknown;
   await Promise.all(Array.from({ length: Math.min(3, rows.length) }, async () => {
     while (cursor < rows.length && !accessFailure) {
-      if (context.signal?.aborted || (context.deadlineAt !== undefined && Date.now() >= context.deadlineAt)) break;
-      const index = cursor++; const row = rows[index]!;
+      const row = rows[cursor]!;
+      // A meeting is not started unless its first node operation (SQL revalidation, a voice note's SQL commit lookup, or the KV body read) has its observed p95 left.
+      if (context.signal?.aborted || !hasStartBudget(!fresh || row.source === "exo-voice-note" ? "sql" : "kv", context)) break;
+      const index = cursor++;
       try {
         const revalidated = fresh?.get(row.meetingRef);
         outcomes[index] = !fresh ? await readMeetingEvidence(reader, row.meetingRef, request, childContext, row)
