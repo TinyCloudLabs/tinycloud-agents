@@ -2,6 +2,7 @@ import { CAPABILITIES, SQL } from "@tinycloud/bootstrap";
 import {
   TinyCloudWeb,
   type Delegation,
+  type Manifest,
   type PortableDelegation,
   serializeDelegation,
 } from "@tinycloud/web-sdk";
@@ -12,6 +13,25 @@ const SQL_ACTIONS = [
   SQL.ADMIN,
   CAPABILITIES.READ,
 ];
+
+/**
+ * The wallet session holds exactly what it delegates: SQL_ACTIONS on `dbHandle`
+ * in the `default` space. No account-registry or public-space access.
+ */
+export function delegationManifest(dbHandle: string): Manifest {
+  return {
+    app_id: "xyz.tinycloud.eliza.delegate-ui",
+    name: "Eliza delegate UI",
+    space: "default",
+    prefix: "",
+    defaults: false,
+    includePublicSpace: false,
+    permissions: [
+      { service: "tinycloud.sql", path: dbHandle, actions: [SQL.READ, SQL.WRITE, SQL.ADMIN] },
+      { service: "tinycloud.capabilities", path: dbHandle, actions: [CAPABILITIES.READ] },
+    ],
+  };
+}
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

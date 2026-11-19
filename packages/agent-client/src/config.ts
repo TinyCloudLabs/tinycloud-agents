@@ -3,6 +3,8 @@
 // HARD CONTRACT: zero host-framework (Eliza) imports — see ./index.ts.
 // All knob defaults come from plan §5 (resilience + security posture).
 
+import type { Manifest, PermissionEntry } from "@tinycloud/node-sdk";
+
 /** Default TinyCloud node endpoint. `host` is SINGULAR (node-sdk gotcha, plan §2.5). */
 export const DEFAULT_HOST = "https://node.tinycloud.xyz";
 
@@ -26,28 +28,62 @@ export const DEFAULT_BREAKER_OPEN_MS = 120_000;
 
 /**
  * Lifetime requested for every TinyCloud session the agent signs in with
- * (`TinyCloudNode` `sessionExpirationMs`): 30 days. The node-sdk default is 7 days
- * (sdk-core `EXPIRY.SESSION_MS`). Delegated child sessions created by
- * `useDelegation` are still bounded by the SDK (1h in node-sdk 2.11.0) and by the
- * user delegation's own expiry, so this never outlives the user's grant.
+ * (`TinyCloudNode` `sessionExpirationMs`): 30 days. The default is 7 days in the
+ * pinned node-sdk 2.11.0 and 30 days in js-sdk 3.x (sdk-core `EXPIRY.SESSION_MS`),
+ * so it is set explicitly. Delegated child sessions created by `useDelegation` are
+ * still bounded by the SDK (1h in node-sdk 2.11.0) and by the user delegation's own
+ * expiry, so this never outlives the user's grant.
  */
 export const AGENT_SESSION_EXPIRATION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * `TinyCloudNode` options for a session the agent signs in with on one of its
+ * OWN spaces, declaring exactly the `permissions` that session uses. Without a
+ * manifest the SDK grants every action on the whole space.
+ *
+ * `autoBootstrapAccount: false`: node-sdk >=2.7 runs first-account bootstrap on
+ * signIn. On prod it fails on the first signIn and "repairs" on the next (~55s
+ * measured on tee.node, 2026-09-28), then costs ~5s per signIn; with it off a
+ * signIn is ~2-4s. The agent never needs account-registry/encryption bootstrap,
+ * and the bootstrap repair cannot create the encryption network from a
+ * manifest session that doesn't ask for it.
+ *
+ * `includeAccountRegistryPermissions: false` leaves out the account-registry
+ * grants, which only that bootstrap and the registry sync use. `prefix: ""`
+ * keeps permission paths literal; `expiry` matches
+ * {@link AGENT_SESSION_EXPIRATION_MS}.
+ */
+export function agentNodeOptions(space: string, permissions: PermissionEntry[]) {
+  const manifest: Manifest = {
+    app_id: "xyz.tinycloud.eliza",
+    name: "Eliza agent",
+    space,
+    prefix: "",
+    defaults: false,
+    includePublicSpace: false,
+    expiry: "30d",
+    permissions,
+  };
+  return {
+    sessionExpirationMs: AGENT_SESSION_EXPIRATION_MS,
+    autoBootstrapAccount: false,
+    includeAccountRegistryPermissions: false,
+    manifest,
+  };
+}
 
 /**
  * `TinyCloudNode` options for the agent's delegation-ACTIVATION nodes (a fresh
  * wallet session whose only job is `useDelegation` on a user's grant).
  *
- * `autoBootstrapAccount: false`: node-sdk >=2.7 runs first-account bootstrap on
- * signIn. On prod it fails on the first signIn and "repairs" on the next (~55s
- * measured on tee.node, 2026-09-28), then costs ~5s per signIn; with it off a
- * signIn is ~2-4s. The agent never needs account-registry/encryption bootstrap to
- * activate a user delegation, and under node-sdk 2.6.0 that bootstrap always
- * failed, so this preserves the deployed behavior.
+ * `useDelegation` needs a signed-in wallet session but none of its grants (the
+ * delegated session is rooted in the user's delegation), so the session asks
+ * only to read capabilities on the agent's own `default` space. A session with
+ * no grants at all makes signIn try, and fail, to write the account registry.
  */
-export const AGENT_ACTIVATION_NODE_OPTIONS = {
-  sessionExpirationMs: AGENT_SESSION_EXPIRATION_MS,
-  autoBootstrapAccount: false,
-} as const;
+export const AGENT_ACTIVATION_NODE_OPTIONS = agentNodeOptions("default", [
+  { service: "tinycloud.capabilities", path: "", actions: ["read"] },
+]);
 
 /** Proactive re-signIn cadence — sessions last ~1h, refresh at ~50min (plan §3 lifecycle). */
 export const DEFAULT_RE_SIGN_IN_MS = 50 * 60_000;

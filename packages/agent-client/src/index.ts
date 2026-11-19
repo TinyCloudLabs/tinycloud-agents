@@ -23,6 +23,7 @@ export {
   DEFAULT_RE_SIGN_IN_MS,
   AGENT_SESSION_EXPIRATION_MS,
   AGENT_ACTIVATION_NODE_OPTIONS,
+  agentNodeOptions,
   resolveConfig,
   resolveDelegationConfig,
 } from "./config";
