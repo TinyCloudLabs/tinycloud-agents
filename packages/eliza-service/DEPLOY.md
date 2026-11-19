@@ -121,10 +121,10 @@ docker push "ghcr.io/tinycloudlabs/eliza-service:$ELIZA_REVISION"
 Make the GHCR **package** public (or grant the CVM pull access). Note: package
 visibility is set on the package, independent of repo visibility.
 
-You also need an ingress image at `ghcr.io/tinycloudlabs/eliza-service:ingress-latest`
-(the standard dstack-ingress image, same as listen's `listen-backend:ingress-latest`).
-Tag/push the org's dstack-ingress image under that name, or override
-`ELIZA_INGRESS_IMAGE` in the env file to point at an existing ingress image.
+The ingress image is pinned by digest in `docker-compose.phala.yml` (never a tag
+such as `ingress-latest`, which can change under a deploy). Both images are
+hard-coded in the compose and are not read from the deploy environment, so the
+env file never decides which image runs; change an image by a PR to the compose.
 
 ### Build and push from GitHub Actions (instead of sections 1-2)
 
@@ -137,9 +137,9 @@ runs the `docker build` from section 1 (`linux/amd64`,
 `BUILD_REVISION=<sha>`, `packages/eliza-service/Dockerfile`). It pushes only
 `ghcr.io/tinycloudlabs/eliza-service-ci:<sha>` (never `latest`), with provenance
 attached, and prints `digest: sha256:…` in the run's step summary and as the
-`digest` job output. It never deploys; use that digest as
-`ELIZA_SERVICE_IMAGE=ghcr.io/tinycloudlabs/eliza-service-ci@<digest>` in
-section 3 (the digest already starts with `sha256:`).
+`digest` job output. It never deploys; to ship it, put that digest (it already
+starts with `sha256:`) in the `eliza-service` `image:` line of
+`docker-compose.phala.yml` in a PR.
 
 ```bash
 gh workflow run eliza-image.yml --repo TinyCloudLabs/tinycloud-agents --ref main -f sha=<full-commit-sha>
@@ -155,9 +155,7 @@ creation with rulesets/branch protection.
 ## 3. Prepare the env file (`.env.phala`)
 
 ```dotenv
-# image
-ELIZA_SERVICE_IMAGE=ghcr.io/tinycloudlabs/eliza-service@sha256:<pushed digest>
-ELIZA_INGRESS_IMAGE=ghcr.io/tinycloudlabs/eliza-service:ingress-latest
+# (no image variables: both images are hard-coded in docker-compose.phala.yml)
 
 # service
 ELIZA_SERVICE_SECRET=<must match tinychat backend's ELIZA_SERVICE_SECRET>
