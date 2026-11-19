@@ -38,12 +38,12 @@ function makeValidSerialized(opts: {
   return JSON.stringify({
     cid: "bafy-sessions-test",
     delegateDID: opts.delegateDID ?? TEST_AGENT_DID,
-    spaceId: "tinycloud:pkh:eip155:1:0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2:default",
+    spaceId: "tinycloud:pkh:eip155:1:0x4db6e7Be716bA504Cd103BC16B9329FE6BBE41F2:default",
     path: opts.path ?? MEMORY_DB_HANDLE,
     actions: opts.actions ?? ["tinycloud.sql/read", "tinycloud.sql/write", "tinycloud.sql/admin"],
     // Within the 30-day registration ceiling.
     expiry: opts.expiry ?? new Date(Date.now() + 29 * 24 * 60 * 60 * 1000).toISOString(),
-    ownerAddress: "0x7d0333579C19E8fa149C2dbf8405cb6f66c373f2",
+    ownerAddress: "0x4db6e7Be716bA504Cd103BC16B9329FE6BBE41F2",
     chainId: 1,
     host: "https://node.tinycloud.xyz",
   });
