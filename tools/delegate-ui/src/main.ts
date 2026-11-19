@@ -57,6 +57,10 @@ document.getElementById("signInBtn")!.addEventListener("click", async () => {
       providers: { web3: { driver: provider } },
       manifest: delegationManifest(dbHandle),
       includeAccountRegistryPermissions: false,
+      // 7 days, the pinned SDK's default, set explicitly so an SDK upgrade
+      // cannot change it silently. Delegations made from this session are
+      // capped at its expiry.
+      sessionExpirationMs: 7 * 24 * 60 * 60 * 1000,
     };
     if (host) {
       config.tinycloudHosts = [host];
