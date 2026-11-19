@@ -6,9 +6,9 @@ import { addressToEntityId, stringToUuid } from "./entity-id.js";
 const AGENT_ID = "92361e74-91ed-43a2-9656-5cc37ff3a07a" as UUID;
 
 // EIP-55 checksummed address
-const ADDR_CHECKSUMMED = "0x7D0333579C19E8Fa149C2dbF8405Cb6f66C373f2";
+const ADDR_CHECKSUMMED = "0x4db6e7Be716bA504Cd103BC16B9329FE6BBE41F2";
 // Same address, all lowercase
-const ADDR_LOWER = "0x7d0333579c19e8fa149c2dbf8405cb6f66c373f2";
+const ADDR_LOWER = "0x4db6e7be716ba504cd103bc16b9329fe6bbe41f2";
 
 describe("stringToUuid", () => {
   it("canary: stringToUuid('hello') matches golden vector", () => {
